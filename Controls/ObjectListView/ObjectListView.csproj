@@ -1,0 +1,42 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+		<AssemblyVersion>2.7.0.0</AssemblyVersion>
+		<Author>Bright Ideas Software</Author>
+		<Company>Bright Ideas Software</Company>
+		<Copyright>Copyright ©  2006-2014</Copyright>
+		<Description>A much easier to use ListView and friends</Description>
+		<FileVersion>2.7.0.0</FileVersion>
+		<NeutralLanguage>en-US</NeutralLanguage>
+		<Platforms>x64</Platforms>
+		<ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+		<RootNamespace>BrightIdeasSoftware</RootNamespace>
+		<TargetFramework>net6.0-windows</TargetFramework>
+		<UseWindowsForms>true</UseWindowsForms>
+		<Version>2.7.0</Version>
+	</PropertyGroup>
+
+	<PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|x64' ">
+		<ErrorReport>prompt</ErrorReport>
+		<DebugSymbols>true</DebugSymbols>
+		<DebugType>portable</DebugType>
+		<DefineConstants>TRACE;DEBUG</DefineConstants>
+		<!--<OutDir>$(SolutionDir)..\Bin\$(Configuration)\DLLs</OutDir>-->
+		<OutputPath>$(BaseOutputPath)$(Configuration)</OutputPath>
+		<WarningLevel>4</WarningLevel>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<Compile Update="Properties\Resources.Designer.cs">
+			<DesignTime>True</DesignTime>
+			<AutoGen>True</AutoGen>
+			<DependentUpon>Resources.resx</DependentUpon>
+		</Compile>
+		<EmbeddedResource Update="Properties\Resources.resx">
+			<Generator>ResXFileCodeGenerator</Generator>
+			<LastGenOutput>Resources.Designer.cs</LastGenOutput>
+		</EmbeddedResource>
+	</ItemGroup>
+
+</Project>

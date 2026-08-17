@@ -1,0 +1,241 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+
+namespace GomLib {
+  public class AMIEntry : IEquatable<AMIEntry> {
+    public long Id { get; set; }
+    public string BaseFile { get; set; }
+    public Dictionary<long, string> Attachments { get; set; }
+    public string SlotType { get; set; }
+    public Dictionary<long, Dictionary<long, string>> MaterialList { get; set; }
+    public long SkinMaterialIndex { get; set; }
+    public long SkinHueIndex { get; set; }
+    public Dictionary<string, string> ChildSkinMaterials { get; set; }
+    public long SithComplexion1 { get; set; } //Only found in ami.complexion
+    public long SithComplexion2 { get; set; } //Only found in ami.complexion
+    public Dictionary<string, float> RepresentativeColor { get; set; } //Only found in ami.garmenthue
+    public string ColorAsVector4 {
+      get {
+        if (RepresentativeColor != null) {
+          string red = "";
+          string green = "";
+          string blue = "";
+          string alpha = "";
+
+          if (RepresentativeColor.ContainsKey("r")) red = RepresentativeColor["r"].ToString();
+          if (RepresentativeColor.ContainsKey("g")) green = RepresentativeColor["g"].ToString();
+          if (RepresentativeColor.ContainsKey("b")) blue = RepresentativeColor["b"].ToString();
+          if (RepresentativeColor.ContainsKey("a")) alpha = RepresentativeColor["a"].ToString();
+          return string.Format("({0},{1},{2},{3})", red, green, blue, alpha);
+        }
+        return "";
+      }
+    }
+    public Dictionary<string, ModelColors> Colors { get; set; } //Only found in ami.colorscheme
+
+    public string GetAttachment(long id) {
+      if (!Attachments.TryGetValue(id, out string attachment))
+        attachment = "";
+      return attachment;
+    }
+
+    public KeyValuePair<string, string> GetMaterial(long id) {
+      if (MaterialList == null)
+        return new KeyValuePair<string, string>("", "");
+      if (!MaterialList.TryGetValue(id, out Dictionary<long, string> matDict)) { }
+
+      if (matDict == null)
+        return new KeyValuePair<string, string>("", "");
+      else
+        return new KeyValuePair<string, string>(matDict[0], matDict.ContainsKey(-1) ? matDict[-1] : matDict.ContainsKey(1) ? matDict[1] : "");
+
+    }
+
+    public void Load(GomObjectData data) {
+      Id = data.ValueOrDefault<long>("appModelId", 0);
+      BaseFile = data.ValueOrDefault("appModelBaseFile", "");
+      var attachments = data.ValueOrDefault("appModelAttachments", new Dictionary<object, object>());
+      Attachments = attachments.ToDictionary(a => (long)a.Key, a => (string)a.Value);
+      SlotType = data.ValueOrDefault("appModelSlotType", new ScriptEnum()).ToString();
+
+      var matList = data.ValueOrDefault("appModelMaterialList", new Dictionary<object, object>());
+
+      if (matList.Count != 0) {
+        MaterialList = new Dictionary<long, Dictionary<long, string>>();
+        foreach (var mat in matList) {
+          Dictionary<long, string> matEntry = new Dictionary<long, string>();
+          foreach (var matFile in ((Dictionary<object, object>)mat.Value).ToDictionary(v => (long)v.Key, v => (string)v.Value)) {
+            matEntry.Add(matFile.Key, matFile.Value);
+          }
+          MaterialList.Add((long)mat.Key, matEntry);
+        }
+      }
+
+      SkinMaterialIndex = data.ValueOrDefault<long>("appModelSkinMaterialIndex", -1);
+      SkinHueIndex = data.ValueOrDefault<long>("appModelSkinHueIndex", -1);
+
+      var childSkinMaterials = data.ValueOrDefault<Dictionary<object, object>>("appModelChildSkinMaterials", null);
+      if (childSkinMaterials != null) {
+        if (childSkinMaterials.Count != 0) {
+          ChildSkinMaterials = new Dictionary<string, string>();
+          foreach (var skinMat in childSkinMaterials) {
+            ChildSkinMaterials.Add(((ScriptEnum)skinMat.Key).ToString(), skinMat.Value.ToString());
+          }
+        }
+      }
+
+      SithComplexion1 = data.ValueOrDefault<long>("appModelSithComplexion1", -1);
+      SithComplexion1 = data.ValueOrDefault<long>("appModelSithComplexion1", -1);
+
+      var repColor = data.ValueOrDefault<object>("appModelRepresentativeColor", null);
+
+      if (repColor != null) {
+        var repObject = repColor as GomObjectData;
+        if (repObject.Dictionary.Count > 3) {
+          RepresentativeColor = new Dictionary<string, float>();
+          foreach (var color in repObject.Dictionary.Skip(3)) {
+            RepresentativeColor.Add(color.Key, (float)color.Value);
+          }
+        }
+
+      }
+
+      var modelColors = data.ValueOrDefault("appModelColors", new Dictionary<object, object>());
+      Colors = new Dictionary<string, ModelColors>();
+      foreach (var kvp in modelColors) {
+        ModelColors mc = new ModelColors((GomObjectData)(kvp.Value));
+        Colors.Add(kvp.Key.ToString(), mc);
+      }
+    }
+
+    public override int GetHashCode() {
+      int hash = Id.GetHashCode();
+      if (BaseFile != null) hash ^= BaseFile.GetHashCode();
+      if (Attachments != null) foreach (var x in Attachments) { hash ^= x.GetHashCode(); }
+      if (SlotType != null) hash ^= SlotType.GetHashCode();
+      if (MaterialList != null) foreach (var x in MaterialList) { hash ^= x.GetHashCode(); }
+      hash ^= SkinMaterialIndex.GetHashCode();
+      hash ^= SkinHueIndex.GetHashCode();
+      if (ChildSkinMaterials != null) foreach (var x in ChildSkinMaterials) { hash ^= x.GetHashCode(); }
+      hash ^= SithComplexion1.GetHashCode();
+      hash ^= SithComplexion2.GetHashCode();
+      if (RepresentativeColor != null) foreach (var x in RepresentativeColor) { hash ^= x.GetHashCode(); }
+
+      return hash;
+    }
+
+    public override bool Equals(object obj) {
+      if (obj == null) return false;
+
+      if (ReferenceEquals(this, obj)) return true;
+
+      if (obj is not AMIEntry ame) return false;
+
+      return Equals(ame);
+    }
+
+    public bool Equals(AMIEntry ame) {
+      if (ame == null) return false;
+
+      if (ReferenceEquals(this, ame)) return true;
+
+      if (Id != ame.Id)
+        return false;
+
+      var lsComp = new Models.DictionaryComparer<long, string>();
+      if (!lsComp.Equals(Attachments, ame.Attachments))
+        return false;
+
+      if (BaseFile != ame.BaseFile)
+        return false;
+
+      var ssComp = new Models.DictionaryComparer<string, string>();
+      if (!ssComp.Equals(ChildSkinMaterials, ame.ChildSkinMaterials))
+        return false;
+
+      if (Colors != null) {
+        if (ame.Colors != null) {
+          if (Colors.Count != ame.Colors.Count)
+            return false;
+          foreach (var color in Colors) {
+            ame.Colors.TryGetValue(color.Key, out ModelColors oColor);
+            if (!color.Value.Equals(oColor))
+              return false;
+          }
+        } else
+          return false;
+      } else if (ame.Colors != null)
+        return false;
+
+      if (MaterialList != null) {
+        if (ame.MaterialList != null) {
+          if (MaterialList.Count != ame.MaterialList.Count)
+            return false;
+          foreach (var material in MaterialList) {
+            ame.MaterialList.TryGetValue(material.Key, out Dictionary<long, string> oMaterial);
+            if (!lsComp.Equals(material.Value, oMaterial))
+              return false;
+          }
+        } else
+          return false;
+      } else if (ame.MaterialList != null)
+        return false;
+
+      var sfComp = new Models.DictionaryComparer<string, float>();
+      if (!sfComp.Equals(RepresentativeColor, ame.RepresentativeColor))
+        return false;
+
+      if (SithComplexion1 != ame.SithComplexion1)
+        return false;
+      if (SithComplexion2 != ame.SithComplexion2)
+        return false;
+      if (SkinHueIndex != ame.SkinHueIndex)
+        return false;
+      if (SkinMaterialIndex != ame.SkinMaterialIndex)
+        return false;
+      if (SlotType != ame.SlotType)
+        return false;
+      return true;
+    }
+  }
+
+  public class ModelColors : IEquatable<ModelColors> {
+    long PrimaryColor { get; set; }
+    long SecondaryColor { get; set; }
+
+    public ModelColors(GomObjectData data) {
+      PrimaryColor = data.ValueOrDefault<long>("appModelPrimaryColor", 0);
+      SecondaryColor = data.ValueOrDefault<long>("appModelPrimaryColor", 0);
+    }
+
+    public override int GetHashCode() {
+      int hash = PrimaryColor.GetHashCode();
+      hash ^= SecondaryColor.GetHashCode();
+      return hash;
+    }
+
+    public override bool Equals(object obj) {
+      if (obj == null) return false;
+
+      if (ReferenceEquals(this, obj)) return true;
+
+      if (obj is not ModelColors ame) return false;
+
+      return Equals(ame);
+    }
+
+    public bool Equals(ModelColors ame) {
+      if (ame == null) return false;
+
+      if (ReferenceEquals(this, ame)) return true;
+
+      if (PrimaryColor != ame.PrimaryColor)
+        return false;
+      if (SecondaryColor != ame.SecondaryColor)
+        return false;
+      return true;
+    }
+  }
+}

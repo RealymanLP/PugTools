@@ -1,0 +1,47 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+		<AssemblyName>HexControl</AssemblyName>
+		<AssemblyVersion>1.6.0.0</AssemblyVersion>
+		<Authors>Bright Ideas</Authors>
+		<Company>Bright Ideas</Company>
+		<Description>C# / .NET Hexidecimal Editor Control</Description>
+		<FileVersion>1.6.0.0</FileVersion>
+		<NeutralLanguage>en-US</NeutralLanguage>
+		<PackageId>Hexidecimal Control</PackageId>
+		<Platforms>x64</Platforms>
+		<ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+		<Product>Hexidecimal Control</Product>
+		<TargetFramework>net6.0-windows</TargetFramework>
+		<UseWindowsForms>true</UseWindowsForms>
+		<Version>1.6.0</Version>
+	</PropertyGroup>
+
+	<PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|x64' ">
+		<BaseAddress>285212672</BaseAddress>
+		<ErrorReport>prompt</ErrorReport>
+		<FileAlignment>4096</FileAlignment>
+		<DebugSymbols>true</DebugSymbols>
+		<DebugType>portable</DebugType>
+		<DefineConstants>DEBUG;TRACE</DefineConstants>
+		<DocumentationFile>BeWindowsFormsHexBox.xml</DocumentationFile>
+		<!--<OutDir>$(SolutionDir)..\Bin\$(Configuration)\DLLs</OutDir>-->
+		<OutputPath>$(BaseOutputPath)$(Configuration)</OutputPath>
+		<WarningLevel>4</WarningLevel>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<Compile Update="Properties\Resources.Designer.cs">
+			<DesignTime>True</DesignTime>
+			<AutoGen>True</AutoGen>
+			<DependentUpon>Resources.resx</DependentUpon>
+		</Compile>
+		<EmbeddedResource Update="Properties\Resources.resx">
+			<Generator>ResXFileCodeGenerator</Generator>
+			<LastGenOutput>Resources.Designer.cs</LastGenOutput>
+		</EmbeddedResource>
+		<None Include="HexBox.snk" />
+	</ItemGroup>
+
+</Project>

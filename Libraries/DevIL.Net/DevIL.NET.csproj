@@ -1,0 +1,53 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+		<AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+		<AssemblyName>DevIL .NET</AssemblyName>
+		<Authors>Nicholas Woodfield</Authors>
+		<Copyright>Copyright © Nicholas Woodfield 2012</Copyright>
+		<Description>.NET for the Open Image Library (DevIL)</Description>
+		<NeutralLanguage>en-US</NeutralLanguage>
+		<PackageId>DevIL .NET</PackageId>
+		<Platforms>x64</Platforms>
+		<PlatformTarget>x64</PlatformTarget>
+		<Product>DevIL .NET</Product>
+		<ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+		<RootNamespace>DevIL</RootNamespace>
+		<TargetFramework>net6.0</TargetFramework>
+	</PropertyGroup>
+
+	<PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+		<DebugSymbols>true</DebugSymbols>
+		<DebugType>portable</DebugType>
+		<DefineConstants>TRACE;DEBUG</DefineConstants>
+		<ErrorReport>prompt</ErrorReport>
+		<NoWarn></NoWarn>
+		<OutputPath>$(BaseOutputPath)$(Configuration)</OutputPath>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<Reference Include="DevIL">
+			<HintPath>DevIL.dll</HintPath>
+		</Reference>
+		<Reference Include="ILU">
+			<HintPath>ILU.dll</HintPath>
+		</Reference>
+		<Reference Include="ILUT">
+			<HintPath>ILUT.dll</HintPath>
+		</Reference>
+	</ItemGroup>
+
+	<ItemGroup>
+	  <None Update="DevIL.dll">
+	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+	  </None>
+	  <None Update="ILU.dll">
+	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+	  </None>
+	  <None Update="ILUT.dll">
+		<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+	  </None>
+	</ItemGroup>
+
+</Project>

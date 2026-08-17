@@ -1,0 +1,7 @@
+<Project>
+	<PropertyGroup>
+		<BaseOutputPath>..\..\Build\GomLib\Bin\</BaseOutputPath>
+		<BaseIntermediateOutputPath>..\..\Build\GomLib\Obj\</BaseIntermediateOutputPath>
+		<MSBuildProjectExtensionsPath>$(BaseIntermediateOutputPath)</MSBuildProjectExtensionsPath>
+	</PropertyGroup>
+</Project>

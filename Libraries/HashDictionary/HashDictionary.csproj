@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+		<Platforms>x64</Platforms>
+		<PlatformTarget>x64</PlatformTarget>
+		<ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+		<TargetFramework>net6.0</TargetFramework>
+	</PropertyGroup>
+
+	<PropertyGroup>
+		<AssemblyName>HashDictionary</AssemblyName>
+		<Authors>perso</Authors>
+		<Copyright>Copyright © perso 2008</Copyright>
+		<NeutralLanguage>en-US</NeutralLanguage>
+		<RootNamespace>nsHashDictionary</RootNamespace>
+	</PropertyGroup>
+
+	<PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+		<DebugSymbols>true</DebugSymbols>
+		<DebugType>portable</DebugType>
+		<DefineConstants>TRACE;DEBUG</DefineConstants>
+		<ErrorReport>prompt</ErrorReport>
+		<OutputPath>$(BaseOutputPath)$(Configuration)</OutputPath>
+		<WarningLevel>4</WarningLevel>
+	</PropertyGroup>
+
+	<!-- <ItemGroup>
+		<None Include="ClassDiagram1.cs" />
+	</ItemGroup> -->
+
+</Project>

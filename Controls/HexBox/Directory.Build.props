@@ -1,0 +1,7 @@
+<Project>
+    <PropertyGroup>
+        <BaseOutputPath>..\..\Build\Controls\HexBox\Bin\</BaseOutputPath>
+        <BaseIntermediateOutputPath>..\..\Build\Controls\HexBox\Obj\</BaseIntermediateOutputPath>
+        <MSBuildProjectExtensionsPath>$(BaseIntermediateOutputPath)</MSBuildProjectExtensionsPath>
+    </PropertyGroup>
+</Project>

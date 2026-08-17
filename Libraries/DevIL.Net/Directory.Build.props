@@ -1,0 +1,7 @@
+<Project>
+    <PropertyGroup>
+        <BaseOutputPath>..\..\Build\DevIL.NET\Bin\</BaseOutputPath>
+        <BaseIntermediateOutputPath>..\..\Build\DevIL.NET\Obj\</BaseIntermediateOutputPath>
+        <MSBuildProjectExtensionsPath>$(BaseIntermediateOutputPath)</MSBuildProjectExtensionsPath>
+    </PropertyGroup>
+</Project>

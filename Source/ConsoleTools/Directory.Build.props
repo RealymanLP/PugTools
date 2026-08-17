@@ -1,0 +1,7 @@
+<Project>
+    <PropertyGroup>
+        <BaseOutputPath>..\..\Build\ConsoleTools\Bin\</BaseOutputPath>
+        <BaseIntermediateOutputPath>..\..\Build\ConsoleTools\Obj\</BaseIntermediateOutputPath>
+        <MSBuildProjectExtensionsPath>$(BaseIntermediateOutputPath)</MSBuildProjectExtensionsPath>
+    </PropertyGroup>
+</Project>

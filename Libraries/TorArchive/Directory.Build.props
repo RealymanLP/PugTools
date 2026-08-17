@@ -1,0 +1,7 @@
+<Project>
+	<PropertyGroup>
+		<BaseOutputPath>..\..\Build\TorArchive\Bin\</BaseOutputPath>
+		<BaseIntermediateOutputPath>..\..\Build\TorArchive\Obj\</BaseIntermediateOutputPath>
+		<MSBuildProjectExtensionsPath>$(BaseIntermediateOutputPath)</MSBuildProjectExtensionsPath>
+	</PropertyGroup>
+</Project>

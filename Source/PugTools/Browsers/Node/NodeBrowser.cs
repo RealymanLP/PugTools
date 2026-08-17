@@ -1,0 +1,1125 @@
+﻿using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Data;
+using System.Diagnostics;
+using System.Linq;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using System.Xml;
+using System.Xml.Linq;
+
+using BrightIdeasSoftware;
+
+using GomLib;
+using TorArchive;
+
+namespace PugTools {
+  internal partial class NodeBrowser : Form {
+    #region Fields
+    private Dictionary<String, NodeAsset> _assetDict;
+    private readonly String _assetsLocation;
+    private readonly Boolean _assetsUsePts;
+    private Boolean _buildCsv;
+    private Boolean _closing;
+    private Boolean _collapsed;
+    private Assets _currentAssets;
+    private DataObjectModel _currentDom;
+    private String[] _current; // 0 = Item, 1 = Node, 2 = Parent.
+    private String _currentTreeNode;
+    private Dictionary<String, String> _customNodeSort;
+    private HashSet<String> _customRoots;
+    private readonly Boolean _customSort;
+    private DataTable _dataTable;
+    private Boolean _filter;
+    private Dictionary<String, DomType> _nodeDict;
+    private TreeNode[] _nodeMatch;
+    private HashSet<String> _outputData;
+    private List<NodeOutput> _outputList;
+    private ArrayList _rootList;
+    private Int32 _searchIndex;
+    private List<String> _searchNodes;
+    #endregion
+
+    #region NodeBrowser
+    internal NodeBrowser(String assetLocation, Boolean usePTS, String extractLocation) {
+      if (extractLocation == null) throw new ArgumentNullException(nameof(extractLocation));
+
+      InitializeComponent();
+      Config.Load();
+
+      _assetsLocation = assetLocation;
+      _assetsUsePts = usePTS;
+
+      using System.IO.StringReader stringReader =
+        new System.IO.StringReader(Properties.Resources.CustomNodeSorting);
+      XmlDocument xmlDoc = new XmlDocument();
+      xmlDoc.Load(stringReader);
+
+      _customRoots = new HashSet<String>();
+      _customNodeSort = new Dictionary<String, String>();
+      _customSort = Convert.ToBoolean(
+        xmlDoc.SelectSingleNode("/custom_sort").Attributes["enabled"].Value
+      );
+      txtExtractPath.Text = Config.ExtractAssetsPath;
+
+      foreach (XmlNode node in xmlDoc.SelectNodes("/custom_sort/roots/root")) {
+        _customRoots.Add(node.Attributes["name"].Value);
+      }
+
+      foreach (XmlNode node in xmlDoc.SelectNodes("/custom_sort/nodes/node")) {
+        _customNodeSort.Add(node.Attributes["name"].Value, node.Attributes["parent"].Value);
+      }
+
+      StatusLabel1Text("Loading Assets ...");
+      LoadingSwirlShow();
+      ProgressBarShow();
+
+      backgroundWorker1.RunWorkerAsync();
+
+      treeViewGrid1.CanExpandGetter = delegate (Object x) {
+        return ((NodeListItem)x).children.Count > 0;
+      };
+
+      treeViewGrid1.ChildrenGetter = delegate (Object x) {
+        NodeListItem obj = (NodeListItem)x;
+        ArrayList children = new ArrayList();
+
+        foreach (NodeListItem child in obj.children) {
+          if (child.DisplayName.Contains("Script_")) continue;
+
+          children.Add(child);
+        }
+
+        return children;
+      };
+    }
+    private void NodeBrowserFormClosed(Object sender, FormClosedEventArgs e) {
+      Hide();
+
+      if (treeViewFast1 != null) {
+        treeViewFast1.Dispose();
+        treeViewFast1 = null;
+      }
+
+      if (treeViewGrid1 != null) {
+        treeViewGrid1.Dispose();
+        treeViewGrid1 = null;
+      }
+
+      if (dataGridView1 != null) {
+        dataGridView1.Dispose();
+        dataGridView1 = null;
+      }
+
+      _assetDict = null;
+      _currentAssets = null;
+      _currentDom = null;
+      _customNodeSort = null;
+      _customRoots = null;
+      _dataTable = null;
+      _nodeDict = null;
+      _outputData = null;
+      _outputList = null;
+      _rootList = null;
+      _searchNodes = null;
+
+      Dispose(true);
+
+      System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.Interactive;
+    }
+    private void NodeBrowserFormClosing(Object sender, FormClosingEventArgs e) {
+      System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.LowLatency;
+      _closing = true;
+    }
+    private void NodeBrowserFormResize(Object sender, EventArgs e) {
+      treeViewFast1.Size =
+        new System.Drawing.Size(splitContainer2.Panel1.Width, splitContainer2.Panel1.Height - 70);
+    }
+    #endregion
+
+    #region Background Workers
+    private void BackgroundWorker1Run(Object sender, DoWorkEventArgs e) {
+      if (_closing) return;
+
+      System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.LowLatency;
+
+      _currentAssets = AssetHandler.Instance.GetCurrentAssets(_assetsLocation, _assetsUsePts);
+      _currentDom = DomHandler.Instance.GetCurrentDOM(_currentAssets);
+    }
+    private void BackgroundWorker1Completed(Object sender, RunWorkerCompletedEventArgs e) {
+      if (_closing) return;
+
+      if (e.Error != null) {
+        throw new Exception("Echter Fehler beim Laden: " + e.Error, e.Error);
+      }
+
+      _assetDict = new Dictionary<String, NodeAsset> {
+        { "/", new NodeAsset("/", "", "Root", null) }
+      };
+
+      _currentDom.NodeLookup.TryGetValue(typeof(GomObject), out _nodeDict);
+
+      ProgressBarStyle(System.Windows.Forms.ProgressBarStyle.Continuous);
+      StatusLabel1Text("Loading Nodes ...");
+
+      backgroundWorker2.RunWorkerAsync();
+    }
+    private void BackgroundWorker2Progress(Object sender, ProgressChangedEventArgs e) {
+      ProgressBarValue(e.ProgressPercentage);
+    }
+    private void BackgroundWorker2Run(Object sender, DoWorkEventArgs e) {
+      if (_closing) return;
+
+      HashSet<String> allDirs = new HashSet<String>();
+      HashSet<String> nodeDirs = new HashSet<String>();
+
+      if (_customSort)
+        if (_customRoots.Count > 0)
+          foreach (String customRoot in _customRoots) {
+            _assetDict.Add(customRoot, new NodeAsset(customRoot, "/", customRoot, null));
+            nodeDirs.Add(customRoot);
+          }
+
+      if (_nodeDict != null) {
+        Int32 nodesDone = 0;
+        Int32 nodesTotal = _nodeDict.Count;
+
+        foreach (KeyValuePair<String, DomType> node in _nodeDict) {
+          GomObject obj = (GomObject)node.Value;
+          String display = node.Key;
+          String parent;
+
+          if (obj.Name.Contains(".")) {
+            String[] temp = obj.Name.Split('.');
+            parent = String.Join(".", temp.Take(temp.Length - 1));
+
+            if (_customSort)
+              if (_customNodeSort.Count > 0)
+                foreach (KeyValuePair<String, String> n in _customNodeSort)
+                  if (obj.Name.StartsWith(n.Key)) {
+                    String origParent = parent;
+                    parent = n.Value + "." + parent;
+                    display = display.Replace(origParent, "").Replace(".", "");
+
+                  } else {
+                    display = display.Replace(parent, "").Replace(".", "");
+                  }
+
+            nodeDirs.Add(parent);
+          } else {
+            parent = "/";
+
+            if (_customSort)
+              if (_customNodeSort.Count > 0)
+                foreach (KeyValuePair<String, String> n in _customNodeSort)
+                  if (obj.Name.StartsWith(n.Key)) parent = n.Value;
+          }
+
+          NodeAsset asset = new NodeAsset(node.Key, parent, display, obj);
+
+          _assetDict.Add(node.Key, asset);
+
+          nodesDone++;
+          backgroundWorker2.ReportProgress(nodesDone * 100 / nodesTotal);
+        }
+
+        foreach (String dir in nodeDirs) {
+          String[] temp = dir.Split('.');
+          Int32 intLength = temp.Length;
+
+          for (Int32 intCount2 = 0; intCount2 <= intLength; intCount2++) {
+            String output = String.Join(".", temp, 0, intCount2);
+
+            if (!String.IsNullOrEmpty(output)) allDirs.Add(output);
+          }
+        }
+
+        foreach (String dir in allDirs) {
+          String[] temp = dir.Split('.');
+          String parentDir = String.Join(".", temp.Take(temp.Length - 1));
+
+          if (String.IsNullOrEmpty(parentDir)) parentDir = "/";
+
+          String display = temp.Last();
+          NodeAsset asset = new NodeAsset(dir, parentDir, display, null);
+
+          if (!_assetDict.ContainsKey(dir)) _assetDict.Add(dir, asset);
+        }
+      }
+    }
+    private void BackgroundWorker2Completed(Object sender, RunWorkerCompletedEventArgs e) {
+      if (_closing) return;
+
+      ProgressBarValue(0);
+      ProgressBarStyle(System.Windows.Forms.ProgressBarStyle.Marquee);
+      StatusLabel1Text("Loading Tree View Items ...");
+
+      backgroundWorker3.RunWorkerAsync();
+    }
+    private void BackgroundWorker3Run(Object sender, DoWorkEventArgs e) {
+      if (_closing) return;
+
+      String getId(NodeAsset x) => x.id;
+      String getParentId(NodeAsset x) => x.parentId;
+      String getDisplayName(NodeAsset x) => x.displayName;
+
+      treeViewFast1.BeginUpdate();
+      treeViewFast1.LoadItems<NodeAsset>(_assetDict, getId, getParentId, getDisplayName);
+      treeViewFast1.EndUpdate();
+      TreeViewFast1Show();
+    }
+    private void BackgroundWorker3Completed(Object sender, RunWorkerCompletedEventArgs e) {
+      if (_closing) return;
+
+      ProgressBarHide();
+      StatusLabel1Text("Loading Complete.");
+      ProgressBarValue(0);
+      ProgressBarStyle(System.Windows.Forms.ProgressBarStyle.Continuous);
+
+      System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.Interactive;
+
+      LoadingSwirlHide();
+      TreeViewGrid1Show();
+      ButtonsEnable();
+
+      // Expand root node
+      if (treeViewFast1.Nodes.Count > 0) treeViewFast1.Nodes[0].Expand();
+
+      txtSearch.Focus();
+    }
+    #endregion
+
+    #region Buttons
+    private void BtnClearSearchClick(Object sender, EventArgs e) {
+      _searchNodes = new List<String>();
+      _searchIndex = 0;
+      txtSearch.Enabled = true;
+      txtSearch.Text = String.Empty;
+      btnSearch.Enabled = true;
+      btnFindNext.Enabled = false;
+      btnClearSearch.Enabled = false;
+      StatusLabel1Text(String.Empty);
+    }
+    private void BtnExtractClick(Object sender, EventArgs e) {
+      try {
+        LoadingSwirlShow();
+        ProgressBarShow();
+        StatusLabel1Text("Extracting Objects ...");
+      }
+      finally {
+        NodeExtraction();
+        StatusLabel1Text("Finished Extracting Objects.");
+        ProgressBarHide();
+        LoadingSwirlHide();
+      }
+    }
+    private void BtnExtractPathClick(Object sender, EventArgs e) {
+      FolderBrowserDialog fbd = new FolderBrowserDialog {
+        SelectedPath = txtExtractPath.Text
+      };
+
+      _ = fbd.ShowDialog();
+
+      txtExtractPath.Text = fbd.SelectedPath + "\\";
+    }
+    private async void BtnFileFinderClick(Object sender, EventArgs e) {
+      DialogResult result = MessageBox.Show(
+        "Run File Name Finder?",
+        "Confirm File Name Finder",
+        MessageBoxButtons.YesNo,
+        MessageBoxIcon.Question
+      );
+
+      if (result == DialogResult.Yes) {
+        DialogResult resultBuild = MessageBox.Show(
+          "Build CSV File?",
+          "Build CSV",
+          MessageBoxButtons.YesNo,
+          MessageBoxIcon.Question
+        );
+
+        if (resultBuild == DialogResult.Yes) {
+          _buildCsv = true;
+        } else {
+          _buildCsv = false;
+        }
+
+        LoadingSwirlShow();
+        ProgressBarStyle(System.Windows.Forms.ProgressBarStyle.Marquee);
+        ProgressBarShow();
+        StatusLabel1Text("Running File Name Finder ...");
+
+        await Task.Run(() => NodeFindFilenames());
+
+        StatusLabel1Text("File Name Finder Complete.");
+
+        MessageBox.Show(
+          "File Name Files Generated",
+          "Files Generated",
+          MessageBoxButtons.OK,
+          MessageBoxIcon.Information
+        );
+
+        ProgressBarHide();
+        ProgressBarStyle(System.Windows.Forms.ProgressBarStyle.Continuous);
+        LoadingSwirlHide();
+      }
+    }
+    private void BtnFindNextClick(Object sender, EventArgs e) {
+      if (_searchNodes.ElementAtOrDefault(_searchIndex) != null) {
+        _nodeMatch = treeViewFast1.Nodes.Find(_searchNodes[_searchIndex], true);
+        treeViewFast1.SelectedNode = _nodeMatch[0];
+        btnFindNext.Focus();
+        StatusLabel1Text("Item " + (_searchIndex + 1) + " of " + _searchNodes.Count);
+        _searchIndex++;
+      } else {
+        StatusLabel1Text("Search Complete.");
+        MessageBox.Show("No more search terms found");
+      }
+    }
+    private void BtnSearchClick(Object sender, EventArgs e) {
+      Search();
+    }
+    private void BtnToggleNodesClick(Object sender, EventArgs e) {
+      // Check if we can collapse or expand the selected node.
+      if (treeViewGrid1.SelectedObject != null) {
+        TreeListView.Branch br = treeViewGrid1.TreeModel.GetBranch(treeViewGrid1.SelectedObject);
+
+        if (br != null && br.CanExpand && !br.IsExpanded) {
+          // Expand node and all child nodes.
+          TreeViewGrid1Hide();
+          LoadingSwirlShow();
+          ProgressBarShow();
+
+          foreach (Object nodeObj in treeViewGrid1.GetChildren(treeViewGrid1.SelectedObject))
+            treeViewGrid1.Expand(nodeObj);
+
+          treeViewGrid1.Expand(treeViewGrid1.SelectedObject);
+
+          btnToggleCollapse.Text = "Collapse Child Nodes";
+
+          TreeViewGrid1Show();
+          ProgressBarHide();
+          LoadingSwirlHide();
+          return;
+
+        } else if (br != null && br.CanExpand && br.IsExpanded) {
+          // Collapse node and all child nodes.
+          TreeViewGrid1Hide();
+          LoadingSwirlShow();
+          ProgressBarShow();
+
+          foreach (Object nodeObj in treeViewGrid1.GetChildren(treeViewGrid1.SelectedObject))
+            treeViewGrid1.Collapse(nodeObj);
+
+          treeViewGrid1.Collapse(treeViewGrid1.SelectedObject);
+
+          btnToggleCollapse.Text = "Expand Child Nodes";
+
+          TreeViewGrid1Show();
+          ProgressBarHide();
+          LoadingSwirlHide();
+          return;
+        }
+      }
+
+      // Couldn't collapse or expand child node. Do whole page.
+      if (_collapsed) {
+        _collapsed = false;
+        treeViewGrid1.ExpandAll();
+        btnToggleCollapse.Text = "Collapse Child Nodes";
+      } else {
+        _collapsed = true;
+        treeViewGrid1.CollapseAll();
+        btnToggleCollapse.Text = "Expand Child Nodes";
+      }
+    }
+    private void ButtonsEnable() {
+      txtSearch.Enabled = true;
+      btnSearch.Enabled = true;
+      btnExtractPath.Enabled = true;
+      btnExtract.Enabled = true;
+      btnFileFinder.Enabled = true;
+    }
+    #endregion
+
+    #region LoadingSwirl
+    private void LoadingSwirlHide() {
+      if (loadingSwirl1.InvokeRequired) loadingSwirl1.Invoke(new Action(() => LoadingSwirlHide()));
+      else loadingSwirl1.Visible = false;
+    }
+    private void LoadingSwirlShow() {
+      if (loadingSwirl1.InvokeRequired) loadingSwirl1.Invoke(new Action(() => LoadingSwirlShow()));
+      else loadingSwirl1.Visible = true;
+    }
+    #endregion
+
+    #region Node Methods
+    // private void NodeExtractByNode(TreeNodeCollection nodes) {
+    //   foreach (TreeNode child in nodes) {
+    //     TreeListItem asset = (TreeListItem)child.Tag;
+
+    //     if (asset.HashInfo.File != null) {
+    //       // extractAsset(asset.file);
+    //     }
+
+    //     if (child.Nodes.Count > 0)
+    //       NodeExtractByNode(child.Nodes);
+    //   }
+    // }
+    private void NodeExtraction() {
+      treeViewFast1.Invoke(new Action(() => {
+        TreeNode node = treeViewFast1.SelectedNode;
+        String extractResult = NodeExtraction(node, false);
+
+        if (String.IsNullOrEmpty(extractResult))
+          extractResult = "Extracted all objects to " + txtExtractPath.Text;
+
+        MessageBox.Show(extractResult);
+      }));
+    }
+    private String NodeExtraction(TreeNode node, Boolean bulkExtract = false) {
+      NodeAsset asset = (NodeAsset)node.Tag;
+
+      if (asset.Obj != null) {
+        WriteFile(
+          new XDocument(new XElement(asset.Obj.Print())),
+          asset.Obj.Name + ".xml",
+          false,
+          false
+        );
+
+        Byte[] buffer = asset.Obj.GetRawUncompressedNode();
+
+        WriteFile(buffer, asset.Obj.Name + ".node");
+
+        if (bulkExtract == false)
+          // MessageBox.Show("Extracted " + asset.Obj.Name + " to " + extractPath);
+          return "Extracted " + asset.Obj.Name + " to " + txtExtractPath.Text;
+      } else {
+        foreach (TreeNode childNode in node.Nodes)
+          NodeExtraction(childNode, true);
+      }
+
+      return String.Empty;
+    }
+    private void NodeFindFilenames() {
+      Int32 nodeCount = 0;
+      Boolean firstRun = true;
+      NodeFileSource _nodeSource = new NodeFileSource();
+
+      foreach (KeyValuePair<String, List<NodeFileSourceItem>> source in _nodeSource.sources) {
+        _searchNodes ??= new List<String>();
+        _searchNodes = _assetDict.Keys.Where(d => d.Contains(source.Key)).ToList();
+
+        _current ??= new String[3];
+
+        foreach (String nodeKey in _searchNodes) {
+          _current[1] = nodeKey; // Node
+          NodeAsset node = _assetDict[nodeKey];
+
+          if (node.Obj != null && node.Obj.Data != null) {
+            _current[0] = node.id; // Item
+
+            foreach (KeyValuePair<String, Object> item in node.Obj.Data.Dictionary) {
+              NodeListItem dataItem = new NodeListItem(item.Key.ToString(), item.Value);
+
+              if (dataItem.children.Count > 0) {
+                _current[2] = dataItem.Name.ToString(); // Parent
+
+                foreach (NodeListItem child in dataItem.children)
+                  NodeHandleChildData(child, source.Value);
+
+                dataItem.children.Clear();
+              }
+
+              dataItem = null;
+            }
+            node.Obj.Unload();
+            nodeCount++;
+          }
+
+          node = null;
+
+          // if (nodeCount == 10000) {
+          //   if (outputData.Count > 0 || outputList.Count > 0) {
+          //     writeData(firstRun);
+          //     outputData.Clear();
+          //     outputList.Clear();
+          //     firstRun = false;
+          //   }
+
+          //   GC.Collect();
+          //   nodeCount = 0;                            
+          // }
+        }
+
+        if (source.Value.Count > 0) source.Value.Clear();
+      }
+
+      _searchNodes.Clear();
+      _nodeSource.sources.Clear();
+
+      _current = null;
+      _searchNodes = null;
+      _nodeSource = null;
+
+      GC.Collect();
+      WriteData(firstRun);
+    }
+    private void NodeDataGet(NodeAsset asset) {
+      if (asset.Obj.Data != null) {
+        _rootList = new ArrayList();
+
+        foreach (KeyValuePair<String, Object> item in asset.Obj.Data.Dictionary) {
+          if (item.Key.Contains("Script_")) continue;
+
+          DomClass classLookup = (DomClass)asset.Obj.Data.Dictionary["Script_Type"];
+          DomField fieldLookup = classLookup.Fields.Find(x => x.Name == item.Key);
+
+          if (fieldLookup == null) {
+            try {
+              UInt64 id = UInt64.Parse(item.Key);
+              fieldLookup = classLookup.Fields.Find(x => x.Id == id);
+
+              if (fieldLookup == null)
+                _currentDom.DomTypeMap.TryGetValue(id, out _); // DomType fieldLookup2); // Hmmm ???
+            }
+            catch (Exception ex) {
+              Debug.WriteLine("Could not parse string: '" + item.Key.ToString() + "'");
+              Debug.WriteLine("Exception: " + ex.ToString());
+            }
+          }
+
+          try {
+            if (fieldLookup == null) {
+              NodeListItem item3 = new NodeListItem(item.Key, item.Value, null);
+              _rootList.Add(item3);
+            } else {
+              NodeListItem item3 = new NodeListItem(item.Key, item.Value, fieldLookup.GomType);
+              _rootList.Add(item3);
+            }
+          }
+          catch (Exception ex) {
+            Debug.WriteLine("Exception: " + ex.ToString());
+          }
+        }
+      }
+    }
+    private void NodeHandleChildData(NodeListItem item, List<NodeFileSourceItem> fields) {
+      if (item != null) {
+        if (item.children.Count > 0) {
+          _current[2] = item.Name.ToString(); // Parent
+
+          foreach (NodeListItem child in item.children) NodeHandleChildData(child, fields);
+
+        } else {
+          if (item.value != null) {
+            _outputData ??= new HashSet<String>();
+            _outputList ??= new List<NodeOutput>();
+
+            foreach (NodeFileSourceItem field in fields) {
+              if (item.DisplayName == field.field) {
+                switch (field.type) {
+                  case "fx":
+                    break;
+                  case "fxgr2":
+                    break;
+                  case "icon":
+                    break;
+                  case "/":
+                    break;
+                  case "cnv":
+                    break;
+                  case "gfximg":
+                    break;
+                  case "spec":
+                    break;
+                  case "anim":
+                    break;
+                  case "gr2":
+                    break;
+                  case "string":
+                    break;
+                  case "bnk":
+                    break;
+                  case "dds":
+                    break;
+                  case "load":
+                    break;
+                  case "tip":
+                    break;
+                  case "codex":
+                    break;
+                  default:
+                    throw new ArgumentException("Unhandled field type: " + field.type);
+                }
+
+                if (item.value.ToString().StartsWith("stg.")) continue;
+
+                if (_buildCsv) {
+                  NodeOutput output = new NodeOutput(
+                    _current[1], // Node
+                    _current[0], // Item
+                    _current[2], // Parent
+                    item.Name.ToString(),
+                    item.value.ToString()
+                  );
+                  _outputList.Add(output);
+                }
+
+                _outputData.Add(item.value.ToString());
+              }
+            }
+
+            // if (item.value.GetType() != typeof(string))
+            //   return;
+            // else {
+            //   if (item.displayName == "String Value")
+            //     return;
+
+            //   String value = (String)item.value;
+
+            //   if (value.Contains("/") || value.Contains("\\")) {
+            //     if (value.Contains("</text>") 
+            //         || value.Contains("<locComment />") 
+            //         || value.Contains("/%") 
+            //         || value.Contains("/$"))
+            //       return;
+
+            //       if (BuildCSV) {
+            //         NodeOutput output = new NodeOutput(
+            //           this.currentNode, 
+            //           this.currentItem, 
+            //           this.currentParent, 
+            //           item.name.ToString(), 
+            //           value
+            //         );
+            //         outputList.Add(output);
+            //       }                                
+
+            //        outputData.Add(value);
+            //   }
+            // }
+
+          }
+        }
+      }
+    }
+    #endregion
+
+    #region Search
+    private void Search() {
+      StatusLabel1Text("Performing Search ...");
+      _searchNodes ??= new List<String>();
+      _searchNodes = _assetDict.Keys.Where(d => d.Contains(txtSearch.Text)).ToList();
+
+      if (_searchNodes.Count > 0) {
+        Searching();
+      } else {
+        if (UInt64.TryParse(txtSearch.Text, out UInt64 nodeId)) {
+          GomObject node = _currentDom.GetObject(nodeId);
+
+          if (node != null) {
+            txtSearch.Text = node.Name;
+            _searchNodes = _assetDict.Keys.Where(d => d.Contains(txtSearch.Text)).ToList();
+
+            if (_searchNodes.Count > 0) {
+              Searching();
+              return;
+            }
+          }
+        }
+
+        StatusLabel1Text("Search Complete.");
+        MessageBox.Show("Search term not found.");
+      }
+    }
+    private void Searching() {
+      txtSearch.Enabled = false;
+      btnSearch.Enabled = false;
+      btnFindNext.Enabled = true;
+      btnClearSearch.Enabled = true;
+      StatusLabel1Text("Found " + (_searchNodes.Count + 1) + " Matches.");
+      LoadingSwirlShow();
+      _nodeMatch = treeViewFast1.Nodes.Find(_searchNodes[_searchIndex], true);
+      LoadingSwirlHide();
+      treeViewFast1.SelectedNode = _nodeMatch[0];
+      btnFindNext.Focus();
+      StatusLabel1Text("Item " + (_searchIndex + 1) + " of " + _searchNodes.Count);
+      _searchIndex++;
+    }
+    #endregion
+
+    #region ToolStrip1
+    private void ToolStripButton1Click(Object sender, EventArgs e) {
+      if (!String.IsNullOrEmpty(toolStripTextBox1.Text)) {
+        toolStripTextBox1.Enabled = false;
+        toolStripButton1.Enabled = false;
+        toolStripButton2.Enabled = true;
+        treeViewGrid1.ModelFilter = TextMatchFilter.Contains(treeViewGrid1, toolStripTextBox1.Text);
+        _filter = true;
+      }
+    }
+    private void ToolStripButton2Click(Object sender, EventArgs e) {
+      treeViewGrid1.ModelFilter = null;
+      toolStripTextBox1.Text = String.Empty;
+      toolStripTextBox1.Enabled = true;
+      toolStripButton1.Enabled = true;
+      toolStripButton2.Enabled = false;
+      _filter = false;
+    }
+    private void ToolStripButton3Click(Object sender, EventArgs e) {
+      toolStrip1.Visible = false;
+    }
+    private void ToolStripButton3MouseEnter(Object sender, EventArgs e) {
+      toolStripButton3.BackColor = System.Drawing.Color.Red;
+      toolStripButton3.ForeColor = System.Drawing.Color.White;
+    }
+    private void ToolStripButton3MouseLeave(Object sender, EventArgs e) {
+      toolStripButton3.BackColor = System.Drawing.SystemColors.Control;
+      toolStripButton3.ForeColor = System.Drawing.Color.Black;
+    }
+    private void ToolStripMenuItem1Click(Object sender, EventArgs e) {
+      BtnExtractClick(this, null);
+    }
+    private void ToolStripMenuItem2Click(Object sender, EventArgs e) {
+      // BrightIdeasSoftware.TreeListView tlv = sender as BrightIdeasSoftware.TreeListView;
+      NodeListItem item = treeViewGrid1.SelectedObject as NodeListItem;
+      // NodeListItem item = tr.SelectedObject as NodeListItem;
+      String nodeString;
+
+      if (item.DisplayValue.Contains(" (") && item.DisplayValue.EndsWith(")")) {
+        nodeString = item.DisplayValue.Split(' ').Last().Replace("(", "").Replace(")", "");
+      } else {
+        nodeString = item.DisplayName.Split(' ').Last().Replace("(", "").Replace(")", "");
+      }
+
+      TreeNode[] node = treeViewFast1.Nodes.Find(nodeString, true);
+      treeViewFast1.SelectedNode = node.First();
+    }
+    private void ToolStripTextBox1KeyDown(Object sender, KeyEventArgs e) {
+      if (e.KeyCode == Keys.Enter && !String.IsNullOrEmpty(toolStripTextBox1.Text)) {
+        toolStripTextBox1.Enabled = false;
+        toolStripButton1.Enabled = false;
+        toolStripButton2.Enabled = true;
+        treeViewGrid1.ModelFilter = TextMatchFilter.Contains(treeViewGrid1, toolStripTextBox1.Text);
+        _filter = true;
+      }
+      if (e.Control && e.KeyCode == Keys.F) toolStrip1.Visible = false;
+    }
+    #endregion
+
+    #region ToolStripProgressBar1
+    private void ProgressBarHide() {
+      if (statusStrip1.InvokeRequired)
+        statusStrip1.Invoke(new Action(() => ProgressBarHide()));
+      else
+        toolStripProgressBar1.Visible = false;
+    }
+    private void ProgressBarShow() {
+      if (statusStrip1.InvokeRequired)
+        statusStrip1.Invoke(new Action(() => ProgressBarShow()));
+      else
+        toolStripProgressBar1.Visible = true;
+    }
+    private void ProgressBarStyle(ProgressBarStyle style) {
+      if (statusStrip1.InvokeRequired)
+        statusStrip1.Invoke(new Action(() => ProgressBarStyle(style)));
+      else
+        toolStripProgressBar1.Style = style;
+    }
+    private void ProgressBarValue(Int32 value) {
+      if (statusStrip1.InvokeRequired)
+        statusStrip1.Invoke(new Action(() => ProgressBarValue(value)));
+      else
+        toolStripProgressBar1.Value = value;
+    }
+    #endregion
+
+    #region ToolStripStatusLabel1
+    private void StatusLabel1Text(String text) {
+      if (statusStrip1.InvokeRequired)
+        statusStrip1.Invoke(new Action(() => StatusLabel1Text(text)));
+      else
+        toolStripStatusLabel1.Text = text;
+    }
+    private void StatusLabel1Hide() {
+      if (statusStrip1.InvokeRequired)
+        statusStrip1.Invoke(new Action(() => StatusLabel1Hide()));
+      else
+        toolStripStatusLabel1.Visible = false;
+    }
+    private void StatusLabel1Show() {
+      if (statusStrip1.InvokeRequired)
+        statusStrip1.Invoke(new Action(() => StatusLabel1Show()));
+      else
+        toolStripStatusLabel1.Visible = true;
+    }
+    #endregion
+
+    #region TreeViewFast1
+    private void TreeViewFast1AfterSelect(Object sender, TreeViewEventArgs e) {
+      TreeNode node = treeViewFast1.SelectedNode;
+      NodeAsset asset = (NodeAsset)node.Tag;
+
+      Text = "Node Browser - " + asset.id.ToString();
+
+      _collapsed = false;
+      btnToggleCollapse.Enabled = true;
+      btnToggleCollapse.Text = "Collapse Child Nodes";
+
+      if (asset != null) {
+        StatusLabel1Text("Loading Selected Node ...");
+
+        _rootList = new ArrayList();
+        treeViewGrid1.ModelFilter = null;
+
+        if (asset.Obj != null) {
+          TreeViewGrid1Hide();
+          LoadingSwirlShow();
+          ProgressBarShow();
+
+          // await Task.Run(() => GetNodeData(asset));
+          NodeDataGet(asset);
+          TreeViewGrid1Roots(_rootList);
+          TreeViewGrid1ExpandAll();
+
+          if (_rootList != null && _rootList.Count > 0) {
+            treeViewGrid1.AutoResizeColumn(0, ColumnHeaderAutoResizeStyle.ColumnContent);
+            treeViewGrid1.AutoResizeColumn(1, ColumnHeaderAutoResizeStyle.ColumnContent);
+          } else {
+            treeViewGrid1.Columns[0].Width = splitContainer3.Panel1.Width / 3;
+            treeViewGrid1.Columns[1].Width = splitContainer3.Panel1.Width / 3;
+          }
+
+          if (_filter)
+            treeViewGrid1.ModelFilter =
+              TextMatchFilter.Contains(treeViewGrid1, toolStripTextBox1.Text);
+        }
+
+        treeViewGrid1.TopItemIndex = 0;
+      }
+
+      StatusLabel1Text(asset.id);
+
+      _dataTable = new DataTable();
+      _dataTable.Columns.Add("Property");
+      _dataTable.Columns.Add("Value");
+      _dataTable.Rows.Add(new String[] { "Current Node", asset.id });
+
+      _currentTreeNode = asset.id;
+      dataGridView1.DataSource = _dataTable;
+      dataGridView1.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.AllCells;
+
+      LoadingSwirlHide();
+      ProgressBarHide();
+      TreeViewGrid1Show();
+
+      return;
+    }
+    private void TreeViewFast1Hide() {
+      if (treeViewFast1.InvokeRequired) treeViewFast1.Invoke(new Action(() => TreeViewFast1Hide()));
+      else treeViewFast1.Visible = false;
+    }
+    private void TreeViewFast1KeyDown(Object sender, KeyEventArgs e) {
+      if (e.Control && e.KeyCode == Keys.F)
+        txtSearch.Focus();
+
+    }
+    private void TreeViewFast1MouseHover(Object sender, EventArgs e) {
+      if (!_closing && !btnFindNext.Focused) treeViewFast1.Focus();
+    }
+    private void TreeViewFast1MouseUp(Object sender, MouseEventArgs e) {
+      if (e.Button == MouseButtons.Right) {
+        treeViewFast1.SelectedNode = treeViewFast1.GetNodeAt(e.X, e.Y);
+
+        if (treeViewFast1.SelectedNode != null) {
+          contextMenuStrip1.Show(treeViewFast1, e.Location);
+        }
+      }
+    }
+    private void TreeViewFast1Show() {
+      if (treeViewFast1.InvokeRequired)
+        treeViewFast1.Invoke(new Action(() => TreeViewFast1Show()));
+      else
+        treeViewFast1.Visible = true;
+    }
+    #endregion
+
+    #region TreeViewGrid1
+    private void TreeViewGrid1ExpandAll() {
+      if (treeViewGrid1.InvokeRequired)
+        treeViewGrid1.Invoke(new Action(() => TreeViewGrid1ExpandAll()));
+      else
+        treeViewGrid1.ExpandAll();
+    }
+    private void TreeViewGrid1Hide() {
+      if (treeViewGrid1.InvokeRequired)
+        treeViewGrid1.Invoke(new Action(() => TreeViewGrid1Hide()));
+      else
+        treeViewGrid1.Visible = false;
+    }
+    private void TreeViewGrid1KeyDown(Object sender, KeyEventArgs e) {
+      if (e.Control && e.KeyCode == Keys.F)
+        if (toolStrip1.Visible) {
+          toolStrip1.Visible = false;
+          treeViewGrid1.Focus();
+        } else {
+          toolStrip1.Visible = true;
+          toolStripTextBox1.Focus();
+        }
+    }
+    private void TreeViewGrid1MouseHover(Object sender, EventArgs e) {
+      if (!_closing && !btnFindNext.Focused && !toolStripTextBox1.Focused)
+        treeViewGrid1.Focus();
+    }
+    private void TreeViewGrid1MouseUp(Object sender, MouseEventArgs e) {
+      if (e.Button == MouseButtons.Right) {
+        TreeListView tlv = sender as TreeListView;
+
+        if (tlv.SelectedObject is NodeListItem item)
+          // Prefer the value. Do we ever have a case of both the key and value representing nodes?
+          if (item.Type == "ulong"
+              && item.DisplayValue.Contains("(") && item.DisplayValue.Contains(")"))
+            contextMenuStrip2.Show(treeViewGrid1, e.Location);
+          else if (item.DisplayName.Contains(" (") && item.DisplayName.EndsWith(")"))
+            contextMenuStrip2.Show(treeViewGrid1, e.Location);
+      }
+    }
+    private void TreeViewGrid1Roots(ArrayList roots) {
+      if (treeViewGrid1.InvokeRequired)
+        treeViewGrid1.Invoke(new Action(() => TreeViewGrid1Roots(roots)));
+      else
+        treeViewGrid1.Roots = roots;
+    }
+    private void TreeViewGrid1SelectedIndexChanged(Object sender, EventArgs e) {
+      TreeListView tlv = sender as TreeListView;
+      _dataTable = new DataTable();
+      _dataTable.Columns.Add("Property");
+      _dataTable.Columns.Add("Value");
+      _dataTable.Rows.Add(new String[] { "Current Node", _currentTreeNode });
+
+      if (tlv.SelectedObject is NodeListItem child) {
+        if (child.Name != null)
+          _dataTable.Rows.Add(new String[] { "Current Item", child.Name.ToString() });
+        else
+          _dataTable.Rows.Add(new String[] { "Current Item", "" });
+
+        if (child.value != null)
+          _dataTable.Rows.Add(new String[] { "Current Value", child.value.ToString() });
+        else
+          _dataTable.Rows.Add(new String[] { "Current Value", "" });
+      }
+
+      dataGridView1.DataSource = _dataTable;
+      dataGridView1.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.AllCells;
+
+      if (tlv.SelectedObject != null) {
+        // Node selected. Lets see if it can collapse or not.
+        TreeListView.Branch br = tlv.TreeModel.GetBranch(tlv.SelectedObject);
+
+        if (br != null && br.CanExpand && br.IsExpanded) {
+          btnToggleCollapse.Text = "Collapse Child Nodes";
+        } else if (br != null && br.CanExpand && !br.IsExpanded) {
+          btnToggleCollapse.Text = "Expand Child Nodes";
+        }
+      } else {
+        // Page selected.
+        if (_collapsed) {
+          btnToggleCollapse.Text = "Expand Child Nodes";
+        } else {
+          btnToggleCollapse.Text = "Collapse Child Nodes";
+        }
+      }
+    }
+    private void TreeViewGrid1Show() {
+      if (treeViewGrid1.InvokeRequired)
+        treeViewGrid1.Invoke(new Action(() => TreeViewGrid1Show()));
+      else
+        treeViewGrid1.Visible = true;
+    }
+    #endregion
+
+    #region TxtSearch
+    private void TxtSearchKeyDown(Object sender, KeyEventArgs e) {
+      if (e.KeyCode == Keys.Enter && !String.IsNullOrEmpty(txtSearch.Text))
+        Search();
+    }
+    #endregion
+
+    #region Write Methods
+    private void WriteData(Boolean firstRun) {
+      if (!System.IO.Directory.Exists(txtExtractPath.Text + "File_Names"))
+        System.IO.Directory.CreateDirectory(txtExtractPath.Text + "File_Names");
+
+      if (_buildCsv) {
+        if (_outputList != null && _outputList.Count > 0) {
+          using System.IO.StreamWriter writeCsv = new System.IO.StreamWriter(
+            txtExtractPath.Text + "File_Names\\node_string_data.csv", !firstRun
+          );
+
+          foreach (NodeOutput node in _outputList) {
+            writeCsv.Write(
+              node.node
+                + ", "
+                + node.item
+                + ", "
+                + node.parent
+                + ", "
+                + node.name
+                + ", "
+                + node.value
+                + "\r\n"
+            );
+          }
+
+          writeCsv.Close();
+          _outputList.Clear();
+        }
+      }
+
+      if (_outputData != null && _outputData.Count > 0) {
+        using System.IO.StreamWriter writeTxt = new System.IO.StreamWriter(
+          txtExtractPath.Text + "File_Names\\node_string_list.txt", !firstRun
+        );
+
+        foreach (String data in _outputData) writeTxt.Write(data + "\r\n");
+
+        writeTxt.Close();
+        _outputData.Clear();
+      }
+
+      GC.Collect();
+    }
+    private void WriteFile(Byte[] content, String filename) {
+      if (content == null || content.Length == 0) return;
+
+      filename = filename.Replace('/', '.');
+
+      if (!System.IO.Directory.Exists(txtExtractPath.Text))
+        System.IO.Directory.CreateDirectory(txtExtractPath.Text);
+
+      System.IO.File.WriteAllBytes(txtExtractPath.Text + filename, content);
+    }
+    private void WriteFile(XDocument content, String filename, Boolean append, Boolean trimEmpty) {
+      if (trimEmpty)
+        content.Descendants().Where(e => e.IsEmpty || string.IsNullOrWhiteSpace(e.Value)).Remove();
+
+      if (content.Root.IsEmpty) return;
+
+      filename = filename.Replace('/', '.');
+
+      if (!System.IO.Directory.Exists(txtExtractPath.Text))
+        System.IO.Directory.CreateDirectory(txtExtractPath.Text);
+
+      using System.IO.StreamWriter file2 =
+        new System.IO.StreamWriter(txtExtractPath.Text + filename, append);
+
+      content.Save(file2, SaveOptions.None);
+    }
+    #endregion
+  }
+}

@@ -1,0 +1,167 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using GomLib.Models;
+
+namespace GomLib.ModelLoader {
+  public class CodexLoader {
+    const long NameLookupKey = -8863348193830878519;
+    const long CategoryLookupKey = -367464477071745071;
+    const long DescriptionLookupKey = 1078249248256508798;
+
+    Dictionary<ulong, Codex> idMap;
+    Dictionary<string, Codex> nameMap;
+
+    List<string> DeprecatedCodices = new List<string>();
+
+    private readonly DataObjectModel _dom;
+
+    public CodexLoader(DataObjectModel dom) {
+      _dom = dom;
+      if (nameMap == null) {
+        Flush();
+      }
+    }
+
+    public void Flush() {
+      idMap = new Dictionary<ulong, Codex>();
+      nameMap = new Dictionary<string, Codex>();
+      DeprecatedCodices = new List<string>();
+    }
+
+    public static string ClassName {
+      get { return "cdxType"; }
+    }
+
+    public Codex Load(ulong nodeId) {
+      if (idMap.TryGetValue(nodeId, out Codex result)) {
+        return result;
+      }
+
+      GomObject obj = _dom.GetObject(nodeId);
+      Codex cdx = new Codex();
+      return Load(cdx, obj);
+    }
+
+    public Codex Load(string fqn) {
+      if (nameMap.TryGetValue(fqn, out Codex result)) {
+        return result;
+      }
+
+      GomObject obj = _dom.GetObject(fqn);
+      Codex cdx = new Codex();
+      return Load(cdx, obj);
+    }
+
+    public Codex Load(GomObject obj) {
+      Codex cdx = new Codex();
+      return Load(cdx, obj);
+    }
+
+    public static GameObject CreateObject() {
+      return new Codex();
+    }
+
+    public Codex Load(GameObject obj, GomObject gom) {
+      if (gom == null) { return (Codex)obj; }
+
+      return Load(obj as Codex, gom);
+    }
+
+    public Codex Load(Codex cdx, GomObject obj) {
+      if (obj == null) { return null; }
+      if (cdx == null) { return null; }
+
+      if (obj.Name.StartsWith("cdx.blurb"))
+        return cdx; //this is to prevent these blurbs from showing up in the json output.
+
+      cdx.Fqn = obj.Name;
+      cdx.Id = obj.Id;
+      cdx.Dom_ = _dom;
+      cdx.References = obj.References;
+      cdx.Image = obj.Data.ValueOrDefault<string>("cdxImage", null);
+
+      _dom.Assets.Icons.AddCodex(cdx.Image);
+
+      var textLookup = obj.Data.ValueOrDefault<Dictionary<object, object>>("locTextRetrieverMap", null);
+      var descLookup = (GomObjectData)textLookup[DescriptionLookupKey];
+      var titleLookup = (GomObjectData)textLookup[NameLookupKey];
+      if (textLookup.TryGetValue(CategoryLookupKey, out object categoryLookup)) {
+        cdx.CategoryId = ((GomObjectData)categoryLookup).ValueOrDefault<long>("strLocalizedTextRetrieverStringID", 0);
+        var CatSTB = _dom.StringTable.Find("str.sys.codexcategories");
+        if (CatSTB != null) {
+          cdx.CategoryName = CatSTB.GetText(cdx.CategoryId, cdx.Fqn);
+          cdx.LocalizedCategoryName = CatSTB.GetLocalizedText(cdx.CategoryId, cdx.Fqn);
+        }
+      }
+
+      var titleId = titleLookup.ValueOrDefault<long>("strLocalizedTextRetrieverStringID", 0);
+      //cdx.Id = (ulong)(titleId >> 32);
+
+      cdx.LocalizedName = _dom.StringTable.TryGetLocalizedStrings(cdx.Fqn, titleLookup);
+      Normalize.Dictionary(cdx.LocalizedName, cdx.Fqn);
+      cdx.Name = _dom.StringTable.TryGetString(cdx.Fqn, titleLookup);
+
+      cdx.LocalizedDescription = _dom.StringTable.TryGetLocalizedStrings(cdx.Fqn, descLookup);
+      cdx.Description = _dom.StringTable.TryGetString(cdx.Fqn, descLookup);
+
+      if (string.IsNullOrWhiteSpace(cdx.Name) && string.IsNullOrWhiteSpace(cdx.Description)) {
+        DeprecatedCodices.Add(obj.Name);
+        cdx.Id = 0;
+        cdx = null; //really wacky permanance issue here.
+        return cdx;
+      }
+
+      cdx.Level = (int)obj.Data.ValueOrDefault<long>("cdxLevel", 0);
+      if (cdx.LocalizedName.Values.ToString() == "") { cdx.IsHidden = true; }
+
+      cdx.Faction = FactionExtensions.ToFaction(obj.Data.ValueOrDefault<long>("cdxFaction", 0));
+      cdx.IsPlanet = obj.Data.ValueOrDefault("cdxIsPlanetCodex", false);
+
+      Dictionary<object, object> classLookup = obj.Data.ValueOrDefault<Dictionary<object, object>>("cdxClassesLookupList", null);
+      if (classLookup == null) {
+        cdx.ClassRestricted = false;
+      } else {
+        cdx.ClassRestricted = true;
+        cdx.Classes = new List<ClassSpec>();
+        foreach (KeyValuePair<object, object> kvp in classLookup) {
+          if ((bool)kvp.Value) {
+            cdx.Classes.Add(_dom.ClassSpecLoader.Load((ulong)kvp.Key));
+          }
+        }
+      }
+
+      List<object> cdxPlanets = obj.Data.ValueOrDefault<List<object>>("cdxPlanets", null);
+      if (cdxPlanets != null) {
+        cdx.HasPlanets = true;
+        cdx.PlanetsIds = cdxPlanets.ConvertAll(x => (ulong)x);
+        cdx.Planets = new List<Codex>();
+        foreach (var planetId in cdxPlanets) {
+          Codex planet = null;
+          if ((ulong)planetId != cdx.Id) planet = _dom.CodexLoader.Load((ulong)planetId);
+          if (planet != null) cdx.Planets.Add(planet);
+        }
+      }
+
+      obj.Unload();
+      return cdx;
+    }
+
+    public void LoadObject(GameObject loadMe, GomObject obj) {
+      Codex cdx = (Codex)loadMe;
+      Load(cdx, obj);
+    }
+
+    public static void LoadReferences(GameObject obj, GomObject gom) {
+      if (obj == null) {
+        throw new ArgumentNullException(nameof(obj));
+      }
+
+      if (gom == null) {
+        throw new ArgumentNullException(nameof(gom));
+      }
+      // No references to load
+    }
+  }
+}
