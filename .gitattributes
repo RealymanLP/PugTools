@@ -1,9 +1,7 @@
 # Auto detect text files and perform LF normalization
 * text=auto
-
 # Custom for Visual Studio
 *.cs     diff=csharp
-
 # Standard to msysgit
 *.doc	 diff=astextplain
 *.DOC	 diff=astextplain
@@ -15,3 +13,5 @@
 *.PDF	 diff=astextplain
 *.rtf	 diff=astextplain
 *.RTF	 diff=astextplain
+Source/PugTools/Hash/hashes_filename.bin.gz filter=lfs diff=lfs merge=lfs -text
+Redist/DotNet/Runtime-6.0.2-Win-x64.exe filter=lfs diff=lfs merge=lfs -text
