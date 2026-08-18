@@ -1,4 +1,4 @@
-using SlimDX;
+﻿using SlimDX;
 
 namespace SlimDXNet.Camera
 {
@@ -50,10 +50,10 @@ namespace SlimDXNet.Camera
 
         public void Fly(float d)
         {
-            // Vertical panning must use the world Y axis.
-            // Using Up.Y can become zero when the camera is near a horizontal
-            // viewing angle, which makes right-drag appear to work only left/right.
-            Target += Vector3.UnitY * d;
+            // Model-viewer panning is in world space. Using Up.Y here makes
+            // vertical movement depend on the current camera pitch and can
+            // make the model stop moving vertically at certain angles.
+            Target = new Vector3(Target.X, Target.Y + d, Target.Z);
         }
 
         public override void Pitch(float angle)

@@ -217,8 +217,7 @@ namespace PugTools {
           foreach (TorArchive.File file in archive.Value.EnumerateFiles()) {
             HashFileInfo hashInfo = new HashFileInfo(file.FileInfo.PrimaryHash,
                                                      file.FileInfo.SecondaryHash,
-                                                     file,
-                                                     false);
+                                                     file);
 
             if (hashInfo.IsNamed) {
               if (hashInfo.FileName == "metadata.bin"
@@ -897,11 +896,6 @@ namespace PugTools {
               txtRawView.Visible = true;
               break;
 
-            case "JBA":
-              await Task.Run(() => PreviewAssetJBA(asset.HashInfo.FileName));
-              txtRawView.Visible = true;
-              break;
-
             case "GR2":
               await Task.Run(() => PreviewAssetGR2(asset.HashInfo.FileName));
               renderPanel.Visible = true;
@@ -1114,31 +1108,6 @@ namespace PugTools {
         }
       }
       catch (Exception) { }
-    }
-
-    private void PreviewAssetJBA(String fileName) {
-      try {
-        using BinaryReader br = new BinaryReader(m_inputStream);
-        FileFormats.JBAAnimation jba = FileFormats.JBAReader.Read(br);
-        StringBuilder sb = new StringBuilder();
-        sb.AppendLine("SWTOR JBA Animation");
-        sb.AppendLine("===================");
-        sb.AppendLine("File: " + fileName);
-        sb.AppendLine($"Length: {jba.Length:0.###} s");
-        sb.AppendLine($"FPS: {jba.FPS:0.###}");
-        sb.AppendLine($"Frames: {jba.FrameCount}");
-        sb.AppendLine($"Blocks: {jba.BlockCount}");
-        sb.AppendLine($"Bones: {jba.BoneCount}");
-        sb.AppendLine();
-        sb.AppendLine("Bones:");
-        foreach (String name in jba.BoneNames) sb.AppendLine("  " + name);
-        sb.AppendLine();
-        sb.AppendLine("Hinweis: Der JBA-Parser ist in diesem Build bereits aktiv. Der eigentliche 3D-Animation-Player folgt, sobald wir das aktuelle 64-bit-GR2-Skinning mit dem passenden Skeleton koppeln.");
-        txtRawView.Text = sb.ToString();
-      }
-      catch (Exception ex) {
-        txtRawView.Text = "JBA konnte nicht gelesen werden:\r\n\r\n" + ex;
-      }
     }
 
     private void PreviewAssetGR2(String fileName) {

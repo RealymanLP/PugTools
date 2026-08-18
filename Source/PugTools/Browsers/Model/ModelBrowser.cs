@@ -1075,20 +1075,24 @@ namespace PugTools {
       XmlNode emitterList =
             xmlDoc.SelectSingleNode("/nodeWClasses/marshalData/node/f[@name='_fxEmitterList']");
 
-      // Load the model list from the FxSpec. Some newer mount FxSpecs omit the
-      // emitter list, so model loading must not depend on it being present.
+      // Load the model list from the FxSpec
       XmlNode modelList =
             xmlDoc.SelectSingleNode("/nodeWClasses/marshalData/node/f[@name='_fxModelList']");
-
-      if (modelList == null || modelList.ChildNodes.Count < 1) return;
 
       // Relative transforms
       Vector3 relPosVec = new Vector3();
       Vector3 relRotVec = new Vector3();
 
+      // Some newer mount FxSpecs do not contain an emitter list. The model
+      // list is still useful on its own (notably for vehicle/glider mounts).
+      // Only the model list is mandatory.
+      if (modelList == null || modelList.ChildNodes.Count < 1) return;
+
       foreach (XmlNode modelNode in modelList.ChildNodes) {
-        // Ignore models that never start. The field is optional in some mount FxSpecs.
-        XmlNode whenToStartNode = modelNode.SelectSingleNode("./node()[@name='_fxWhenToStart']");
+        // Ignore models that explicitly never start. Older/newer mount FxSpecs
+        // may omit this optional field, in which case the model should load.
+        XmlNode whenToStartNode =
+          modelNode.SelectSingleNode("./node()[@name='_fxWhenToStart']");
         if (whenToStartNode != null && whenToStartNode.InnerText == "NEVER")
           continue;
 
@@ -1097,8 +1101,16 @@ namespace PugTools {
           modelNode.SelectSingleNode("./node()[@name='_fxResourceName']");
         XmlNode resourceFxName =
           modelNode.SelectSingleNode("./node()[@name='_fxName']");
-        if (resourceNameNode == null || resourceFxName == null) continue;
-        String resourceName = resourceNameNode.InnerText;
+
+        if (resourceNameNode == null || String.IsNullOrWhiteSpace(resourceNameNode.InnerText))
+          continue;
+
+        String resourceName = resourceNameNode.InnerText.Trim();
+        // Some vehicle/glider FxSpecs omit _fxName. Use the model filename as
+        // the dictionary key instead of aborting the complete FxSpec parse.
+        String modelKey = resourceFxName != null && !String.IsNullOrWhiteSpace(resourceFxName.InnerText)
+          ? resourceFxName.InnerText
+          : resourceName.Replace("\\", "/").Split('/').Last().Split('.').First();
 
         // Transform vectors
         Vector3 positionVec = new Vector3();
@@ -1134,17 +1146,18 @@ namespace PugTools {
           continue;
 
         // Hide creature handles and weapon crystals
-        if (resourceFxName.InnerText.Contains("handle")
-            || resourceFxName.InnerText.Contains("m_crystal"))
+        if (resourceFxName != null &&
+            (resourceFxName.InnerText.Contains("handle")
+             || resourceFxName.InnerText.Contains("m_crystal")))
           continue;
 
         // Check the resource name is valid
         if (resourceName.Contains(".gr2")) {
           // Standardise model filepath
-          String normalizedResourceName = resourceName.Replace("\\", "/");
-          String modelPath = normalizedResourceName.StartsWith("/resources/", StringComparison.OrdinalIgnoreCase)
-            ? normalizedResourceName
-            : "/resources" + (normalizedResourceName.StartsWith("/") ? normalizedResourceName : "/" + normalizedResourceName);
+          String normalizedResource = resourceName.Replace("\\", "/");
+          String modelPath = normalizedResource.StartsWith("/resources/", StringComparison.OrdinalIgnoreCase)
+            ? normalizedResource
+            : "/resources" + (normalizedResource.StartsWith("/") ? normalizedResource : "/" + normalizedResource);
 
           // Find the model file in the game assets
           File attachModel = _currentAssets.FindFile(modelPath);
@@ -1158,9 +1171,11 @@ namespace PugTools {
 
             // Parse the emitter node chain
             XmlNode emitterNode = null;
-            if (emitterList != null && attachToNode != null && !String.IsNullOrEmpty(attachToNode.InnerText))
-              emitterNode = emitterList.SelectSingleNode(
-                ".//node()[@name='_fxName' and text() = '" + attachToNode.InnerText + "']");
+            if (emitterList != null && attachToNode != null) {
+              emitterNode =
+                emitterList.SelectSingleNode(
+                  ".//node()[@name='_fxName' and text() = '" + attachToNode.InnerText + "']");
+            }
 
             if (emitterNode != null) {
               parentAttachToNode =
@@ -1201,7 +1216,8 @@ namespace PugTools {
             }
 
             // Check if attachments should be relative
-            if (attachRelativeNode != null && attachRelativeNode.InnerText == "true" && resourceFxName.InnerText == "speeder") {
+            if (attachRelativeNode != null && attachRelativeNode.InnerText == "true"
+                && resourceFxName != null && resourceFxName.InnerText == "speeder") {
               String[] pos = modelNode.SelectSingleNode("./node()[@name='_fxStartLocOffset']")
                 .InnerText.Replace("(", "").Replace(")", "").Split(',');
               relPosVec = new Vector3(
@@ -1312,7 +1328,7 @@ namespace PugTools {
                 * Matrix.Translation(positionVec);
 
             // Add model to models list
-            _models.Add(resourceFxName.InnerText, gr2Model);
+            _models[modelKey] = gr2Model;
           }
         }
       }
@@ -1326,9 +1342,13 @@ namespace PugTools {
                                      String type) {
       XmlNode checkMe = emitterNode.ParentNode;
 
-      if (checkMe.SelectSingleNode("./node()[@name='_fxAttachBone']").InnerText == ""
-          && checkMe.SelectSingleNode("./node()[@name='_fxAttachTo']").InnerText != "CASTER"
-          && checkMe.SelectSingleNode("./node()[@name='_fxAttachTo']").InnerText != "TARGET") {
+      XmlNode checkBoneNode = checkMe?.SelectSingleNode("./node()[@name='_fxAttachBone']");
+      XmlNode checkAttachToNode = checkMe?.SelectSingleNode("./node()[@name='_fxAttachTo']");
+      if (checkMe == null || checkAttachToNode == null) return;
+
+      if ((checkBoneNode == null || checkBoneNode.InnerText == "")
+          && checkAttachToNode.InnerText != "CASTER"
+          && checkAttachToNode.InnerText != "TARGET") {
         XmlNode attachToNode =
           emitterNode.ParentNode.SelectSingleNode("./node()[@name='_fxAttachTo']");
         emitterNode =
@@ -1975,21 +1995,6 @@ namespace PugTools {
           };
 
           _models.Add(name, gr2Model);
-        }
-      }
-
-      // Some mount entries reference an NPC that is not present in the current
-      // DOM snapshot. Keep the ModelBrowser useful in that case by falling back
-      // to the mount's body skeleton instead of ending with an empty model list.
-      if (_models.Count == 0) {
-        String skeletonModel = "/resources/art/dynamic/spec/" + _bodyType + "new_skeleton.gr2";
-        File file = _currentAssets.FindFile(skeletonModel);
-        if (file != null) {
-          using BinaryReader br = new BinaryReader(file.OpenCopyInMemory());
-          String name = skeletonModel.Split('/').Last();
-          _models[name] = new GR2(br, name) {
-            transformMatrix = Matrix.Scaling(new Vector3(1.0F, 1.0F, 1.0F))
-          };
         }
       }
 

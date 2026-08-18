@@ -208,10 +208,12 @@ namespace FileFormats {
 
         if (isZstd) {
           using var decompressor = new ZstdSharp.Decompressor();
-          // We don't know the exact uncompressed size up front here (unlike TorArchive/GomObject,
-          // there's no separate uncompressed-size field available at this call site) - pass 0 so
-          // ZstdSharp reads it from the frame header itself, which zstd frames carry by default.
-          System.Span<byte> span = decompressor.Unwrap(vertexData, 0);
+          // maxDecompressedSize=0 is NOT "auto-detect from the frame header" here - ZstdSharp
+          // enforces it as a hard cap and throws if the real size exceeds it, even though the
+          // frame header does carry the real size (confirmed by the exception message itself
+          // reporting it). Heightmap grids are small (tens/low hundreds of KB); 16 MB is a very
+          // generous, safe ceiling without hardcoding an exact expected size we don't have here.
+          System.Span<byte> span = decompressor.Unwrap(vertexData, 16 * 1024 * 1024);
           br2 = new BinaryReader(new MemoryStream(span.ToArray()));
         } else {
           var magic = BitConverter.ToUInt16(vertexData, 0);
@@ -257,52 +259,59 @@ namespace FileFormats {
 
         HeightMap heightMap = new HeightMap(br2);
 
-        VertexPT[] vertices = new VertexPT[(int)(width * depth)];
+        // Use the HeightMap's own parsed dimensions consistently, not the AssetInstance's width/
+        // depth fields (which come from a different source and aren't guaranteed to match the
+        // heightmap data actually read - mismatched sizes here were what caused the out-of-bounds
+        // access into heightMap.elevation, which is sized [heightMap.depth, heightMap.width]).
+        uint hmWidth = heightMap.width;
+        uint hmDepth = heightMap.depth;
 
-        for (int z = 0; z < depth - 1; z++) {
-          for (int x = 0; x < width - 1; x++) {
-            float posX = 0.2f * heightMap.width / width * (x - width / 2);
+        VertexPT[] vertices = new VertexPT[(int)(hmWidth * hmDepth)];
+
+        for (int z = 0; z < hmDepth; z++) {
+          for (int x = 0; x < hmWidth; x++) {
+            float posX = 0.2f * (x - hmWidth / 2);
             float posY = heightMap.elevation[z, x];
-            float posZ = 0.2f * heightMap.depth / depth * (z - depth / 2);
+            float posZ = 0.2f * (z - hmDepth / 2);
 
             Vector3 posVec = new Vector3(posX, posY, posZ);
             Vector2 texVec = new Vector2(x % 2, z % 2);
 
-            vertices[(int)(z * width + x)] = new VertexPT(posVec, texVec);
+            vertices[(int)(z * hmWidth + x)] = new VertexPT(posVec, texVec);
           }
         }
 
         VBD = new BufferDescription(VertexPT.Stride * vertices.Length, ResourceUsage.Immutable, BindFlags.VertexBuffer, CpuAccessFlags.None, ResourceOptionFlags.None, 0);
         VDS = new DataStream(vertices, false, false);
 
-        ushort[] indices = new ushort[(int)(width * depth * 6)];
+        ushort[] indices = new ushort[(int)(hmWidth * hmDepth * 6)];
         numFaces = 0;
 
-        for (int z = 0; z < depth - 1; z++) {
-          for (int x = 0; x < width - 1; x++) {
+        for (int z = 0; z < hmDepth - 1; z++) {
+          for (int x = 0; x < hmWidth - 1; x++) {
             if (heightMap.hasHoles && heightMap.CheckNoHole(x, z + 1) && heightMap.CheckNoHole(x + 1, z)) {
               if (heightMap.CheckNoHole(x, z)) {
-                indices[numFaces + 0] = (ushort)(z * width + x); // Top left
-                indices[numFaces + 1] = (ushort)((z + 1) * width + x); // Bottom left
-                indices[numFaces + 2] = (ushort)(z * width + (x + 1)); // Top right
+                indices[numFaces + 0] = (ushort)(z * hmWidth + x); // Top left
+                indices[numFaces + 1] = (ushort)((z + 1) * hmWidth + x); // Bottom left
+                indices[numFaces + 2] = (ushort)(z * hmWidth + (x + 1)); // Top right
 
                 numFaces += 3;
               }
 
               if (heightMap.CheckNoHole(x + 1, z + 1)) {
-                indices[numFaces + 0] = (ushort)(z * width + (x + 1)); // Top right
-                indices[numFaces + 1] = (ushort)((z + 1) * width + x); // Bottom left
-                indices[numFaces + 2] = (ushort)((z + 1) * width + (x + 1)); // Bottom right
+                indices[numFaces + 0] = (ushort)(z * hmWidth + (x + 1)); // Top right
+                indices[numFaces + 1] = (ushort)((z + 1) * hmWidth + x); // Bottom left
+                indices[numFaces + 2] = (ushort)((z + 1) * hmWidth + (x + 1)); // Bottom right
 
                 numFaces += 3;
               }
             } else {
-              indices[numFaces + 0] = (ushort)(z * width + x); // Top left
-              indices[numFaces + 1] = (ushort)((z + 1) * width + x); // Bottom left
-              indices[numFaces + 2] = (ushort)(z * width + (x + 1)); // Top right
-              indices[numFaces + 3] = (ushort)(z * width + (x + 1)); // Top right
-              indices[numFaces + 4] = (ushort)((z + 1) * width + x); // Bottom left
-              indices[numFaces + 5] = (ushort)((z + 1) * width + (x + 1)); // Bottom right
+              indices[numFaces + 0] = (ushort)(z * hmWidth + x); // Top left
+              indices[numFaces + 1] = (ushort)((z + 1) * hmWidth + x); // Bottom left
+              indices[numFaces + 2] = (ushort)(z * hmWidth + (x + 1)); // Top right
+              indices[numFaces + 3] = (ushort)(z * hmWidth + (x + 1)); // Top right
+              indices[numFaces + 4] = (ushort)((z + 1) * hmWidth + x); // Bottom left
+              indices[numFaces + 5] = (ushort)((z + 1) * hmWidth + (x + 1)); // Bottom right
 
               numFaces += 6;
             }

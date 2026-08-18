@@ -59,10 +59,6 @@ namespace PugTools {
 
       Effects.InitAll(Device);
       _fx = Effects.GR2_FX;
-      if (_fx == null) {
-        System.Diagnostics.Debug.WriteLine("View_NPC_GR2: GR2 effect could not be initialized.");
-        return false;
-      }
       InputLayouts.InitAll(Device);
       RenderStates.InitAll(Device);
 
@@ -292,12 +288,6 @@ namespace PugTools {
       _camera.UpdateViewMatrix();
       _cMatrix = _camera.View;
       _pMatrix = _camera.Proj;
-
-      if (_fx == null) {
-        System.Diagnostics.Debug.WriteLine("View_NPC_GR2: DrawScene skipped because GR2 effect is unavailable.");
-        SwapChain.Present(1, PresentFlags.None);
-        return;
-      }
 
       _activeTech = _fx.Generic;
 
@@ -535,6 +525,28 @@ namespace PugTools {
       _camera.Position = _cameraPos;
       _camera.LookAt(_cameraPos, _globalBoxCenter, Vector3.UnitY);
 
+      // Fit the complete model into view using the model bounds. Radius is
+      // read-only, so choose a camera position at the desired distance.
+      // MNT/ITM assets benefit from a larger starting distance because their
+      // bounds are often dominated by attachments/weapon or vehicle geometry.
+      Vector3 boxSize = _globalBoxMax - _globalBoxMin;
+      Single boxDiagonal = boxSize.Length();
+      if (boxDiagonal > 0.001F) {
+        Single fitFactor = (type == "mnt" || type == "itm") ? 3.0F : 2.0F;
+        Single distance = Math.Max(boxDiagonal * fitFactor, 1.0F);
+        Single beta = 0.5F;
+        Single alpha = 0.5F;
+        Single cosBeta = (Single)Math.Cos(beta);
+        Vector3 direction = new Vector3(
+          cosBeta * (Single)Math.Cos(alpha),
+          (Single)Math.Sin(beta),
+          cosBeta * (Single)Math.Sin(alpha)
+        );
+        _cameraPos = _globalBoxCenter + direction * distance;
+        _camera.Position = _cameraPos;
+        _camera.LookAt(_cameraPos, _globalBoxCenter, Vector3.UnitY);
+      }
+
       foreach (KeyValuePair<String, GR2> model in models) {
         if (model.Value.materials?.Count > 0)
           foreach (GR2_Material material in model.Value.materials)
@@ -647,7 +659,7 @@ namespace PugTools {
       Window.Controls.Find(RenderPanelName, true).First().Capture = true;
     }
     protected override void OnMouseMove(Object sender, MouseEventArgs e) {
-      if (e.Button == MouseButtons.Left) {
+      if ((Control.MouseButtons & MouseButtons.Left) == MouseButtons.Left) {
         Single yDelta = MathF.ToRadians(0.4F * (e.Y - _lastMousePos.Y));
         Single xDelta = -MathF.ToRadians(0.4F * (e.X - _lastMousePos.X));
 
@@ -663,7 +675,7 @@ namespace PugTools {
           _camera.Yaw(-xDelta);
         }
 
-      } else if (e.Button == MouseButtons.Right) {
+      } else if ((Control.MouseButtons & MouseButtons.Right) == MouseButtons.Right) {
         Single xDelta = MathF.ToRadians(0.05F * (e.X - _lastMousePos.X));
         Single yDelta = MathF.ToRadians(0.05F * (e.Y - _lastMousePos.Y));
 

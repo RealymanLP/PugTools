@@ -422,9 +422,19 @@ namespace PugTools {
             _fx.SetWorldMatrix(mvMatrix);
             _fx.SetMvMatrix(wvp);
 
-            /*
             if (instance.hasHeightMap)
             {
+                // Nothing sets a material for terrain yet (that's the still-pending texture-
+                // splatting work), so without resetting these the shader would otherwise just
+                // keep whatever diffuse/rotation/gloss maps and alpha mode were last bound by
+                // the previous model drawn - the dark/reflective "stripes" seen on the terrain
+                // were exactly that leftover state showing through.
+                _fx.SetAlphaMode(0);
+                _fx.SetAlphaTestValue(0);
+                _fx.SetDiffuseMap(null);
+                _fx.SetRotationMap(null);
+                _fx.SetGlossMap(null);
+
                 ImmediateContext.InputAssembler.SetVertexBuffers(0, new VertexBufferBinding(instance.VBO, VertexPT.Stride, 0));
                 ImmediateContext.InputAssembler.SetIndexBuffer(instance.IBO, Format.R16_UInt, 0);
 
@@ -432,7 +442,6 @@ namespace PugTools {
 
                 ImmediateContext.DrawIndexed(instance.numFaces / 3, 0, 0);
             }
-            */
 
             if (models.Keys.Contains(instance.assetID)) {
               GR2 model = models[instance.assetID];
