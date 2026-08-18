@@ -17,7 +17,61 @@ namespace PugTools {
     public Boolean ExportICONS1 { get; set; } = false;
     public Boolean ExportNPP1 { get; set; } = false;
 
+    private XElement CompareStringTableElements(XElement previousElement, XElement newElement) {
+      XElement result = new XElement(newElement.Name);
+      foreach (XAttribute attribute in newElement.Attributes()) result.Add(new XAttribute(attribute));
+
+      Dictionary<String, XElement> previousEntries = previousElement
+        .Elements("Entry")
+        .Where(x => x.Attribute("Id") != null)
+        .GroupBy(x => x.Attribute("Id").Value)
+        .ToDictionary(g => g.Key, g => g.First());
+
+      Dictionary<String, XElement> currentEntries = newElement
+        .Elements("Entry")
+        .Where(x => x.Attribute("Id") != null)
+        .GroupBy(x => x.Attribute("Id").Value)
+        .ToDictionary(g => g.Key, g => g.First());
+
+      foreach (XElement current in newElement.Elements("Entry")) {
+        XAttribute id = current.Attribute("Id");
+        if (id == null) continue;
+
+        if (!previousEntries.TryGetValue(id.Value, out XElement previous)) {
+          XElement added = new XElement(current);
+          added.Add(new XAttribute("Status", "New"));
+          result.Add(added);
+        } else if (!XNode.DeepEquals(previous, current)) {
+          XElement changed = new XElement(current);
+          changed.Add(new XAttribute("Status", "Changed"));
+          result.Add(changed);
+        }
+      }
+
+      foreach (XElement previous in previousElement.Elements("Entry")) {
+        XAttribute id = previous.Attribute("Id");
+        if (id == null || currentEntries.ContainsKey(id.Value)) continue;
+
+        XElement removed = new XElement(previous);
+        removed.Add(new XAttribute("Status", "Removed"));
+        result.Add(removed);
+      }
+
+      return result;
+    }
+
     private XElement CompareElements(XElement previousElement, XElement newElement) {
+      // String tables can contain tens of thousands of Entry elements. The generic
+      // comparer below repeatedly scans previousElement.Elements() for every entry,
+      // which turns a large table such as str.abl into an effectively O(n^2) job.
+      // Compare string-table entries by their Id once using dictionaries instead.
+      if (previousElement != null
+          && newElement != null
+          && newElement.Name == "StringTable"
+          && newElement.Elements("Entry").Count() > 200) {
+        return CompareStringTableElements(previousElement, newElement);
+      }
+
       List<XElement> elementsToRemove = new List<XElement>();
       Int32 unmodifiedBaseElemCount = 0;
 

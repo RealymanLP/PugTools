@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Linq;
@@ -59,6 +59,7 @@ namespace PugTools {
 
       Effects.InitAll(Device);
       _fx = Effects.GR2_FX;
+      if (_fx == null) return false;
       InputLayouts.InitAll(Device);
       RenderStates.InitAll(Device);
 
@@ -288,6 +289,20 @@ namespace PugTools {
       _camera.UpdateViewMatrix();
       _cMatrix = _camera.View;
       _pMatrix = _camera.Proj;
+
+      // Effects.GR2_FX is a shared static resource and can be released by
+      // another viewer. MNT previews are especially prone to hitting this
+      // race because their render thread is started asynchronously. Re-acquire
+      // the effect before rendering and never dereference a missing effect.
+      if (_fx == null) {
+        Effects.InitAll(Device);
+        _fx = Effects.GR2_FX;
+      }
+
+      if (_fx == null) {
+        SwapChain.Present(1, PresentFlags.None);
+        return;
+      }
 
       _activeTech = _fx.Generic;
 
@@ -532,7 +547,7 @@ namespace PugTools {
       Vector3 boxSize = _globalBoxMax - _globalBoxMin;
       Single boxDiagonal = boxSize.Length();
       if (boxDiagonal > 0.001F) {
-        Single fitFactor = (type == "mnt" || type == "itm") ? 3.0F : 2.0F;
+        Single fitFactor = (type == "mnt" || type == "itm") ? 8.0F : 2.0F;
         Single distance = Math.Max(boxDiagonal * fitFactor, 1.0F);
         Single beta = 0.5F;
         Single alpha = 0.5F;

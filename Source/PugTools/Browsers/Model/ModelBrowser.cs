@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Data;
@@ -1083,11 +1083,13 @@ namespace PugTools {
       Vector3 relPosVec = new Vector3();
       Vector3 relRotVec = new Vector3();
 
-      // Some newer mount FxSpecs do not contain an emitter list. The model
-      // list is still useful on its own (notably for vehicle/glider mounts).
-      // Only the model list is mandatory.
-      if (modelList == null || modelList.ChildNodes.Count < 1) return;
+      // Some newer mount FxSpecs do not contain the old _fxModelList layout at all.
+      // Do not abort here: a number of vehicle/glider FxSpecs expose their GR2
+      // resource directly elsewhere in the document. We use that as a fallback
+      // below if the normal model-list parser finds nothing.
+      Int32 modelsBefore = _models.Count;
 
+      if (modelList != null && modelList.ChildNodes.Count > 0)
       foreach (XmlNode modelNode in modelList.ChildNodes) {
         // Ignore models that explicitly never start. Older/newer mount FxSpecs
         // may omit this optional field, in which case the model should load.
@@ -1329,6 +1331,47 @@ namespace PugTools {
 
             // Add model to models list
             _models[modelKey] = gr2Model;
+          }
+        }
+      }
+
+      // Fallback for newer MNT/vehicle FxSpecs: locate any GR2 resource in the
+      // complete FxSpec, not just under _fxModelList. These entries often contain
+      // no _fxName/attachment metadata, so load them as root models.
+      if (_models.Count == modelsBefore) {
+        foreach (XmlNode resourceNode in xmlDoc.SelectNodes("//node()[@name='_fxResourceName']")) {
+          String resourceName = resourceNode.InnerText?.Trim();
+          if (String.IsNullOrWhiteSpace(resourceName)
+              || !resourceName.EndsWith(".gr2", StringComparison.OrdinalIgnoreCase)) continue;
+
+          String normalizedResource = resourceName.Replace("\\", "/");
+          String modelPath = normalizedResource.StartsWith("/resources/", StringComparison.OrdinalIgnoreCase)
+            ? normalizedResource
+            : "/resources" + (normalizedResource.StartsWith("/") ? normalizedResource : "/" + normalizedResource);
+
+          File modelFile = _currentAssets.FindFile(modelPath);
+          if (modelFile == null) continue;
+
+          String name = modelPath.Split('/').Last();
+          if (_models.ContainsKey(name)) continue;
+
+          using BinaryReader br = new BinaryReader(modelFile.OpenCopyInMemory());
+          GR2 gr2Model = new GR2(br, name) {
+            transformMatrix = Matrix.Identity
+          };
+          _models.Add(name, gr2Model);
+        }
+
+        // A few mount specs are only wrappers and point to another FxSpec via
+        // displayName. Follow that reference when no GR2 could be resolved here.
+        if (_models.Count == modelsBefore) {
+          foreach (XmlNode displayNode in xmlDoc.SelectNodes("//node()[@name='displayName']")) {
+            String nestedFx = displayNode.InnerText?.Trim();
+            if (String.IsNullOrWhiteSpace(nestedFx)) continue;
+            if (!nestedFx.EndsWith(".fxspec", StringComparison.OrdinalIgnoreCase)) continue;
+            if (nestedFx.Equals(fxspec, StringComparison.OrdinalIgnoreCase)) continue;
+            ParseFxSpec(nestedFx, type);
+            if (_models.Count > modelsBefore) break;
           }
         }
       }
