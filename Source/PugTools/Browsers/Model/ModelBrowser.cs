@@ -54,6 +54,7 @@ namespace PugTools {
     private Dictionary<String, List<String>> _testGroups;
     private List<TestRule> _testRules;
     private Dictionary<String, Object> _weaponAppearance;
+    private readonly HashSet<String> _parsedFxSpecs = new HashSet<String>(StringComparer.OrdinalIgnoreCase);
 
     #endregion Fields
 
@@ -95,16 +96,27 @@ namespace PugTools {
     private void ModelBrowserFormClosed(Object sender, FormClosedEventArgs e) {
       Hide();
 
-      HashDictionaryInstance.Instance.Unload();
+      // HashDictionaryInstance is a shared process-wide cache. Unload() performs
+      // an explicit full GC.Collect(), which is extremely expensive with the
+      // current SWTOR hash list and was the main cause of the whole PC stalling
+      // when a browser was closed. Keep the cache alive for the parent PugTools
+      // process instead.
 
       if (_panelRender != null) {
         _panelRender.StopRender();
 
-        if (_render != null) _render.Join();
+        // Never block the WinForms UI indefinitely on a D3D render thread.
+        // Normally it exits immediately after StopRender(). If a driver call is
+        // temporarily stuck, leave the background thread to finish naturally.
+        Boolean renderStopped = _render == null || !_render.IsAlive || _render.Join(750);
 
-        _panelRender.Clear();
-        _panelRender.Dispose();
+        if (renderStopped) {
+          try { _panelRender.Clear(); } catch { }
+          try { _panelRender.Dispose(); } catch { }
+        }
+
         _panelRender = null;
+        _render = null;
       }
 
       if (treeViewFast1 != null) {
@@ -138,19 +150,49 @@ namespace PugTools {
       _testRules = null;
       _weaponAppearance = null;
 
-      Dispose(true);
-
       System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.Interactive;
     }
+
     private void ModelBrowserFormClosing(Object sender, FormClosingEventArgs e) {
       System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.Interactive;
       _closing = true;
+
+      // Stop GPU work before WinForms starts tearing down the render control.
+      // This also gives the render thread time to exit while the form is still
+      // valid, rather than waiting in FormClosed.
+      try { _panelRender?.StopRender(); } catch { }
     }
     private void ModelBrowserFormResize(Object sender, EventArgs e) {
       treeViewFast1.Size =
         new System.Drawing.Size(splitContainer2.Panel1.Width, splitContainer2.Panel1.Height - 40);
     }
     #endregion
+
+    private static GomObjectData FindFirstGomObjectData(Object value) {
+      if (value == null)
+        return null;
+
+      if (value is GomObjectData data)
+        return data;
+
+      if (value is IEnumerable<Object> values) {
+        foreach (Object entry in values) {
+          GomObjectData result = FindFirstGomObjectData(entry);
+          if (result != null)
+            return result;
+        }
+      }
+
+      if (value is IDictionary<Object, Object> map) {
+        foreach (Object entry in map.Values) {
+          GomObjectData result = FindFirstGomObjectData(entry);
+          if (result != null)
+            return result;
+        }
+      }
+
+      return null;
+    }
 
     #region Background Worker Methods
     private void BackgroundWorker1DoWork(Object sender, DoWorkEventArgs e) {
@@ -200,10 +242,23 @@ namespace PugTools {
         _weaponAppearance.Add(app.Key.ToString().ToLower(), app.Value);
       }
 
-      _mntMountInfoData =
-        _currentDom.GetObject("mntMountInfoPrototype").Data.Get<Dictionary<Object, Object>>(
-          "mntMountInfoData"
-        );
+      // Mount table names changed over the lifetime of SWTOR.  Older PugTools
+      // expected only mntMountInfoData; current GOM data exposes mntIdToDataMap
+      // (and some intermediate builds used mntDataMap).  Treat all of them as
+      // aliases and do not abort ModelBrowser startup when one is absent.
+      _mntMountInfoData = new Dictionary<Object, Object>();
+      GomObject mountInfoPrototype = _currentDom.GetObject("mntMountInfoPrototype");
+      if (mountInfoPrototype?.Data != null) {
+        Object mountTable = null;
+        if (!mountInfoPrototype.Data.Dictionary.TryGetValue("mntMountInfoData", out mountTable))
+          if (!mountInfoPrototype.Data.Dictionary.TryGetValue("mntIdToDataMap", out mountTable))
+            mountInfoPrototype.Data.Dictionary.TryGetValue("mntDataMap", out mountTable);
+
+        if (mountTable is Dictionary<Object, Object> objectMap)
+          _mntMountInfoData = objectMap;
+        else if (mountTable is IDictionary<Object, Object> objectDictionary)
+          _mntMountInfoData = objectDictionary.ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+      }
 
       // Get the relevant nodes from the new dom.
       List<GomObject> itmList =
@@ -324,15 +379,26 @@ namespace PugTools {
       }
 
       foreach (KeyValuePair<Object, Object> item in _mntMountInfoData) {
-        GomObjectData value = (GomObjectData)item.Value;
+        GomObjectData value = FindFirstGomObjectData(item.Value);
+        if (value == null)
+          continue;
 
-        value.Dictionary.TryGetValue("mntDataSpecString", out Object spec);
+        Object spec = null;
+        if (!value.Dictionary.TryGetValue("mntDataSpecString", out spec))
+          value.Dictionary.TryGetValue("mntDataSpec", out spec);
+
+        if (spec == null)
+          continue;
+
+        String specString = spec.ToString();
+        if (String.IsNullOrWhiteSpace(specString))
+          continue;
 
         String parent;
-        String display = spec.ToString().Split('.').Last();
+        String display = specString.Split('.').Last();
 
-        if (spec.ToString().Contains(".")) {
-          String[] temp = spec.ToString().Split('.');
+        if (specString.Contains(".")) {
+          String[] temp = specString.Split('.');
           parent = String.Join(".", temp.Take(temp.Length - 1));
           display = display.Replace(parent, "").Replace(".", "");
 
@@ -340,9 +406,10 @@ namespace PugTools {
         } else
           parent = "/nodes";
 
-        NodeAsset asset = new NodeAsset(spec.ToString(), parent, display, value);
+        NodeAsset asset = new NodeAsset(specString, parent, display, value);
 
-        _assetDict.Add(spec.ToString(), asset);
+        if (!_assetDict.ContainsKey(specString))
+          _assetDict.Add(specString, asset);
       }
 
       foreach (String dir in nodeDirs) {
@@ -1054,6 +1121,60 @@ namespace PugTools {
     #endregion
 
     #region Parsers
+    private static Boolean TryParseFxFloat(String value, out Single result) {
+      result = 0.0F;
+      if (String.IsNullOrWhiteSpace(value))
+        return false;
+
+      value = value.Trim();
+
+      // SWTOR FxSpec numeric values are stored with a dot decimal separator,
+      // independent of the Windows UI locale.
+      if (Single.TryParse(
+            value,
+            System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture,
+            out result))
+        return true;
+
+      return Single.TryParse(
+        value,
+        System.Globalization.NumberStyles.Float,
+        System.Globalization.CultureInfo.CurrentCulture,
+        out result
+      );
+    }
+
+    private static Boolean TryParseFxVector3(String text, out Vector3 result) {
+      result = new Vector3();
+      if (String.IsNullOrWhiteSpace(text))
+        return false;
+
+      String cleaned = text
+        .Replace("(", " ")
+        .Replace(")", " ")
+        .Replace("[", " ")
+        .Replace("]", " ")
+        .Trim();
+
+      // Normal FxSpecs use commas. A few newer marshalled values use
+      // semicolons or plain whitespace instead.
+      String[] parts = cleaned
+        .Split(new Char[] { ',', ';', ' ', '\t', '\r', '\n' },
+               StringSplitOptions.RemoveEmptyEntries);
+
+      if (parts.Length < 3)
+        return false;
+
+      if (!TryParseFxFloat(parts[0], out Single x)
+          || !TryParseFxFloat(parts[1], out Single y)
+          || !TryParseFxFloat(parts[2], out Single z))
+        return false;
+
+      result = new Vector3(x, y, z);
+      return true;
+    }
+
     private void ParseFxSpec(String fxspec, String type = "") {
       if (fxspec == null) return;
 
@@ -1062,7 +1183,11 @@ namespace PugTools {
       fxspec += fxspec.Contains(".fxspec") ? "" : ".fxspec";
 
       // Define full filepath
-      File fxFile = _currentAssets.FindFile("/resources/art/fx/fxspec/" + fxspec);
+      fxspec = fxspec.Replace("\\", "/");
+      String normalizedFxSpec = fxspec.StartsWith("/") ? fxspec : "/resources/art/fx/fxspec/" + fxspec;
+      if (!normalizedFxSpec.EndsWith(".fxspec", StringComparison.OrdinalIgnoreCase)) normalizedFxSpec += ".fxspec";
+      if (!_parsedFxSpecs.Add(normalizedFxSpec)) return;
+      File fxFile = _currentAssets.FindFile(normalizedFxSpec);
 
       // If filepath is invalid, return
       if (fxFile == null) return;
@@ -1077,19 +1202,110 @@ namespace PugTools {
 
       // Load the model list from the FxSpec
       XmlNode modelList =
-            xmlDoc.SelectSingleNode("/nodeWClasses/marshalData/node/f[@name='_fxModelList']");
+            xmlDoc.SelectSingleNode("//*[@name='_fxModelList']");
 
       // Relative transforms
       Vector3 relPosVec = new Vector3();
       Vector3 relRotVec = new Vector3();
 
-      // Some newer mount FxSpecs do not contain the old _fxModelList layout at all.
-      // Do not abort here: a number of vehicle/glider FxSpecs expose their GR2
-      // resource directly elsewhere in the document. We use that as a fallback
-      // below if the normal model-list parser finds nothing.
-      Int32 modelsBefore = _models.Count;
+      // Newer MNT/glider FxSpecs can be wrapper specs. Follow displayName
+      // references to the actual visual FxSpec.
+      foreach (XmlNode displayNode in xmlDoc.SelectNodes("//*[@name='displayName']")) {
+        String referenced = displayNode.InnerText?.Trim();
+        if (String.IsNullOrWhiteSpace(referenced)) continue;
+        if (referenced.EndsWith(".fxspec", StringComparison.OrdinalIgnoreCase))
+          ParseFxSpec(referenced, type);
+        else if (type == "mnt")
+          ParseFxSpec(referenced + ".fxspec", type);
+      }
 
-      if (modelList != null && modelList.ChildNodes.Count > 0)
+      // Vehicle/glider FxSpecs are often wrappers.  Some of them reference
+      // another FxSpec through fields other than displayName/_fxResourceName.
+      // Follow every textual *.fxspec reference in the document. _parsedFxSpecs
+      // prevents cycles.
+      if (type == "mnt") {
+        XmlNodeList allFxNodes = xmlDoc.SelectNodes("//*[not(*)]");
+        if (allFxNodes != null) {
+          foreach (XmlNode valueNode in allFxNodes) {
+            String valueText = valueNode.InnerText?.Trim().Replace("\\", "/");
+            if (String.IsNullOrWhiteSpace(valueText)) continue;
+
+            Int32 fxIndex = valueText.IndexOf(".fxspec", StringComparison.OrdinalIgnoreCase);
+            if (fxIndex < 0) continue;
+
+            // Values are normally a single path. Strip simple surrounding
+            // punctuation used by marshalled string representations.
+            String nestedFx = valueText.Substring(0, fxIndex + 7)
+              .Trim(' ', '\t', '\r', '\n', '"', '\'', '{', '}', '[', ']', '(', ')');
+
+            if (!String.IsNullOrWhiteSpace(nestedFx))
+              ParseFxSpec(nestedFx, type);
+          }
+        }
+      }
+
+      // Collect every GR2 resource in the whole FxSpec. This covers nested
+      // visual resources used by newer gliders.
+      XmlNodeList fallbackResources = xmlDoc.SelectNodes("//*[@name='_fxResourceName']");
+      if (fallbackResources != null) {
+        foreach (XmlNode resourceNode in fallbackResources) {
+          String resourceName = resourceNode.InnerText?.Trim().Replace("\\", "/");
+          if (String.IsNullOrWhiteSpace(resourceName) || !resourceName.EndsWith(".gr2", StringComparison.OrdinalIgnoreCase)) continue;
+          if (resourceName.IndexOf("vfx", StringComparison.OrdinalIgnoreCase) >= 0 || resourceName.IndexOf("spawn", StringComparison.OrdinalIgnoreCase) >= 0 || resourceName.IndexOf("_distortion", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+          String modelPath = resourceName.StartsWith("/resources/", StringComparison.OrdinalIgnoreCase) ? resourceName : "/resources" + (resourceName.StartsWith("/") ? resourceName : "/" + resourceName);
+          File attachModel = _currentAssets.FindFile(modelPath);
+          if (attachModel == null) continue;
+          String name = modelPath.Split('/').Last();
+          if (_models.ContainsKey(name)) continue;
+          using BinaryReader br = new BinaryReader(attachModel.OpenCopyInMemory());
+          _models[name] = new GR2(br, name) { transformMatrix = Matrix.Identity };
+        }
+      }
+
+      // A few current vehicle specs store their model path in another field
+      // entirely. As a final MNT fallback, inspect every leaf value containing
+      // a .gr2 path and load it as a root model.
+      if (type == "mnt") {
+        XmlNodeList allValueNodes = xmlDoc.SelectNodes("//*[not(*)]");
+        if (allValueNodes != null) {
+          foreach (XmlNode valueNode in allValueNodes) {
+            String rawValue = valueNode.InnerText?.Trim().Replace("\\", "/");
+            if (String.IsNullOrWhiteSpace(rawValue)) continue;
+
+            Int32 gr2Index = rawValue.IndexOf(".gr2", StringComparison.OrdinalIgnoreCase);
+            if (gr2Index < 0) continue;
+
+            String resourceName = rawValue.Substring(0, gr2Index + 4)
+              .Trim(' ', '\t', '\r', '\n', '"', '\'', '{', '}', '[', ']', '(', ')');
+
+            if (resourceName.IndexOf("vfx", StringComparison.OrdinalIgnoreCase) >= 0
+                || resourceName.IndexOf("spawn", StringComparison.OrdinalIgnoreCase) >= 0
+                || resourceName.IndexOf("_distortion", StringComparison.OrdinalIgnoreCase) >= 0)
+              continue;
+
+            String modelPath = resourceName.StartsWith("/resources/", StringComparison.OrdinalIgnoreCase)
+              ? resourceName
+              : "/resources" + (resourceName.StartsWith("/") ? resourceName : "/" + resourceName);
+
+            File modelFile = _currentAssets.FindFile(modelPath);
+            if (modelFile == null) continue;
+
+            String name = modelPath.Split('/').Last();
+            if (_models.ContainsKey(name)) continue;
+
+            using BinaryReader br = new BinaryReader(modelFile.OpenCopyInMemory());
+            _models[name] = new GR2(br, name) {
+              transformMatrix = Matrix.Identity,
+              scaleMatrix = Matrix.Identity
+            };
+          }
+        }
+      }
+
+      // Some newer mount FxSpecs do not contain an emitter list. The model
+      // list is still useful on its own.
+      if (modelList == null || modelList.ChildNodes.Count < 1) return;
+
       foreach (XmlNode modelNode in modelList.ChildNodes) {
         // Ignore models that explicitly never start. Older/newer mount FxSpecs
         // may omit this optional field, in which case the model should load.
@@ -1117,7 +1333,10 @@ namespace PugTools {
         // Transform vectors
         Vector3 positionVec = new Vector3();
         Vector3 rotationVec = new Vector3();
-        Vector3 scaleVec = new Vector3();
+
+        // Missing _fxScale means identity scale.  The old zero vector made
+        // otherwise valid vehicle models collapse to a point.
+        Vector3 scaleVec = new Vector3(1.0F, 1.0F, 1.0F);
 
         // Transform vector nodes
         XmlNode positionVecNode =
@@ -1190,24 +1409,14 @@ namespace PugTools {
                 emitterNode.ParentNode.SelectSingleNode("./node()[@name='_fxAttachRotation']");
 
               // Position Transform
-              if (parentPositionVecNode != null) {
-                String[] temp =
-                  parentPositionVecNode.InnerText.Replace("(", "").Replace(")", "").Split(',');
-                positionVec += new Vector3(
-                  Single.Parse(temp[0]),
-                  Single.Parse(temp[1]),
-                  Single.Parse(temp[2]));
-              }
+              if (parentPositionVecNode != null
+                  && TryParseFxVector3(parentPositionVecNode.InnerText, out Vector3 parentPos))
+                positionVec += parentPos;
 
               // Rotation Transform
-              if (parentRotationVecNode != null) {
-                String[] temp =
-                  parentRotationVecNode.InnerText.Replace("(", "").Replace(")", "").Split(',');
-                rotationVec += new Vector3(
-                  Single.Parse(temp[0]),
-                  Single.Parse(temp[1]),
-                  Single.Parse(temp[2]));
-              }
+              if (parentRotationVecNode != null
+                  && TryParseFxVector3(parentRotationVecNode.InnerText, out Vector3 parentRot))
+                rotationVec += parentRot;
 
               ParseFxSpecEmitters(
                 emitterNode,
@@ -1220,54 +1429,37 @@ namespace PugTools {
             // Check if attachments should be relative
             if (attachRelativeNode != null && attachRelativeNode.InnerText == "true"
                 && resourceFxName != null && resourceFxName.InnerText == "speeder") {
-              String[] pos = modelNode.SelectSingleNode("./node()[@name='_fxStartLocOffset']")
-                .InnerText.Replace("(", "").Replace(")", "").Split(',');
-              relPosVec = new Vector3(
-                Single.Parse(pos[0]),
-                Single.Parse(pos[1]),
-                Single.Parse(pos[2]));
+              XmlNode startLocNode =
+                modelNode.SelectSingleNode("./node()[@name='_fxStartLocOffset']");
+              if (startLocNode != null
+                  && TryParseFxVector3(startLocNode.InnerText, out Vector3 relPos))
+                relPosVec = relPos;
 
-              String[] rot = modelNode.SelectSingleNode("./node()[@name='_fxRotation']")
-                .InnerText.Replace("(", "").Replace(")", "").Split(',');
-              relRotVec = new Vector3(
-                Single.Parse(rot[0]),
-                Single.Parse(rot[1]),
-                Single.Parse(rot[2]));
+              XmlNode fxRotationNode =
+                modelNode.SelectSingleNode("./node()[@name='_fxRotation']");
+              if (fxRotationNode != null
+                  && TryParseFxVector3(fxRotationNode.InnerText, out Vector3 relRot))
+                relRotVec = relRot;
             }
 
             // Position Transform
-            if (positionVecNode != null) {
-              String[] temp =
-                positionVecNode.InnerText.Replace("(", "").Replace(")", "").Split(',');
-              positionVec += new Vector3(
-                Single.Parse(temp[0]),
-                Single.Parse(temp[1]),
-                Single.Parse(temp[2]));
-
+            if (positionVecNode != null
+                && TryParseFxVector3(positionVecNode.InnerText, out Vector3 parsedPosition)) {
+              positionVec += parsedPosition;
               if (relPosVec != new Vector3()) positionVec += relPosVec;
             }
 
             // Rotation Transform
-            if (rotationVecNode != null) {
-              String[] temp =
-                rotationVecNode.InnerText.Replace("(", "").Replace(")", "").Split(',');
-              rotationVec += new Vector3(
-                Single.Parse(temp[0]),
-                Single.Parse(temp[1]),
-                Single.Parse(temp[2]));
-
+            if (rotationVecNode != null
+                && TryParseFxVector3(rotationVecNode.InnerText, out Vector3 parsedRotation)) {
+              rotationVec += parsedRotation;
               if (relRotVec != new Vector3()) rotationVec += relRotVec;
             }
 
             // Scale Transform
-            if (scaleVecNode != null) {
-              String[] temp =
-                scaleVecNode.InnerText.Replace("(", "").Replace(")", "").Split(',');
-              scaleVec = new Vector3(
-                Single.Parse(temp[0]),
-                Single.Parse(temp[1]),
-                Single.Parse(temp[2]));
-            }
+            if (scaleVecNode != null
+                && TryParseFxVector3(scaleVecNode.InnerText, out Vector3 parsedScale))
+              scaleVec = parsedScale;
 
             // Check if model is attached to a valid attachment point or bone
             if (parentBoneAttachNode != null && parentBoneAttachNode.InnerText != "") {
@@ -1318,8 +1510,7 @@ namespace PugTools {
             }
 
             // Scale matrix from vector
-            if (scaleVec != new Vector3(0.0F, 0.0F, 0.0F))
-              gr2Model.scaleMatrix = Matrix.Scaling(scaleVec);
+            gr2Model.scaleMatrix = Matrix.Scaling(scaleVec);
 
             // Transform matrix from vectors
             gr2Model.transformMatrix =
@@ -1331,47 +1522,6 @@ namespace PugTools {
 
             // Add model to models list
             _models[modelKey] = gr2Model;
-          }
-        }
-      }
-
-      // Fallback for newer MNT/vehicle FxSpecs: locate any GR2 resource in the
-      // complete FxSpec, not just under _fxModelList. These entries often contain
-      // no _fxName/attachment metadata, so load them as root models.
-      if (_models.Count == modelsBefore) {
-        foreach (XmlNode resourceNode in xmlDoc.SelectNodes("//node()[@name='_fxResourceName']")) {
-          String resourceName = resourceNode.InnerText?.Trim();
-          if (String.IsNullOrWhiteSpace(resourceName)
-              || !resourceName.EndsWith(".gr2", StringComparison.OrdinalIgnoreCase)) continue;
-
-          String normalizedResource = resourceName.Replace("\\", "/");
-          String modelPath = normalizedResource.StartsWith("/resources/", StringComparison.OrdinalIgnoreCase)
-            ? normalizedResource
-            : "/resources" + (normalizedResource.StartsWith("/") ? normalizedResource : "/" + normalizedResource);
-
-          File modelFile = _currentAssets.FindFile(modelPath);
-          if (modelFile == null) continue;
-
-          String name = modelPath.Split('/').Last();
-          if (_models.ContainsKey(name)) continue;
-
-          using BinaryReader br = new BinaryReader(modelFile.OpenCopyInMemory());
-          GR2 gr2Model = new GR2(br, name) {
-            transformMatrix = Matrix.Identity
-          };
-          _models.Add(name, gr2Model);
-        }
-
-        // A few mount specs are only wrappers and point to another FxSpec via
-        // displayName. Follow that reference when no GR2 could be resolved here.
-        if (_models.Count == modelsBefore) {
-          foreach (XmlNode displayNode in xmlDoc.SelectNodes("//node()[@name='displayName']")) {
-            String nestedFx = displayNode.InnerText?.Trim();
-            if (String.IsNullOrWhiteSpace(nestedFx)) continue;
-            if (!nestedFx.EndsWith(".fxspec", StringComparison.OrdinalIgnoreCase)) continue;
-            if (nestedFx.Equals(fxspec, StringComparison.OrdinalIgnoreCase)) continue;
-            ParseFxSpec(nestedFx, type);
-            if (_models.Count > modelsBefore) break;
           }
         }
       }
@@ -1417,25 +1567,14 @@ namespace PugTools {
         if (type == "itm" || parentAttachToNode.InnerText != "CASTER"
             && parentAttachToNode.InnerText != "TARGET") {
           // Position Transform
-          if (parentPositionVecNode != null) {
-            String[] temp = parentPositionVecNode.InnerText
-              .ToString().Replace("(", "").Replace(")", "").Split(',');
-            positionVec += new Vector3(
-              Single.Parse(temp[0]),
-              Single.Parse(temp[1]),
-              Single.Parse(temp[2]));
-          }
+          if (parentPositionVecNode != null
+              && TryParseFxVector3(parentPositionVecNode.InnerText, out Vector3 emitterPos))
+            positionVec += emitterPos;
 
           // Rotation Transform
-          if (parentRotationVecNode != null) {
-            String[] temp =
-              parentRotationVecNode.InnerText
-                .ToString().Replace("(", "").Replace(")", "").Split(',');
-            rotationVec += new Vector3(
-              Single.Parse(temp[0]),
-              Single.Parse(temp[1]),
-              Single.Parse(temp[2]));
-          }
+          if (parentRotationVecNode != null
+              && TryParseFxVector3(parentRotationVecNode.InnerText, out Vector3 emitterRot))
+            rotationVec += emitterRot;
         }
 
         // Recursive
@@ -1702,6 +1841,10 @@ namespace PugTools {
     #region Preview Methods
     private void PreviewAsset(NodeAsset asset) {
       if (asset.Obj != null || asset.objData != null || asset.dynObject != null) {
+        // FxSpec recursion is cached only for the duration of a single preview.
+        // Keeping this set across selections made the same MNT load differently
+        // depending on what had been viewed before.
+        _parsedFxSpecs.Clear();
         RenderPanelHide();
         LoadingSwirlShow();
         ProgressBarShow();
@@ -1716,6 +1859,11 @@ namespace PugTools {
 
         _models ??= new Dictionary<String, GR2>();
         _resources ??= new Dictionary<String, Object>();
+
+        // Do not carry models/resources from the previous preview into the
+        // next MNT/ITM selection.
+        _models.Clear();
+        _resources.Clear();
 
         DataGridViewClear();
         DataGridViewDisable();
@@ -1812,7 +1960,8 @@ namespace PugTools {
           }
         } else if (asset.objData != null) {
           GomObjectData obj = asset.objData;
-          if (obj.Dictionary.ContainsKey("mntDataSpecString")) {
+          if (obj.Dictionary.ContainsKey("mntDataSpecString") ||
+              obj.Dictionary.ContainsKey("mntDataSpec")) {
             try {
               StatusBarText("Loading MNT Data ...");
               Refresh();
@@ -1820,8 +1969,7 @@ namespace PugTools {
             }
             catch (Exception ex) {
               MessageBox.Show(
-                ex.Message.ToString() + "\r\n" + ex.InnerException.ToString() + "\r\n"
-                  + ex.StackTrace.ToString(),
+                ex.ToString(),
                 "Error"
               );
             }
@@ -1998,55 +2146,558 @@ namespace PugTools {
       _render.Start();
     }
 
+    private Boolean LoadGR2Model(String modelPath, String key = null) {
+      if (String.IsNullOrWhiteSpace(modelPath)) return false;
+
+      modelPath = modelPath.Replace('\\', '/');
+      if (!modelPath.Contains(".gr2", StringComparison.OrdinalIgnoreCase)) return false;
+
+      if (!modelPath.StartsWith("/resources", StringComparison.OrdinalIgnoreCase))
+        modelPath = "/resources" + (modelPath.StartsWith("/") ? "" : "/") + modelPath;
+
+      File file = _currentAssets.FindFile(modelPath);
+      if (file == null) return false;
+
+      using BinaryReader br = new BinaryReader(file.OpenCopyInMemory());
+      String name = modelPath.Split('/').Last();
+      GR2 gr2Model = new GR2(br, name) {
+        transformMatrix = Matrix.Scaling(new Vector3(1.0F, 1.0F, 1.0F))
+      };
+
+      _models[key ?? name] = gr2Model;
+      return true;
+    }
+
+
+    private Boolean ResolveMountVisualValue(
+      Object value,
+      HashSet<UInt64> visitedNodes,
+      Int32 depth = 0
+    ) {
+      if (value == null || depth > 6) return false;
+
+      Boolean loaded = false;
+
+      if (value is String text) {
+        text = text.Trim().Replace('\\', '/');
+        if (String.IsNullOrWhiteSpace(text)) return false;
+
+        if (text.EndsWith(".gr2", StringComparison.OrdinalIgnoreCase)) {
+          String key = text.Split('/').Last();
+          return LoadGR2Model(text, key);
+        }
+
+        if (text.EndsWith(".fxspec", StringComparison.OrdinalIgnoreCase)) {
+          Int32 before = _models?.Count ?? 0;
+          ParseFxSpec(text, "mnt");
+          return (_models?.Count ?? 0) > before;
+        }
+
+        // Some decoration/dynamic records use an FQN instead of a direct asset
+        // path. Follow it when it resolves to a GOM node.
+        if (text.Contains(".")) {
+          try {
+            GomObject referenced = _currentDom.GetObject(text);
+            if (referenced != null)
+              return LoadMountDecoration(referenced.Id, visitedNodes);
+          } catch { }
+        }
+
+        return false;
+      }
+
+      if (value is GomObjectData gomData) {
+        foreach (KeyValuePair<String, Object> kvp in gomData.Dictionary) {
+          if (kvp.Key == "Script_Type"
+              || kvp.Key == "Script_TypeId"
+              || kvp.Key == "Script_NumFields")
+            continue;
+
+          loaded |= ResolveMountVisualValue(kvp.Value, visitedNodes, depth + 1);
+        }
+        return loaded;
+      }
+
+      if (value is System.Collections.IDictionary dict) {
+        foreach (System.Collections.DictionaryEntry entry in dict)
+          loaded |= ResolveMountVisualValue(entry.Value, visitedNodes, depth + 1);
+
+        return loaded;
+      }
+
+      if (value is System.Collections.IEnumerable enumerable && value is not String) {
+        foreach (Object item in enumerable)
+          loaded |= ResolveMountVisualValue(item, visitedNodes, depth + 1);
+
+        return loaded;
+      }
+
+      return loaded;
+    }
+
+    private Boolean LoadMountDecoration(UInt64 nodeId) {
+      return LoadMountDecoration(nodeId, new HashSet<UInt64>());
+    }
+
+    private Boolean LoadMountDecoration(UInt64 nodeId, HashSet<UInt64> visited) {
+      if (nodeId == 0 || visited == null || !visited.Add(nodeId)) return false;
+
+      GomObject node = _currentDom.GetObject(nodeId);
+      if (node == null || node.Data == null) return false;
+
+      Boolean loaded = false;
+      String key = !String.IsNullOrWhiteSpace(node.Name)
+        ? node.Name.Split('.').Last()
+        : nodeId.ToString();
+
+      // mntDataDecorationId does not necessarily point at the drawable object.
+      // On current clients it can point at a decDecoration wrapper whose
+      // decDecorationId references the actual dyn/plc/npc asset.
+      UInt64 nestedDecorationId =
+        node.Data.ValueOrDefault<UInt64>("decDecorationId", 0);
+      if (nestedDecorationId != 0 && nestedDecorationId != nodeId)
+        loaded |= LoadMountDecoration(nestedDecorationId, visited);
+
+      // Vehicle appearance nodes used by vehicle/speeder/glider mounts.
+      String vehicleModel = node.Data.ValueOrDefault<String>("vehAppModel", null);
+      if (!String.IsNullOrWhiteSpace(vehicleModel))
+        loaded |= LoadGR2Model(vehicleModel, key);
+
+      // Placeables occur both with the old plcModel field and the newer
+      // asset-spec variant.
+      String placeableModel =
+        node.Data.ValueOrDefault<String>("plcModel", null)
+        ?? node.Data.ValueOrDefault<String>("plcModelAssetSpec", null);
+      if (!String.IsNullOrWhiteSpace(placeableModel))
+        loaded |= LoadGR2Model(placeableModel, key);
+
+      // Dynamic decoration nodes changed shape between client generations.
+      // Older PugTools expected dynVisualList to always be List<Object>, while
+      // current Gree mounts can wrap the visual in maps/structs. Traverse the
+      // actual runtime value instead.
+      if (node.Data.Dictionary.TryGetValue("dynVisualList", out Object visualListValue))
+        loaded |= ResolveMountVisualValue(visualListValue, visited, 0);
+
+      // Also inspect model/visual/appearance/asset fields generically. This is
+      // deliberately limited to visual-looking fields so unrelated numeric GOM
+      // data is not followed as object references.
+      foreach (KeyValuePair<String, Object> field in node.Data.Dictionary) {
+        String fieldName = field.Key ?? String.Empty;
+        if (fieldName.IndexOf("visual", StringComparison.OrdinalIgnoreCase) >= 0
+            || fieldName.IndexOf("model", StringComparison.OrdinalIgnoreCase) >= 0
+            || fieldName.IndexOf("appearance", StringComparison.OrdinalIgnoreCase) >= 0
+            || fieldName.IndexOf("asset", StringComparison.OrdinalIgnoreCase) >= 0
+            || fieldName.IndexOf("fxspec", StringComparison.OrdinalIgnoreCase) >= 0)
+          loaded |= ResolveMountVisualValue(field.Value, visited, 0);
+      }
+
+      // Some wrappers point at another object by FQN rather than by node ID.
+      foreach (String refField in new [] {
+        "dynVisualFqn",
+        "dynVisual",
+        "plcModel",
+        "plcModelAssetSpec",
+        "vehAppModel",
+        "mntDataSpec",
+        "mntDataSpecString"
+      }) {
+        String referencedFqn = node.Data.ValueOrDefault<String>(refField, null);
+        if (String.IsNullOrWhiteSpace(referencedFqn)
+            || referencedFqn.Contains(".gr2", StringComparison.OrdinalIgnoreCase))
+          continue;
+
+        GomObject referencedNode = _currentDom.GetObject(referencedFqn);
+        if (referencedNode != null && referencedNode.Id != nodeId)
+          loaded |= LoadMountDecoration(referencedNode.Id, visited);
+      }
+
+      return loaded;
+    }
+
+
+    private String DescribeMountValue(Object value, Int32 depth = 0) {
+      if (value == null) return "<null>";
+      if (depth > 2) return value.ToString();
+
+      if (value is GomObjectData gomData) {
+        List<String> parts = new List<String>();
+        foreach (KeyValuePair<String, Object> kvp in gomData.Dictionary) {
+          if (kvp.Key == "Script_Type" || kvp.Key == "Script_TypeId" || kvp.Key == "Script_NumFields")
+            continue;
+          parts.Add(kvp.Key + "=" + DescribeMountValue(kvp.Value, depth + 1));
+        }
+        return "{ " + String.Join(", ", parts) + " }";
+      }
+
+      if (value is IDictionary<Object, Object> objectDict) {
+        List<String> parts = new List<String>();
+        Int32 count = 0;
+        foreach (KeyValuePair<Object, Object> kvp in objectDict) {
+          parts.Add(DescribeMountValue(kvp.Key, depth + 1) + " => "
+                    + DescribeMountValue(kvp.Value, depth + 1));
+          if (++count >= 20) {
+            parts.Add("...");
+            break;
+          }
+        }
+        return "{ " + String.Join(", ", parts) + " }";
+      }
+
+      if (value is System.Collections.IDictionary dict) {
+        List<String> parts = new List<String>();
+        Int32 count = 0;
+        foreach (System.Collections.DictionaryEntry entry in dict) {
+          parts.Add(DescribeMountValue(entry.Key, depth + 1) + " => "
+                    + DescribeMountValue(entry.Value, depth + 1));
+          if (++count >= 20) {
+            parts.Add("...");
+            break;
+          }
+        }
+        return "{ " + String.Join(", ", parts) + " }";
+      }
+
+      if (value is System.Collections.IEnumerable enumerable && value is not String) {
+        List<String> parts = new List<String>();
+        Int32 count = 0;
+        foreach (Object item in enumerable) {
+          parts.Add(DescribeMountValue(item, depth + 1));
+          if (++count >= 20) {
+            parts.Add("...");
+            break;
+          }
+        }
+        return "[ " + String.Join(", ", parts) + " ]";
+      }
+
+      String text = value.ToString();
+
+      // If this looks like a node id, append the resolved object name.
+      try {
+        UInt64 nodeId = Convert.ToUInt64(value);
+        if (nodeId > 0) {
+          GomObject node = _currentDom.GetObject(nodeId);
+          if (node != null && !String.IsNullOrWhiteSpace(node.Name))
+            text += "  ->  " + node.Name;
+        }
+      } catch {
+        // Not a numeric node id.
+      }
+
+      // If this looks like a FQN, show whether the DOM can resolve it.
+      if (!String.IsNullOrWhiteSpace(text)
+          && !text.Contains(" -> ")
+          && text.Contains(".")
+          && !text.EndsWith(".gr2", StringComparison.OrdinalIgnoreCase)
+          && !text.EndsWith(".fxspec", StringComparison.OrdinalIgnoreCase)) {
+        try {
+          GomObject node = _currentDom.GetObject(text);
+          if (node != null)
+            text += "  -> nodeId " + node.Id;
+        } catch {
+          // Not a resolvable FQN.
+        }
+      }
+
+      return text;
+    }
+
+    private String BuildMountDebugDump(GomObjectData obj, String fqn) {
+      System.Text.StringBuilder sb = new System.Text.StringBuilder();
+      sb.AppendLine("MNT DEBUG");
+      sb.AppendLine("=========");
+      sb.AppendLine("FQN: " + (String.IsNullOrWhiteSpace(fqn) ? "<empty>" : fqn));
+      sb.AppendLine();
+
+      if (obj == null || obj.Dictionary == null) {
+        sb.AppendLine("<no GOM data>");
+        return sb.ToString();
+      }
+
+      foreach (KeyValuePair<String, Object> kvp in obj.Dictionary.OrderBy(x => x.Key)) {
+        if (kvp.Key == "Script_Type" || kvp.Key == "Script_TypeId" || kvp.Key == "Script_NumFields")
+          continue;
+
+        sb.Append(kvp.Key);
+        sb.Append(" [");
+        sb.Append(kvp.Value?.GetType().FullName ?? "null");
+        sb.Append("] = ");
+        sb.AppendLine(DescribeMountValue(kvp.Value));
+      }
+
+      return sb.ToString();
+    }
+
+
+    private void CollectMountFxSpecs(Object value, HashSet<String> fxSpecs, Int32 depth = 0) {
+      if (value == null || fxSpecs == null || depth > 8) return;
+
+      if (value is String text) {
+        if (!String.IsNullOrWhiteSpace(text)
+            && text.EndsWith(".fxspec", StringComparison.OrdinalIgnoreCase))
+          fxSpecs.Add(text.Trim());
+        return;
+      }
+
+      if (value is GomObjectData gomData) {
+        foreach (KeyValuePair<String, Object> kvp in gomData.Dictionary) {
+          // Prefer explicitly named FxSpec/VFX fields, but recurse through all
+          // values because current mntDataSeatConfigs nests mntDataFxspec
+          // several levels below the mount row.
+          if ((kvp.Key.Contains("Fxspec", StringComparison.OrdinalIgnoreCase)
+               || kvp.Key.Contains("VFX", StringComparison.OrdinalIgnoreCase))
+              && kvp.Value != null) {
+            String fx = kvp.Value.ToString();
+            if (!String.IsNullOrWhiteSpace(fx)
+                && fx.EndsWith(".fxspec", StringComparison.OrdinalIgnoreCase))
+              fxSpecs.Add(fx.Trim());
+          }
+
+          CollectMountFxSpecs(kvp.Value, fxSpecs, depth + 1);
+        }
+        return;
+      }
+
+      if (value is System.Collections.IDictionary dict) {
+        foreach (System.Collections.DictionaryEntry entry in dict) {
+          CollectMountFxSpecs(entry.Key, fxSpecs, depth + 1);
+          CollectMountFxSpecs(entry.Value, fxSpecs, depth + 1);
+        }
+        return;
+      }
+
+      if (value is System.Collections.IEnumerable enumerable && value is not String) {
+        foreach (Object item in enumerable)
+          CollectMountFxSpecs(item, fxSpecs, depth + 1);
+      }
+    }
+
+
+    private void NormalizeMountModels(HashSet<String> mountFxSpecs) {
+      if (_models == null || _models.Count == 0 || mountFxSpecs == null || mountFxSpecs.Count == 0)
+        return;
+
+      // The recursive FxSpec resolver deliberately sees helper/VFX GR2s as well
+      // as the visible mount.  For a preview we want the main vehicle, not
+      // speeder_bike anchors, light helpers, or multiple alternate vehicle
+      // variants rendered on top of each other.
+      List<KeyValuePair<String, GR2>> vehicleCandidates =
+        _models.Where(x => {
+          String key = x.Key ?? String.Empty;
+          String file = x.Value?.filename ?? String.Empty;
+          return key.Contains("veh_", StringComparison.OrdinalIgnoreCase)
+              || file.Contains("veh_", StringComparison.OrdinalIgnoreCase);
+        }).ToList();
+
+      if (vehicleCandidates.Count == 0)
+        return;
+
+      Single ModelSize(GR2 model) {
+        if (model == null) return 0.0F;
+
+        Single dx = Math.Abs(model.globalBox.maxX - model.globalBox.minX);
+        Single dy = Math.Abs(model.globalBox.maxY - model.globalBox.minY);
+        Single dz = Math.Abs(model.globalBox.maxZ - model.globalBox.minZ);
+
+        if (Single.IsNaN(dx) || Single.IsInfinity(dx)) dx = 0;
+        if (Single.IsNaN(dy) || Single.IsInfinity(dy)) dy = 0;
+        if (Single.IsNaN(dz) || Single.IsInfinity(dz)) dz = 0;
+
+        return (Single)Math.Sqrt(dx * dx + dy * dy + dz * dz);
+      }
+
+      // Prefer a drawable mesh, then the largest vehicle-shaped GR2.  Current
+      // mount FxSpecs frequently include small veh_* light/effect meshes next
+      // to the actual speeder/glider.
+      KeyValuePair<String, GR2> primary =
+        vehicleCandidates
+          .OrderByDescending(x => x.Value?.numMeshes > 0 ? 1 : 0)
+          .ThenByDescending(x => ModelSize(x.Value))
+          .First();
+
+      HashSet<String> keep = new HashSet<String>(StringComparer.OrdinalIgnoreCase) {
+        primary.Key
+      };
+
+      foreach (String key in _models.Keys.ToList()) {
+        if (keep.Contains(key))
+          continue;
+
+        GR2 model = _models[key];
+        String file = model?.filename ?? String.Empty;
+
+        Boolean helper =
+          key.Equals("speeder", StringComparison.OrdinalIgnoreCase)
+          || key.Equals("speeder_bike", StringComparison.OrdinalIgnoreCase)
+          || file.Equals("speeder", StringComparison.OrdinalIgnoreCase)
+          || file.Equals("speeder_bike", StringComparison.OrdinalIgnoreCase)
+          || key.Contains("light_", StringComparison.OrdinalIgnoreCase)
+          || file.Contains("light_", StringComparison.OrdinalIgnoreCase)
+          || key.Contains("_light", StringComparison.OrdinalIgnoreCase)
+          || file.Contains("_light", StringComparison.OrdinalIgnoreCase)
+          || key.Contains("vfx", StringComparison.OrdinalIgnoreCase)
+          || file.Contains("vfx", StringComparison.OrdinalIgnoreCase)
+          || key.Contains("fx_", StringComparison.OrdinalIgnoreCase)
+          || file.Contains("fx_", StringComparison.OrdinalIgnoreCase);
+
+        // Once a real vehicle was resolved, remove other root FxSpec models.
+        // This avoids duplicate/triple mounts and wildly separated helper
+        // geometry affecting the camera.  Creature mounts do not enter this
+        // path because they have no vehicle candidate.
+        if (helper || vehicleCandidates.Any(x => x.Key == key) || mountFxSpecs.Count > 0) {
+          try {
+            model?.Dispose();
+          } catch {
+            // The render panel has not taken ownership yet.
+          }
+          _models.Remove(key);
+        }
+      }
+
+      System.Diagnostics.Debug.WriteLine(
+        "MNT primary model: " + primary.Key
+        + " (" + ModelSize(primary.Value).ToString("0.###") + ")"
+      );
+    }
+
     private void PreviewMNT(GomObjectData obj) {
-      obj.Dictionary.TryGetValue("mntDataVFX", out Object fxSpec);
+      String fqn = obj.ValueOrDefault<String>("mntDataSpecString", null)
+        ?? obj.ValueOrDefault<String>("mntDataSpec", null)
+        ?? String.Empty;
 
-      String fqn = (String)obj.Dictionary["mntDataSpecString"];
+      String mountDebugDump = BuildMountDebugDump(obj, fqn);
 
-      if (fxSpec != null)
-        ParseFxSpec(fxSpec.ToString(), "mnt");
+      // Current vehicle/glider mount rows can hide their visible vehicle
+      // FxSpec deep inside mntDataSeatConfigs.  Traverse the complete mount
+      // object instead of only looking at a few top-level mntData* fields.
+      Int32 modelsBeforeFx = _models?.Count ?? 0;
+      HashSet<String> mountFxSpecs =
+        new HashSet<String>(StringComparer.OrdinalIgnoreCase);
 
-      // "4611686299207604004"
-      obj.Dictionary.TryGetValue("mntDataNpc", out Object npcNodeId);
+      CollectMountFxSpecs(obj, mountFxSpecs);
+
+      // Keep the legacy top-level values too, including old entries that omit
+      // the .fxspec suffix.
+      foreach (String fxField in new [] {
+        "mntDataFxspec",
+        "mntDataVFX",
+        "mntDataPreviewVfx",
+        "mntDataFlourishVFX"
+      }) {
+        if (!obj.Dictionary.TryGetValue(fxField, out Object fxValue) || fxValue == null)
+          continue;
+
+        String fxString = fxValue.ToString()?.Trim();
+        if (String.IsNullOrWhiteSpace(fxString)) continue;
+
+        if (!fxString.EndsWith(".fxspec", StringComparison.OrdinalIgnoreCase))
+          fxString += ".fxspec";
+
+        mountFxSpecs.Add(fxString);
+      }
+
+      foreach (String mountFxSpec in mountFxSpecs) {
+        Int32 before = _models?.Count ?? 0;
+        ParseFxSpec(mountFxSpec, "mnt");
+
+        System.Diagnostics.Debug.WriteLine(
+          "MNT FxSpec: " + mountFxSpec + " -> models +" + ((_models?.Count ?? 0) - before)
+        );
+      }
+
+      Boolean loaded = (_models?.Count ?? 0) > modelsBeforeFx;
+
+      // Creature mounts: current GOM calls this field mntDataNpcSpec; older
+      // client data used mntDataNpc. Support both so the viewer works with
+      // both generations of GOM data.
+      Object npcNodeId = null;
+      if (!obj.Dictionary.TryGetValue("mntDataNpcSpec", out npcNodeId))
+        obj.Dictionary.TryGetValue("mntDataNpc", out npcNodeId);
 
       if (npcNodeId != null) {
-        GomObject npcNode = _currentDom.GetObject((UInt64)npcNodeId);
-        List<Object> npcVisualList =
-          npcNode.Data.ValueOrDefault<List<Object>>("npcVisualDataList", null);
+        try {
+          GomObject npcNode = _currentDom.GetObject(Convert.ToUInt64(npcNodeId));
+          List<Object> npcVisualList =
+            npcNode?.Data?.ValueOrDefault<List<Object>>("npcVisualDataList", null);
 
-        if (npcVisualList != null && npcVisualList.Count > 0) {
-          foreach (GomObjectData visualItem in npcVisualList) {
-            if (visualItem.Dictionary.ContainsKey("npcTemplateVisualDataAppearance")) {
+          if (npcVisualList != null) {
+            foreach (GomObjectData visualItem in npcVisualList.OfType<GomObjectData>()) {
+              if (!visualItem.Dictionary.ContainsKey("npcTemplateVisualDataAppearance")) continue;
+
               NpcAppearance npcData =
                 (NpcAppearance)_currentDom.AppearanceLoader.Load(
-                  (UInt64)visualItem.Dictionary["npcTemplateVisualDataAppearance"]
+                  Convert.ToUInt64(visualItem.Dictionary["npcTemplateVisualDataAppearance"])
                 );
 
               ParseNpcData(npcData);
+              loaded = true;
             }
           }
+        } catch (Exception ex) {
+          System.Diagnostics.Debug.WriteLine("MNT NPC load failed: " + ex);
         }
-      } else {
+      }
+
+      // Newer mounts, especially vehicle/glider-style mounts, can point to a
+      // decoration instead of an NPC. The decoration is a normal dyn/npc/plc
+      // node and can therefore carry the actual GR2 model.
+      Object decorationId = null;
+      if (!obj.Dictionary.TryGetValue("mntDataDecorationId", out decorationId))
+        obj.Dictionary.TryGetValue("mntDataDecoration", out decorationId);
+
+      if (decorationId != null) {
+        try {
+          loaded |= LoadMountDecoration(Convert.ToUInt64(decorationId));
+        } catch (Exception ex) {
+          System.Diagnostics.Debug.WriteLine("MNT decoration load failed: " + ex);
+        }
+      }
+
+      // Direct vehicle appearance fallback: the mount spec itself may be a
+      // vehAppearanceProtoData node.
+      if (!loaded && !String.IsNullOrWhiteSpace(fqn)) {
+        try {
+          GomObject specNode = _currentDom.GetObject(fqn);
+          if (specNode != null) {
+            loaded |= LoadMountDecoration(specNode.Id);
+          }
+        } catch (Exception ex) {
+          System.Diagnostics.Debug.WriteLine("MNT vehicle appearance load failed: " + ex);
+        }
+      }
+
+      // Reduce recursive vehicle FxSpecs to one stable visible root model.
+      // Do this only after all FX/decor/NPC resolution has finished.
+      NormalizeMountModels(mountFxSpecs);
+      loaded = _models != null && _models.Count > 0;
+
+      // Only use the humanoid skeleton as a last resort for legacy/creature
+      // mount data. If a vehicle/glider explicitly supplied an FX reference
+      // but it could not be resolved, adding the skeleton merely produces a
+      // misleading empty blue preview with human bones.
+      if (!loaded && mountFxSpecs.Count == 0) {
         String skeletonModel = "/resources/art/dynamic/spec/" + _bodyType + "new_skeleton.gr2";
-        File file = _currentAssets.FindFile(skeletonModel);
-
-        if (file != null) {
-          using BinaryReader br = new BinaryReader(file.OpenCopyInMemory());
-          String name = skeletonModel.Split('/').Last();
-          GR2 gr2Model = new GR2(br, name) {
-            transformMatrix = Matrix.Scaling(new Vector3(1.0F, 1.0F, 1.0F))
-          };
-
-          _models.Add(name, gr2Model);
-        }
+        loaded = LoadGR2Model(skeletonModel);
       }
 
       if (_models.Count > 0) {
         _panelRender.LoadModel(_models, _resources, fqn, "mnt");
         _render = new Thread(_panelRender.StartRender) { IsBackground = true };
         _render.Start();
+
       } else {
-        MessageBox.Show("No models were found", "Error Loading Models");
+        mountDebugDump += "\r\nResolved FxSpecs:\r\n  "
+          + (mountFxSpecs.Count > 0
+            ? String.Join("\r\n  ", mountFxSpecs)
+            : "<none>")
+          + "\r\n";
+
+        MessageBox.Show(
+          mountDebugDump,
+          "MNT Debug - no models resolved",
+          MessageBoxButtons.OK,
+          MessageBoxIcon.Information
+        );
       }
     }
 

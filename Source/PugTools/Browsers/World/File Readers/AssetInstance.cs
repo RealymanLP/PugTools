@@ -104,6 +104,23 @@ namespace FileFormats {
 
     private readonly Inflater RawDeflate = new Inflater();
 
+    private void LogHeightmapDiagnostic(string codecUsed, HeightMap heightMap, bool succeeded) {
+      try {
+        string logPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "heightmap_debug.log");
+        string line = string.Format(
+          "id={0} pos=({1:F1},{2:F1},{3:F1}) codec={4} succeeded={5} width={6} depth={7} " +
+          "headerBitflag={8} hasHoles={9}\n",
+          ID, position.X, position.Y, position.Z, codecUsed, succeeded,
+          heightMap != null ? heightMap.width.ToString() : "-",
+          heightMap != null ? heightMap.depth.ToString() : "-",
+          heightMap != null ? heightMap.headerBitFlag.ToString() : "-",
+          heightMap != null ? heightMap.hasHoles.ToString() : "-");
+        System.IO.File.AppendAllText(logPath, line);
+      } catch {
+        // Best-effort diagnostic only.
+      }
+    }
+
     public Vector3 position = new Vector3(0.0f, 0.0f, 0.0f);
     public Vector3 rotation = new Vector3(0.0f, 0.0f, 0.0f);
     public Vector3 scale = new Vector3(1.0f, 1.0f, 1.0f);
@@ -198,6 +215,7 @@ namespace FileFormats {
     public void ReadHeightMap() {
       if (vertexData != null) {
         BinaryReader br2 = null;
+        string codecUsed = "none";
 
         // Same situation as everywhere else in the 64-bit client: this data may be Zstandard-
         // compressed (magic 28 B5 2F FD) instead of the old zlib/deflate (magic 9C 78 little-endian
@@ -207,6 +225,7 @@ namespace FileFormats {
                       vertexData[2] == 0x2F && vertexData[3] == 0xFD;
 
         if (isZstd) {
+          codecUsed = "zstd";
           using var decompressor = new ZstdSharp.Decompressor();
           // maxDecompressedSize=0 is NOT "auto-detect from the frame header" here - ZstdSharp
           // enforces it as a hard cap and throws if the real size exceeds it, even though the
@@ -219,6 +238,7 @@ namespace FileFormats {
           var magic = BitConverter.ToUInt16(vertexData, 0);
 
           if (magic == 0x8B1F) {
+            codecUsed = "gzip-unsupported";
             System.Diagnostics.Debug.WriteLine("Heightmap uses GZip compression");
 
             // br.BaseStream.Seek(pos + 14, SeekOrigin.Begin);
@@ -246,18 +266,25 @@ namespace FileFormats {
             //     Debug.WriteLine("Heightmap uses unknown compression");
             // }
           } else if (magic == 0x9C78) {
+            codecUsed = "zlib";
             byte[] buffer = new byte[1048575];
 
             RawDeflate.SetInput(vertexData);
             RawDeflate.Inflate(buffer);
 
             br2 = new BinaryReader(new MemoryStream(buffer));
+          } else {
+            codecUsed = string.Format("unknown-0x{0:X4}", magic);
           }
         }
 
-        if (br2 == null) return;
+        if (br2 == null) {
+          LogHeightmapDiagnostic(codecUsed, null, false);
+          return;
+        }
 
         HeightMap heightMap = new HeightMap(br2);
+        LogHeightmapDiagnostic(codecUsed, heightMap, true);
 
         // Use the HeightMap's own parsed dimensions consistently, not the AssetInstance's width/
         // depth fields (which come from a different source and aren't guaranteed to match the

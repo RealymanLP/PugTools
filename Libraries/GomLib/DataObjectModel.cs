@@ -186,7 +186,14 @@ namespace GomLib {
         NodeLookup[typeType] = nameMap;
       }
 
-      NodeLookup[typeType].Add(type.Name, type);
+      // Multiple GOM IDs can share the same resolved display name.
+      // NodeLookup is keyed only by name, so such aliases are inherently
+      // ambiguous. Keep the first loaded entry instead of aborting the
+      // complete DOM load with Dictionary.Add(). ID-based access remains
+      // available through DomTypeMap for every type.
+      if (!NodeLookup[typeType].ContainsKey(type.Name)) {
+        NodeLookup[typeType].Add(type.Name, type);
+      }
     }
 
     private void AddTypeLoader(DomTypeLoaders.IDomTypeLoader loader) {
@@ -546,8 +553,16 @@ namespace GomLib {
 
           String name = node.Value;
 
-          m_storedNameMap.Add(name, id);
-          m_storedIdMap.Add(id, name);
+          // gom_type_names can legitimately contain the same display name for
+          // different GOM type IDs (for example GUIAnimation is both an
+          // association and a class). Keep the first name -> id mapping so
+          // existing lookups remain stable, while still retaining every unique
+          // id -> name mapping.
+          if (!m_storedNameMap.ContainsKey(name))
+            m_storedNameMap.Add(name, id);
+
+          if (!m_storedIdMap.ContainsKey(id))
+            m_storedIdMap.Add(id, name);
         }
       }
     }

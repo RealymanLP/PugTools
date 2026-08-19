@@ -36,7 +36,7 @@ namespace GomLib {
     public Dictionary<string, ModelColors> Colors { get; set; } //Only found in ami.colorscheme
 
     public string GetAttachment(long id) {
-      if (!Attachments.TryGetValue(id, out string attachment))
+      if (Attachments == null || !Attachments.TryGetValue(id, out string attachment))
         attachment = "";
       return attachment;
     }
@@ -102,7 +102,9 @@ namespace GomLib {
 
       }
 
-      var modelColors = data.ValueOrDefault("appModelColors", new Dictionary<object, object>());
+      // appModelColors was renamed to appModelColorSchemeHues.
+      var modelColors = data.ValueOrDefault<Dictionary<object, object>>("appModelColorSchemeHues", null)
+                        ?? data.ValueOrDefault("appModelColors", new Dictionary<object, object>());
       Colors = new Dictionary<string, ModelColors>();
       foreach (var kvp in modelColors) {
         ModelColors mc = new ModelColors((GomObjectData)(kvp.Value));

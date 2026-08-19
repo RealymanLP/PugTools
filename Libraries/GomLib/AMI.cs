@@ -71,14 +71,43 @@ namespace GomLib {
           Fqn = ami.Name,
           Id = ami.Id
         };
-        var entries = ami.Data.Get<Dictionary<object, object>>("appModelDetails");
+        // appModelDetails was renamed to appModelsById in newer GOM data.
+        // Keep the old name as a fallback so older clients still work.
+        Dictionary<object, object> entries =
+          ami.Data.ValueOrDefault<Dictionary<object, object>>("appModelsById", null)
+          ?? ami.Data.ValueOrDefault<Dictionary<object, object>>("appModelDetails", null);
+
         table.data = new Dictionary<long, AMIEntry>();
-        foreach (var entry in entries) {
-          AMIEntry ame = new AMIEntry();
-          ame.Load((GomObjectData)(entry.Value));
-          table.data.Add((long)entry.Key, ame);
+        if (entries != null) {
+          foreach (var entry in entries) {
+            long entryId;
+            try {
+              entryId = Convert.ToInt64(entry.Key);
+            }
+            catch {
+              continue;
+            }
+
+            GomObjectData entryData = entry.Value as GomObjectData;
+            if (entryData == null && entry.Value is IEnumerable<object> wrappedValues) {
+              foreach (object wrappedValue in wrappedValues) {
+                entryData = wrappedValue as GomObjectData;
+                if (entryData != null) break;
+              }
+            }
+
+            if (entryData == null)
+              continue;
+
+            AMIEntry ame = new AMIEntry();
+            ame.Load(entryData);
+            table.data[entryId] = ame;
+          }
         }
-        fqnMap.Add(table.Fqn, table);
+
+        // Some current data can expose the same AMI FQN more than once.
+        // Last valid table wins instead of terminating the browser.
+        fqnMap[table.Fqn] = table;
       }
       if (fqnMap.Count == 0)
         load_failed = true;

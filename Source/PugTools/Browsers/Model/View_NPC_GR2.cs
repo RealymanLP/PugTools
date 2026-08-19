@@ -59,7 +59,6 @@ namespace PugTools {
 
       Effects.InitAll(Device);
       _fx = Effects.GR2_FX;
-      if (_fx == null) return false;
       InputLayouts.InitAll(Device);
       RenderStates.InitAll(Device);
 
@@ -205,8 +204,10 @@ namespace PugTools {
         _models.Clear();
       }
 
-      _resources.Clear();
-      _vertices.Clear();
+      // Clear() can be called while the render panel is only partially initialized
+      // (for example after a failed/empty MNT/GR2 preview).
+      _resources?.Clear();
+      _vertices?.Clear();
       // indexes.Clear();
       // indexList.Clear();
     }
@@ -290,16 +291,10 @@ namespace PugTools {
       _cMatrix = _camera.View;
       _pMatrix = _camera.Proj;
 
-      // Effects.GR2_FX is a shared static resource and can be released by
-      // another viewer. MNT previews are especially prone to hitting this
-      // race because their render thread is started asynchronously. Re-acquire
-      // the effect before rendering and never dereference a missing effect.
-      if (_fx == null) {
-        Effects.InitAll(Device);
-        _fx = Effects.GR2_FX;
-      }
-
-      if (_fx == null) {
+      // The render thread can start one frame before the effect system has
+      // finished initializing (notably for MNT/vehicle previews). Do not let
+      // that race terminate the process.
+      if (_fx == null || _fx.Generic == null || _models == null) {
         SwapChain.Present(1, PresentFlags.None);
         return;
       }
@@ -460,8 +455,8 @@ namespace PugTools {
       }
 
       _globalBoxCenter = new Vector3();
-      _globalBoxMax = new Vector3();
-      _globalBoxMin = new Vector3();
+      _globalBoxMax = new Vector3(Single.MinValue, Single.MinValue, Single.MinValue);
+      _globalBoxMin = new Vector3(Single.MaxValue, Single.MaxValue, Single.MaxValue);
 
       if (type == "ipp") {
         _focus = models.First().Value;
@@ -487,15 +482,36 @@ namespace PugTools {
         _globalBoxMin = new Vector3(min.X, min.Y, min.Z);
 
         _globalBoxCenter = _globalBoxMin + (_globalBoxMax - _globalBoxMin) / 2;
-        _cameraPos = new Vector3(
-          _globalBoxCenter.X * 1.85F,
-          _globalBoxCenter.Y * 1.85F,
-          Math.Max(Math.Max(_globalBoxMax.X, _globalBoxMax.Y), _globalBoxMax.Z) * 1.85F
-        );
+        _cameraPos = _globalBoxCenter + new Vector3(1.0F, 0.65F, 1.0F) *
+          Math.Max((_globalBoxMax - _globalBoxMin).Length() * 1.75F, 2.0F);
 
       } else {
-        foreach (KeyValuePair<String, GR2> model in models) {
-          if (model.Key.Contains("skeleton")) continue;
+        // Vehicle/glider FxSpecs can contain helper meshes (for example
+        // speeder_bike) that are intentionally positioned a long way from the
+        // visible vehicle.  Including those helpers in the camera bounds makes
+        // the actual mount appear as a tiny dot.  For MNT previews prefer the
+        // real veh_* GR2(s) for camera framing, while still rendering every
+        // model normally.
+        IEnumerable<KeyValuePair<String, GR2>> cameraModels = models;
+
+        if (type == "mnt") {
+          List<KeyValuePair<String, GR2>> vehicleModels =
+            models.Where(x =>
+              !x.Key.Contains("skeleton", StringComparison.OrdinalIgnoreCase)
+              && (
+                x.Key.Contains("veh_", StringComparison.OrdinalIgnoreCase)
+                || (!String.IsNullOrWhiteSpace(x.Value?.filename)
+                    && x.Value.filename.Contains("veh_", StringComparison.OrdinalIgnoreCase))
+              )
+            ).ToList();
+
+          if (vehicleModels.Count > 0)
+            cameraModels = vehicleModels;
+        }
+
+        foreach (KeyValuePair<String, GR2> model in cameraModels) {
+          if (model.Key.Contains("skeleton", StringComparison.OrdinalIgnoreCase)) continue;
+          if (model.Value == null) continue;
 
           _focus = model.Value;
 
@@ -516,20 +532,21 @@ namespace PugTools {
             _focus.GetTransform()
           );
 
-          _globalBoxMin.X = min.X < _globalBoxMin.X ? min.X : _globalBoxMin.X;
-          _globalBoxMin.Y = min.Y < _globalBoxMin.Y ? min.Y : _globalBoxMin.Y;
-          _globalBoxMin.Z = min.Z < _globalBoxMin.Z ? min.Z : _globalBoxMin.Z;
+          // A rotated model can swap min/max on an axis.
+          Single minX = Math.Min(min.X, max.X);
+          Single minY = Math.Min(min.Y, max.Y);
+          Single minZ = Math.Min(min.Z, max.Z);
+          Single maxX = Math.Max(min.X, max.X);
+          Single maxY = Math.Max(min.Y, max.Y);
+          Single maxZ = Math.Max(min.Z, max.Z);
 
-          _globalBoxMax.X = max.X > _globalBoxMax.X ? max.X : _globalBoxMax.X;
-          _globalBoxMax.Y = max.Y > _globalBoxMax.Y ? max.Y : _globalBoxMax.Y;
-          _globalBoxMax.Z = max.Z > _globalBoxMax.Z ? max.Z : _globalBoxMax.Z;
+          _globalBoxMin.X = Math.Min(_globalBoxMin.X, minX);
+          _globalBoxMin.Y = Math.Min(_globalBoxMin.Y, minY);
+          _globalBoxMin.Z = Math.Min(_globalBoxMin.Z, minZ);
 
-          _globalBoxCenter = _globalBoxMin + (_globalBoxMax - _globalBoxMin) / 2;
-          _cameraPos = new Vector3(
-            _globalBoxCenter.X * fac,
-            _globalBoxCenter.Y * fac,
-            Math.Max(Math.Max(_globalBoxMax.X, _globalBoxMax.Y), _globalBoxMax.Z) * fac
-          );
+          _globalBoxMax.X = Math.Max(_globalBoxMax.X, maxX);
+          _globalBoxMax.Y = Math.Max(_globalBoxMax.Y, maxY);
+          _globalBoxMax.Z = Math.Max(_globalBoxMax.Z, maxZ);
         }
       }
 
@@ -540,16 +557,31 @@ namespace PugTools {
       _camera.Position = _cameraPos;
       _camera.LookAt(_cameraPos, _globalBoxCenter, Vector3.UnitY);
 
-      // Fit the complete model into view using the model bounds. Radius is
-      // read-only, so choose a camera position at the desired distance.
-      // MNT/ITM assets benefit from a larger starting distance because their
-      // bounds are often dominated by attachments/weapon or vehicle geometry.
-      Vector3 boxSize = _globalBoxMax - _globalBoxMin;
-      Single boxDiagonal = boxSize.Length();
-      if (boxDiagonal > 0.001F) {
-        Single fitFactor = (type == "mnt" || type == "itm") ? 8.0F : 2.0F;
-        Single distance = Math.Max(boxDiagonal * fitFactor, 1.0F);
-        Single beta = 0.5F;
+      // Fit the complete model into view using the real aggregate bounds.
+      // The previous implementation started the minimum bounds at zero and
+      // then multiplied the center by a large factor. That made many MNT/ITM
+      // assets appear extremely close or even off-center.
+      if (_globalBoxMin.X != Single.MaxValue && _globalBoxMax.X != Single.MinValue) {
+        Vector3 boxSize = _globalBoxMax - _globalBoxMin;
+        Single boxDiagonal = Math.Max(boxSize.Length(), 0.001F);
+        _globalBoxCenter = _globalBoxMin + boxSize / 2.0F;
+
+        // Fit from the bounding sphere and the actual vertical field of view
+        // instead of using a large fixed multiplier.  This keeps tiny mounts
+        // from filling the whole viewport without pushing large speeders/gliders
+        // excessively far away.
+        Single radius = Math.Max(boxDiagonal * 0.5F, 0.001F);
+        Single verticalFov = 0.25F * MathF.PI;
+        Single margin = type == "mnt" ? 1.30F : type == "itm" ? 1.22F : 1.18F;
+        Single distance = radius / (Single)Math.Tan(verticalFov * 0.5F) * margin;
+
+        // Avoid pathological GOM/GR2 bounds while retaining a useful minimum
+        // distance for very small objects.
+        Single minDistance = type == "mnt" || type == "itm" ? 1.25F : 1.0F;
+        Single maxDistance = Math.Max(boxDiagonal * 3.0F, minDistance);
+        distance = Math.Max(minDistance, Math.Min(distance, maxDistance));
+
+        Single beta = 0.42F;
         Single alpha = 0.5F;
         Single cosBeta = (Single)Math.Cos(beta);
         Vector3 direction = new Vector3(
@@ -682,8 +714,7 @@ namespace PugTools {
           xDelta = MathF.ToRadians(0.05f * (e.X - _lastMousePos.X));
           yDelta = MathF.ToRadians(0.05f * (e.Y - _lastMousePos.Y));
 
-          _camera.Strafe(-xDelta * _camera.Radius);
-          _camera.Fly(yDelta * _camera.Radius);
+          _camera.Pan(-xDelta * _camera.Radius, yDelta * _camera.Radius);
 
         } else {
           _camera.Pitch(yDelta);
@@ -694,14 +725,13 @@ namespace PugTools {
         Single xDelta = MathF.ToRadians(0.05F * (e.X - _lastMousePos.X));
         Single yDelta = MathF.ToRadians(0.05F * (e.Y - _lastMousePos.Y));
 
-        _camera.Strafe(-xDelta * _camera.Radius);
-        _camera.Fly(yDelta * _camera.Radius);
+        _camera.Pan(-xDelta * _camera.Radius, yDelta * _camera.Radius);
       }
 
       _lastMousePos = e.Location;
     }
     protected override void OnMouseUp(Object sender, MouseEventArgs e) {
-      Window.Controls.Find(RenderPanelName, true).First().Capture = true;
+      Window.Controls.Find(RenderPanelName, true).First().Capture = false;
     }
     protected override void OnMouseWheel(Object sender, MouseEventArgs e) {
       Double zoom = -e.Delta * SystemInformation.MouseWheelScrollLines;

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Xml.Linq;
@@ -183,19 +183,21 @@ namespace PugTools {
           // If we are doing a compare build then strip the entries without any values.
 
           if (chkBuildCompare.Checked) {
-            String value = entry.Value.LocalizedText["enMale"];
+            String value = entry.Value.LocalizedText.ContainsKey(GomLib.StringTable.SelectedLocalization) ? entry.Value.LocalizedText[GomLib.StringTable.SelectedLocalization] : String.Empty;
 
             if (value != null && value.Length > 0) {
               stringTable.Add(new XElement("Entry", new XAttribute("Id", entry.Key), value));
             }
           } else {
-            if (!string.IsNullOrEmpty(entry.Value.LocalizedText["enMale"]))
+            String selected = entry.Value.LocalizedText.ContainsKey(GomLib.StringTable.SelectedLocalization) ? entry.Value.LocalizedText[GomLib.StringTable.SelectedLocalization] : String.Empty;
+            String en = entry.Value.LocalizedText.ContainsKey("enMale") ? entry.Value.LocalizedText["enMale"] : String.Empty;
+            String fr = entry.Value.LocalizedText.ContainsKey("frMale") ? entry.Value.LocalizedText["frMale"] : String.Empty;
+            String de = entry.Value.LocalizedText.ContainsKey("deMale") ? entry.Value.LocalizedText["deMale"] : String.Empty;
+            if (!String.IsNullOrEmpty(selected) || !String.IsNullOrEmpty(en) || !String.IsNullOrEmpty(fr) || !String.IsNullOrEmpty(de))
               stringTable.Add(
                 new XElement("Entry", new XAttribute("Id", entry.Key),
-                new XElement("en", entry.Value.LocalizedText["enMale"]),
-                new XElement("fr", entry.Value.LocalizedText["frMale"]),
-                new XElement("de", entry.Value.LocalizedText["deMale"])
-                )
+                new XElement("selected", new XAttribute("locale", GomLib.StringTable.SelectedLocale), selected),
+                new XElement("en", en), new XElement("fr", fr), new XElement("de", de))
               );
           }
         }

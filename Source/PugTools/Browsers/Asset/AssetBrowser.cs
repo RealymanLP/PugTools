@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -99,16 +99,22 @@ namespace PugTools {
     }
 
     private void AssetBrowserFormClosed(Object sender, FormClosedEventArgs e) {
-      // Reload hash list to ensure other code is unaffected.
-      HashDictionaryInstance.Instance.Unload();
-      //HashDictionaryInstance.Instance.Load();
+      // Do NOT unload the shared hash dictionary here. Unload() calls
+      // GC.Collect(), and with the current large SWTOR dictionary this can
+      // freeze the entire desktop for seconds/minutes. The main application
+      // can keep this shared cache alive.
 
       if (m_panelRender != null) {
         m_panelRender.StopRender();
 
-        if (m_render != null) m_render.Join();
+        Boolean renderStopped = m_render == null || !m_render.IsAlive || m_render.Join(750);
+        if (renderStopped) {
+          try { m_panelRender.Clear(); } catch { }
+          try { m_panelRender.Dispose(); } catch { }
+        }
 
-        m_panelRender.Dispose();
+        m_panelRender = null;
+        m_render = null;
       }
 
       if (treeViewFast1 != null) {
@@ -116,7 +122,15 @@ namespace PugTools {
         treeViewFast1 = null;
       }
 
-      if (m_audioPlaying) m_waveOut.Stop();
+      try {
+        if (m_audioPlaying) m_waveOut?.Stop();
+        m_waveOut?.Dispose();
+      } catch { }
+      m_waveOut = null;
+      m_audioPlaying = false;
+
+      try { m_inputStream?.Dispose(); } catch { }
+      m_inputStream = null;
 
       m_assetDict = null;
 
@@ -148,6 +162,13 @@ namespace PugTools {
     private void AssetBrowserFormClosing(Object sender, FormClosingEventArgs e) {
       System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.Interactive;
       m_closing = true;
+
+      // Stop high-frequency work immediately, before controls and D3D handles
+      // are destroyed.
+      try { m_panelRender?.StopRender(); } catch { }
+      try {
+        if (m_audioPlaying) m_waveOut?.Stop();
+      } catch { }
 
       if (m_hashData.Dictionary.NeedsSave && (m_modNewCount > 2 || m_foundNewFileCount > 0)) {
         DialogResult save = MessageBox.Show(
@@ -211,10 +232,16 @@ namespace PugTools {
       Int32 maxLibs = m_currentAssets.Libraries.Count;
 
       foreach (Library lib in m_currentAssets.Libraries) {
+        if (m_closing) return;
+
         lib.Load();
+        if (m_closing) return;
 
         foreach (KeyValuePair<Int32, Archive> archive in lib.Archives) {
+          if (m_closing) return;
+
           foreach (TorArchive.File file in archive.Value.EnumerateFiles()) {
+            if (m_closing) return;
             HashFileInfo hashInfo = new HashFileInfo(file.FileInfo.PrimaryHash,
                                                      file.FileInfo.SecondaryHash,
                                                      file);

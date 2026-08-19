@@ -1,4 +1,4 @@
-﻿using SlimDX;
+using SlimDX;
 
 namespace SlimDXNet.Camera
 {
@@ -50,10 +50,24 @@ namespace SlimDXNet.Camera
 
         public void Fly(float d)
         {
-            // Model-viewer panning is in world space. Using Up.Y here makes
-            // vertical movement depend on the current camera pitch and can
-            // make the model stop moving vertically at certain angles.
+            // Keep Fly as world-space vertical movement for callers that use
+            // it directly. The model viewer uses Pan() for screen-space pan.
             Target = new Vector3(Target.X, Target.Y + d, Target.Z);
+        }
+
+        public void Pan(float rightAmount, float upAmount)
+        {
+            // Pan in camera/screen space. This keeps right-mouse movement
+            // consistent even after the camera has been rotated vertically.
+            Vector3 right = Right;
+            if (right.LengthSquared() > 0.000001f)
+                right.Normalize();
+
+            Vector3 up = Up;
+            if (up.LengthSquared() > 0.000001f)
+                up.Normalize();
+
+            Target += right * rightAmount + up * upAmount;
         }
 
         public override void Pitch(float angle)
@@ -94,6 +108,9 @@ namespace SlimDXNet.Camera
 
             Look = new Vector3(View.M13, View.M23, View.M33);
             Look.Normalize();
+
+            Up = new Vector3(View.M12, View.M22, View.M32);
+            Up.Normalize();
             _frustum = Frustum.FromViewProj(ViewProj);
         }
     }
