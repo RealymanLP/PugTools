@@ -96,27 +96,16 @@ namespace PugTools {
     private void ModelBrowserFormClosed(Object sender, FormClosedEventArgs e) {
       Hide();
 
-      // HashDictionaryInstance is a shared process-wide cache. Unload() performs
-      // an explicit full GC.Collect(), which is extremely expensive with the
-      // current SWTOR hash list and was the main cause of the whole PC stalling
-      // when a browser was closed. Keep the cache alive for the parent PugTools
-      // process instead.
+      HashDictionaryInstance.Instance.Unload();
 
       if (_panelRender != null) {
         _panelRender.StopRender();
 
-        // Never block the WinForms UI indefinitely on a D3D render thread.
-        // Normally it exits immediately after StopRender(). If a driver call is
-        // temporarily stuck, leave the background thread to finish naturally.
-        Boolean renderStopped = _render == null || !_render.IsAlive || _render.Join(750);
+        if (_render != null) _render.Join();
 
-        if (renderStopped) {
-          try { _panelRender.Clear(); } catch { }
-          try { _panelRender.Dispose(); } catch { }
-        }
-
+        _panelRender.Clear();
+        _panelRender.Dispose();
         _panelRender = null;
-        _render = null;
       }
 
       if (treeViewFast1 != null) {
@@ -150,17 +139,13 @@ namespace PugTools {
       _testRules = null;
       _weaponAppearance = null;
 
+      Dispose(true);
+
       System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.Interactive;
     }
-
     private void ModelBrowserFormClosing(Object sender, FormClosingEventArgs e) {
       System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.Interactive;
       _closing = true;
-
-      // Stop GPU work before WinForms starts tearing down the render control.
-      // This also gives the render thread time to exit while the form is still
-      // valid, rather than waiting in FormClosed.
-      try { _panelRender?.StopRender(); } catch { }
     }
     private void ModelBrowserFormResize(Object sender, EventArgs e) {
       treeViewFast1.Size =
@@ -2168,73 +2153,6 @@ namespace PugTools {
       return true;
     }
 
-
-    private Boolean ResolveMountVisualValue(
-      Object value,
-      HashSet<UInt64> visitedNodes,
-      Int32 depth = 0
-    ) {
-      if (value == null || depth > 6) return false;
-
-      Boolean loaded = false;
-
-      if (value is String text) {
-        text = text.Trim().Replace('\\', '/');
-        if (String.IsNullOrWhiteSpace(text)) return false;
-
-        if (text.EndsWith(".gr2", StringComparison.OrdinalIgnoreCase)) {
-          String key = text.Split('/').Last();
-          return LoadGR2Model(text, key);
-        }
-
-        if (text.EndsWith(".fxspec", StringComparison.OrdinalIgnoreCase)) {
-          Int32 before = _models?.Count ?? 0;
-          ParseFxSpec(text, "mnt");
-          return (_models?.Count ?? 0) > before;
-        }
-
-        // Some decoration/dynamic records use an FQN instead of a direct asset
-        // path. Follow it when it resolves to a GOM node.
-        if (text.Contains(".")) {
-          try {
-            GomObject referenced = _currentDom.GetObject(text);
-            if (referenced != null)
-              return LoadMountDecoration(referenced.Id, visitedNodes);
-          } catch { }
-        }
-
-        return false;
-      }
-
-      if (value is GomObjectData gomData) {
-        foreach (KeyValuePair<String, Object> kvp in gomData.Dictionary) {
-          if (kvp.Key == "Script_Type"
-              || kvp.Key == "Script_TypeId"
-              || kvp.Key == "Script_NumFields")
-            continue;
-
-          loaded |= ResolveMountVisualValue(kvp.Value, visitedNodes, depth + 1);
-        }
-        return loaded;
-      }
-
-      if (value is System.Collections.IDictionary dict) {
-        foreach (System.Collections.DictionaryEntry entry in dict)
-          loaded |= ResolveMountVisualValue(entry.Value, visitedNodes, depth + 1);
-
-        return loaded;
-      }
-
-      if (value is System.Collections.IEnumerable enumerable && value is not String) {
-        foreach (Object item in enumerable)
-          loaded |= ResolveMountVisualValue(item, visitedNodes, depth + 1);
-
-        return loaded;
-      }
-
-      return loaded;
-    }
-
     private Boolean LoadMountDecoration(UInt64 nodeId) {
       return LoadMountDecoration(nodeId, new HashSet<UInt64>());
     }
@@ -2271,35 +2189,20 @@ namespace PugTools {
       if (!String.IsNullOrWhiteSpace(placeableModel))
         loaded |= LoadGR2Model(placeableModel, key);
 
-      // Dynamic decoration nodes changed shape between client generations.
-      // Older PugTools expected dynVisualList to always be List<Object>, while
-      // current Gree mounts can wrap the visual in maps/structs. Traverse the
-      // actual runtime value instead.
-      if (node.Data.Dictionary.TryGetValue("dynVisualList", out Object visualListValue))
-        loaded |= ResolveMountVisualValue(visualListValue, visited, 0);
-
-      // Also inspect model/visual/appearance/asset fields generically. This is
-      // deliberately limited to visual-looking fields so unrelated numeric GOM
-      // data is not followed as object references.
-      foreach (KeyValuePair<String, Object> field in node.Data.Dictionary) {
-        String fieldName = field.Key ?? String.Empty;
-        if (fieldName.IndexOf("visual", StringComparison.OrdinalIgnoreCase) >= 0
-            || fieldName.IndexOf("model", StringComparison.OrdinalIgnoreCase) >= 0
-            || fieldName.IndexOf("appearance", StringComparison.OrdinalIgnoreCase) >= 0
-            || fieldName.IndexOf("asset", StringComparison.OrdinalIgnoreCase) >= 0
-            || fieldName.IndexOf("fxspec", StringComparison.OrdinalIgnoreCase) >= 0)
-          loaded |= ResolveMountVisualValue(field.Value, visited, 0);
+      // Dynamic decoration nodes can contain one or several visual GR2s.
+      List<Object> visualList =
+        node.Data.ValueOrDefault<List<Object>>("dynVisualList", null);
+      if (visualList != null) {
+        foreach (GomObjectData visualItem in visualList.OfType<GomObjectData>()) {
+          String model = visualItem.ValueOrDefault<String>("dynVisualFqn", null);
+          if (!String.IsNullOrWhiteSpace(model))
+            loaded |= LoadGR2Model(model, model.Replace('\\', '/').Split('/').Last());
+        }
       }
 
       // Some wrappers point at another object by FQN rather than by node ID.
       foreach (String refField in new [] {
-        "dynVisualFqn",
-        "dynVisual",
-        "plcModel",
-        "plcModelAssetSpec",
-        "vehAppModel",
-        "mntDataSpec",
-        "mntDataSpecString"
+        "dynVisualFqn", "mntDataSpec", "mntDataSpecString"
       }) {
         String referencedFqn = node.Data.ValueOrDefault<String>(refField, null);
         if (String.IsNullOrWhiteSpace(referencedFqn)

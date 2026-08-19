@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -8,7 +8,7 @@ using SlimDX;
 namespace FileFormats {
   public static class FileHelpers {
     public static Single ByteToFloat(Byte byteValue) {
-      return byteValue / 255;
+      return byteValue / 255.0F;
     }
     // public static Single ByteToNormal(Byte byteValue) {
     //   return (Single)((byteValue - 127.5) / 127.5);

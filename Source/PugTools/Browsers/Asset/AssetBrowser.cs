@@ -17,6 +17,7 @@ using Be.HexEditor;
 using Be.Windows.Forms;
 using ColorCode;
 using DevIL;
+using FileFormats;
 using GomLib;
 using NAudio.Wave;
 using nsHashDictionary;
@@ -55,6 +56,11 @@ namespace PugTools {
     private WaveOutEvent m_waveOut;
     private XmlDocument m_xmlDoc;
 
+    // JBA playback reuses the existing audio ToolStrip so the controls stay
+    // consistent with WEM/BNK playback.
+    private Boolean m_jbaActive;
+    private System.Windows.Forms.Timer m_jbaUiTimer;
+
     #endregion
 
     #region Asset Browser
@@ -67,6 +73,9 @@ namespace PugTools {
       m_autoPreview = true;
       m_extractPath = Config.ExtractAssetsPath;
       m_hashData = HashDictionaryInstance.Instance;
+
+      m_jbaUiTimer = new System.Windows.Forms.Timer { Interval = 50 };
+      m_jbaUiTimer.Tick += JbaUiTimerTick;
 
       if (!m_hashData.Loaded) m_hashData.Load();
 
@@ -128,6 +137,13 @@ namespace PugTools {
       } catch { }
       m_waveOut = null;
       m_audioPlaying = false;
+
+      try {
+        m_jbaUiTimer?.Stop();
+        m_jbaUiTimer?.Dispose();
+      } catch { }
+      m_jbaUiTimer = null;
+      m_jbaActive = false;
 
       try { m_inputStream?.Dispose(); } catch { }
       m_inputStream = null;
@@ -832,6 +848,19 @@ namespace PugTools {
     private async void PreviewAsset(TreeListItem asset) {
       if (asset.HashInfo.File != null) {
 
+        // Stop JBA UI state before switching to another asset.
+        m_jbaActive = false;
+        m_jbaUiTimer?.Stop();
+
+        // Restore the audio strip defaults; JBA temporarily repurposes button 3
+        // as a Loop toggle.
+        toolStrip1Button1.Font = new Font("Webdings", 13F);
+        toolStrip1Button2.Font = new Font("Webdings", 13F);
+        toolStrip1Button3.Font = new Font("Webdings", 13F);
+        toolStrip1Button3.Text = "X";
+        toolStrip1Button3.ToolTipText = "Mute";
+        toolStrip1Button3.Checked = false;
+
         // Hide all the viewers
         hexBox1.Visible = false;
         pictureBox1.Visible = false;
@@ -921,6 +950,11 @@ namespace PugTools {
             case "PRT":
               await Task.Run(PreviewAssetRAW);
               txtRawView.Visible = true;
+              break;
+
+            case "JBA":
+              await Task.Run(() => PreviewAssetJBA(asset.HashInfo.Directory, asset.HashInfo.FileName));
+              renderPanel.Visible = true;
               break;
 
             case "GR2":
@@ -1135,6 +1169,115 @@ namespace PugTools {
         }
       }
       catch (Exception) { }
+    }
+
+    private void PreviewAssetJBA(String directory, String fileName) {
+      try {
+        if (m_inputStream == null) return;
+        m_inputStream.Position = 0;
+
+        JBAAnimation animation;
+        using (BinaryReader br = new BinaryReader(m_inputStream, Encoding.UTF8, true))
+          animation = JBAReader.Read(br);
+
+        JBARig rig = null;
+        String mphPath =
+          (directory.TrimEnd('/') + "/anim_library.mph").Replace("//", "/");
+        TorArchive.File mphFile = m_currentAssets.FindFile(mphPath);
+
+        if (mphFile != null) {
+          try {
+            using Stream mphStream = mphFile.OpenCopyInMemory();
+            using BinaryReader mphReader = new BinaryReader(mphStream);
+            rig = MPHAnimationReader.FindRigForClip(mphReader, fileName);
+          }
+          catch (Exception ex) {
+            System.Diagnostics.Debug.WriteLine(
+              "JBA MPH mapping failed for " + fileName + ": " + ex
+            );
+          }
+        }
+
+        String bodyType = JBAAppearance.BodyTypeFromAnimationDirectory(directory);
+
+        String skeletonPath = !String.IsNullOrWhiteSpace(bodyType)
+          ? "/resources/art/dynamic/spec/" + bodyType + "_skeleton.gr2"
+          : "/resources/art/dynamic/spec/bmnnew_skeleton.gr2";
+
+        TorArchive.File skeletonFile = m_currentAssets.FindFile(skeletonPath);
+
+        if (skeletonFile == null) {
+          skeletonPath = "/resources/art/dynamic/spec/bmnnew_skeleton.gr2";
+          skeletonFile = m_currentAssets.FindFile(skeletonPath);
+        }
+
+        if (skeletonFile == null) {
+          BeginInvoke(new Action(() => {
+            txtRawView.Text = $"JBA: {fileName}\r\nVersion: {animation.Version}\r\nLength: {animation.Length:0.###} s\r\nFPS: {animation.FPS:0.###}\r\nFrames: {animation.FrameCount}\r\nBones: {animation.BoneCount}\r\n\r\nKein kompatibles Skeleton gefunden.";
+            txtRawView.Visible = true;
+            renderPanel.Visible = false;
+          }));
+          return;
+        }
+
+        GR2 skeleton;
+        using (Stream skeletonStream = skeletonFile.OpenCopyInMemory())
+        using (BinaryReader skeletonReader = new BinaryReader(skeletonStream))
+          skeleton = new GR2(skeletonReader, skeletonPath);
+
+        List<JBAAppearancePart> appearanceParts = JBAAppearance.GetDefault(bodyType);
+        GR2 previewModel = JBAAppearance.LoadComposite(
+          m_currentAssets,
+          skeleton,
+          appearanceParts,
+          "jba_" + bodyType
+        );
+
+        m_panelRender.LoadModel(previewModel);
+        m_panelRender.LoadAnimation(animation, rig);
+        m_panelRender.SetAnimationLoop(true);
+        m_render = new Thread(m_panelRender.StartRender) { IsBackground = true };
+        m_render.Start();
+
+        BeginInvoke(new Action(() => {
+          m_jbaActive = true;
+
+          // Reuse the audio toolbar: Play/Pause, Stop, Loop and progress.
+          toolStrip1.Visible = true;
+          toolStrip1Button1.Enabled = true;
+          toolStrip1Button2.Enabled = true;
+          toolStrip1Button3.Enabled = true;
+          toolStrip1ProgressBar1.Enabled = true;
+
+          toolStrip1Button1.Font = new Font("Webdings", 13F);
+          toolStrip1Button1.Text = ";";
+          toolStrip1Button1.ToolTipText = "Pause";
+
+          toolStrip1Button2.Font = new Font("Webdings", 13F);
+          toolStrip1Button2.Text = "<";
+          toolStrip1Button2.ToolTipText = "Stop / Reset";
+
+          toolStrip1Button3.Font = new Font("Segoe UI", 9F);
+          toolStrip1Button3.Text = "Loop";
+          toolStrip1Button3.ToolTipText = "Loop animation";
+          toolStrip1Button3.Checked = true;
+
+          toolStrip1ProgressBar1.Minimum = 0;
+          toolStrip1ProgressBar1.Maximum = Math.Max(1, animation.FrameCount - 1);
+          toolStrip1ProgressBar1.Value = 0;
+
+          toolStripStatusLabel2.Text = $"JBA v{animation.Version} | {animation.Length:0.###} s | {animation.FPS:0.##} FPS | {animation.FrameCount} Frames | {animation.BoneCount} Channels | Rig: {(rig != null ? rig.Bones.Count + " bones" : "fallback")}";
+          UpdateJbaToolbar();
+          m_jbaUiTimer?.Start();
+        }));
+      }
+      catch (Exception ex) {
+        BeginInvoke(new Action(() => {
+          txtRawView.Text = "JBA konnte nicht abgespielt werden:\r\n\r\n" + ex;
+          txtRawView.Visible = true;
+          renderPanel.Visible = false;
+        }));
+      }
     }
 
     private void PreviewAssetGR2(String fileName) {
@@ -1816,8 +1959,57 @@ namespace PugTools {
 
     #endregion Hash List Methods
 
+    private void JbaUiTimerTick(Object sender, EventArgs e) {
+      if (!m_jbaActive || m_panelRender == null) {
+        m_jbaUiTimer?.Stop();
+        return;
+      }
+
+      UpdateJbaToolbar();
+    }
+
+    private void UpdateJbaToolbar() {
+      if (!m_jbaActive || m_panelRender == null) return;
+
+      Single current = Math.Max(0.0F, m_panelRender.AnimationTime);
+      Single total = Math.Max(0.0F, m_panelRender.AnimationLength);
+      Int32 frame = Math.Max(0, m_panelRender.AnimationFrame);
+      Int32 frameCount = Math.Max(1, m_panelRender.AnimationFrameCount);
+
+      TimeSpan currentTime = TimeSpan.FromSeconds(current);
+      TimeSpan totalTime = TimeSpan.FromSeconds(total);
+      toolStrip1Label1.Text =
+        $"{currentTime.Minutes:00}:{currentTime.Seconds:00}.{currentTime.Milliseconds:000}"
+        + "/"
+        + $"{totalTime.Minutes:00}:{totalTime.Seconds:00}.{totalTime.Milliseconds:000}";
+
+      toolStrip1ProgressBar1.Maximum = Math.Max(1, frameCount - 1);
+      toolStrip1ProgressBar1.Value =
+        Math.Min(toolStrip1ProgressBar1.Maximum, Math.Max(0, frame));
+
+      if (m_panelRender.AnimationPlaying) {
+        toolStrip1Button1.Text = ";";
+        toolStrip1Button1.ToolTipText = "Pause";
+      } else {
+        toolStrip1Button1.Text = "4";
+        toolStrip1Button1.ToolTipText = "Play";
+      }
+    }
+
     #region ToolStrip1
     private void ToolStrip1Button1Click(Object sender, EventArgs e) {
+      if (m_jbaActive && m_panelRender != null) {
+        if (m_panelRender.AnimationPlaying)
+          m_panelRender.PauseAnimation();
+        else
+          m_panelRender.PlayAnimation();
+
+        UpdateJbaToolbar();
+        return;
+      }
+
+      if (m_waveOut == null) return;
+
       if (m_waveOut.PlaybackState == PlaybackState.Paused) {
         toolStrip1Button1.Text = ";";
         toolStrip1Button1.ToolTipText = "Pause";
@@ -1834,6 +2026,14 @@ namespace PugTools {
     }
 
     private void ToolStrip1Button2Click(Object sender, EventArgs e) {
+      if (m_jbaActive && m_panelRender != null) {
+        m_panelRender.StopAnimation();
+        UpdateJbaToolbar();
+        return;
+      }
+
+      if (m_waveOut == null) return;
+
       m_waveOut.Stop();
       m_audioPlaying = false;
 
@@ -1846,6 +2046,16 @@ namespace PugTools {
     }
 
     private void ToolStrip1Button3Click(Object sender, EventArgs e) {
+      if (m_jbaActive && m_panelRender != null) {
+        toolStrip1Button3.Checked = !toolStrip1Button3.Checked;
+        m_panelRender.SetAnimationLoop(toolStrip1Button3.Checked);
+        toolStrip1Button3.ToolTipText =
+          toolStrip1Button3.Checked ? "Loop animation: On" : "Loop animation: Off";
+        return;
+      }
+
+      if (m_waveOut == null) return;
+
       if (m_waveOut.Volume == 0) {
         toolStrip1Button3.Checked = false;
         toolStrip1Button3.ToolTipText = "Mute";
