@@ -33,6 +33,7 @@ namespace PugTools {
     private Dictionary<String, NodeAsset> _assetDict;
     private readonly String _assetsLocation;
     private readonly Boolean _assetsUsePts;
+    private readonly Boolean _compareFiles;
     private String _bodyType = "bmn";
     private readonly Dictionary<String, String> _bodyTypes;
     internal Boolean _closing;
@@ -71,6 +72,7 @@ namespace PugTools {
       _assetsUsePts = usePTS;
       _previousAssetsLocation = previousAssetLocation;
       _previousAssetsUsePts = previousUsePTS;
+      _compareFiles = loadprevious;
       _hashData = HashDictionaryInstance.Instance;
 
       if (!_hashData.Loaded) _hashData.Load();
@@ -194,6 +196,7 @@ namespace PugTools {
         _previousAssets =
           AssetHandler.Instance.GetPreviousAssets(_previousAssetsLocation, _previousAssetsUsePts);
         _previousDom = DomHandler.Instance.GetPreviousDOM(_previousAssets);
+        if (!_hashData.Loaded) _hashData.Load();
       }
     }
     private void BackgroundWorker1RunWorkerCompleted(Object sender, RunWorkerCompletedEventArgs e) {
@@ -437,148 +440,152 @@ namespace PugTools {
       Int32 libsDone = 0;
       Int32 totalLibs = _currentAssets.Libraries.Count;
 
-      foreach (Library lib in _currentAssets.Libraries) {
-        String path = lib.Location;
+      if (_compareFiles && _previousAssets != null) {
+        BuildComparedGr2Assets(fileDirs);
+      } else {
+        foreach (Library lib in _currentAssets.Libraries) {
+          String path = lib.Location;
 
-        if (!lib.Loaded) lib.Load();
+          if (!lib.Loaded) lib.Load();
 
-        foreach (KeyValuePair<Int32, Archive> arch in lib.Archives) {
-          foreach (File file in arch.Value.EnumerateFiles()) {
-            HashFileInfo hashInfo =
-              new HashFileInfo(file.FileInfo.PrimaryHash, file.FileInfo.SecondaryHash, file);
+          foreach (KeyValuePair<Int32, Archive> arch in lib.Archives) {
+            foreach (File file in arch.Value.EnumerateFiles()) {
+              HashFileInfo hashInfo =
+                new HashFileInfo(file.FileInfo.PrimaryHash, file.FileInfo.SecondaryHash, file);
 
-            if (hashInfo.IsNamed) {
-              if (hashInfo.FileName == "metadata.bin" || hashInfo.FileName == "ft.sig"
-                  // || hashInfo.FileName == "groupmanifest.bin") continue;
-                  || hashInfo.Extension.ToUpper() != "GR2") continue;
+              if (hashInfo.IsNamed) {
+                if (hashInfo.FileName == "metadata.bin" || hashInfo.FileName == "ft.sig"
+                    // || hashInfo.FileName == "groupmanifest.bin") continue;
+                    || hashInfo.Extension.ToUpper() != "GR2") continue;
 
-              NodeAsset assetAll =
-                new NodeAsset(
-                  prefixAll + hashInfo.Directory + "/" + hashInfo.FileName,
-                  prefixAll + hashInfo.Directory,
-                  hashInfo.FileName,
-                  hashInfo
-                );
-
-              if (!_assetDict.ContainsKey(
-                prefixAll + hashInfo.Directory + "/" + hashInfo.FileName)) {
-                _assetDict.Add(prefixAll + hashInfo.Directory + "/" + hashInfo.FileName, assetAll);
-              } else {
-                // String pauseHere = "";
-              }
-
-              fileDirs.Add(prefixAll + hashInfo.Directory);
-
-              if (hashInfo.FileState == HashFileInfo.State.New) {
-                NodeAsset assetNew = new NodeAsset(
-                    prefixNew + hashInfo.Directory + "/" + hashInfo.FileName,
-                    prefixNew + hashInfo.Directory,
-                    hashInfo.FileName, hashInfo
-                );
-                String fileName = String.Format(
-                  "{0}{1}/{2}",
-                  prefixNew,
-                  hashInfo.Directory,
-                  hashInfo.FileName
-                );
-
-                if (!_assetDict.ContainsKey(fileName)) {
-                  // NodeAsset assetNew = new NodeAsset(
-                  //   prefixNew + hashInfo.Directory + "/" + hashInfo.FileName,
-                  //   prefixNew + hashInfo.Directory,
-                  //   hashInfo.FileName, hashInfo
-                  // );
-                  _assetDict.Add(
-                    prefixNew + hashInfo.Directory + "/" + hashInfo.FileName,
-                    assetNew
-                  );
-                  fileDirs.Add(prefixNew + hashInfo.Directory);
-                }
-              }
-
-              if (hashInfo.FileState == HashFileInfo.State.Modified) {
-                NodeAsset assetMod = new NodeAsset(
-                    prefixMod + hashInfo.Directory + "/" + hashInfo.FileName,
-                    prefixMod + hashInfo.Directory,
+                NodeAsset assetAll =
+                  new NodeAsset(
+                    prefixAll + hashInfo.Directory + "/" + hashInfo.FileName,
+                    prefixAll + hashInfo.Directory,
                     hashInfo.FileName,
                     hashInfo
-                );
-                String fileName = String.Format(
-                  "{0}{1}/{2}",
-                  prefixMod,
-                  hashInfo.Directory,
-                  hashInfo.FileName
-                );
+                  );
 
-                if (!_assetDict.ContainsKey(fileName)) {
-                  // NodeAsset assetMod = new NodeAsset(
-                  //   fileName, 
-                  //   prefixMod + hashInfo.Directory, 
-                  //   hashInfo.FileName, 
-                  //   hashInfo
-                  // );
-                  _assetDict.Add(fileName, assetMod);
-                  fileDirs.Add(prefixMod + hashInfo.Directory);
+                if (!_assetDict.ContainsKey(
+                  prefixAll + hashInfo.Directory + "/" + hashInfo.FileName)) {
+                  _assetDict.Add(prefixAll + hashInfo.Directory + "/" + hashInfo.FileName, assetAll);
+                } else {
+                  // String pauseHere = "";
                 }
-              }
-            } else {
-              if (hashInfo.Extension.ToUpper() != "GR2") continue;
 
-              hashInfo.Directory = "/unknown/" + hashInfo.Source.Replace(".tor", String.Empty);
-              NodeAsset assetUnn = new NodeAsset(
-                prefixUnn + hashInfo.Directory + "/" + hashInfo.Extension + "/"
-                  + hashInfo.FileName + "." + hashInfo.Extension,
-                  prefixUnn + hashInfo.Directory + "/" + hashInfo.Extension,
-                hashInfo.FileName + "." + hashInfo.Extension,
-                hashInfo
-              );
+                fileDirs.Add(prefixAll + hashInfo.Directory);
 
-              _assetDict.Add(
-                prefixUnn + hashInfo.Directory + "/" + hashInfo.Extension + "/"
-                  + hashInfo.FileName + "." + hashInfo.Extension,
-                assetUnn
-              );
-              fileDirs.Add(prefixUnn + hashInfo.Directory + "/" + hashInfo.Extension);
+                if (hashInfo.FileState == HashFileInfo.State.New) {
+                  NodeAsset assetNew = new NodeAsset(
+                      prefixNew + hashInfo.Directory + "/" + hashInfo.FileName,
+                      prefixNew + hashInfo.Directory,
+                      hashInfo.FileName, hashInfo
+                  );
+                  String fileName = String.Format(
+                    "{0}{1}/{2}",
+                    prefixNew,
+                    hashInfo.Directory,
+                    hashInfo.FileName
+                  );
 
-              if (hashInfo.FileState == HashFileInfo.State.New) {
-                NodeAsset assetNew = new NodeAsset(
-                  prefixNew + hashInfo.Directory + "/" + hashInfo.Extension + "/"
+                  if (!_assetDict.ContainsKey(fileName)) {
+                    // NodeAsset assetNew = new NodeAsset(
+                    //   prefixNew + hashInfo.Directory + "/" + hashInfo.FileName,
+                    //   prefixNew + hashInfo.Directory,
+                    //   hashInfo.FileName, hashInfo
+                    // );
+                    _assetDict.Add(
+                      prefixNew + hashInfo.Directory + "/" + hashInfo.FileName,
+                      assetNew
+                    );
+                    fileDirs.Add(prefixNew + hashInfo.Directory);
+                  }
+                }
+
+                if (hashInfo.FileState == HashFileInfo.State.Modified) {
+                  NodeAsset assetMod = new NodeAsset(
+                      prefixMod + hashInfo.Directory + "/" + hashInfo.FileName,
+                      prefixMod + hashInfo.Directory,
+                      hashInfo.FileName,
+                      hashInfo
+                  );
+                  String fileName = String.Format(
+                    "{0}{1}/{2}",
+                    prefixMod,
+                    hashInfo.Directory,
+                    hashInfo.FileName
+                  );
+
+                  if (!_assetDict.ContainsKey(fileName)) {
+                    // NodeAsset assetMod = new NodeAsset(
+                    //   fileName, 
+                    //   prefixMod + hashInfo.Directory, 
+                    //   hashInfo.FileName, 
+                    //   hashInfo
+                    // );
+                    _assetDict.Add(fileName, assetMod);
+                    fileDirs.Add(prefixMod + hashInfo.Directory);
+                  }
+                }
+              } else {
+                if (hashInfo.Extension.ToUpper() != "GR2") continue;
+
+                hashInfo.Directory = "/unknown/" + hashInfo.Source.Replace(".tor", String.Empty);
+                NodeAsset assetUnn = new NodeAsset(
+                  prefixUnn + hashInfo.Directory + "/" + hashInfo.Extension + "/"
                     + hashInfo.FileName + "." + hashInfo.Extension,
-                  prefixNew + hashInfo.Directory + "/" + hashInfo.Extension,
+                    prefixUnn + hashInfo.Directory + "/" + hashInfo.Extension,
                   hashInfo.FileName + "." + hashInfo.Extension,
                   hashInfo
                 );
 
                 _assetDict.Add(
-                  prefixNew + hashInfo.Directory + "/" + hashInfo.Extension + "/"
+                  prefixUnn + hashInfo.Directory + "/" + hashInfo.Extension + "/"
                     + hashInfo.FileName + "." + hashInfo.Extension,
-                  assetNew
+                  assetUnn
                 );
-                fileDirs.Add(prefixNew + hashInfo.Directory + "/" + hashInfo.Extension);
-              }
+                fileDirs.Add(prefixUnn + hashInfo.Directory + "/" + hashInfo.Extension);
 
-              if (hashInfo.FileState == HashFileInfo.State.Modified) {
-                NodeAsset assetMod = new NodeAsset(
-                  prefixMod + hashInfo.Directory + "/" + hashInfo.Extension + "/"
-                    + hashInfo.FileName + "." + hashInfo.Extension,
-                  prefixMod + hashInfo.Directory + "/" + hashInfo.Extension,
-                  hashInfo.FileName + "." + hashInfo.Extension,
-                  hashInfo
-                );
+                if (hashInfo.FileState == HashFileInfo.State.New) {
+                  NodeAsset assetNew = new NodeAsset(
+                    prefixNew + hashInfo.Directory + "/" + hashInfo.Extension + "/"
+                      + hashInfo.FileName + "." + hashInfo.Extension,
+                    prefixNew + hashInfo.Directory + "/" + hashInfo.Extension,
+                    hashInfo.FileName + "." + hashInfo.Extension,
+                    hashInfo
+                  );
 
-                _assetDict.Add(
-                  prefixMod + hashInfo.Directory + "/" + hashInfo.Extension + "/"
-                    + hashInfo.FileName + "." + hashInfo.Extension,
-                  assetMod
-                );
-                fileDirs.Add(prefixMod + hashInfo.Directory + "/" + hashInfo.Extension);
+                  _assetDict.Add(
+                    prefixNew + hashInfo.Directory + "/" + hashInfo.Extension + "/"
+                      + hashInfo.FileName + "." + hashInfo.Extension,
+                    assetNew
+                  );
+                  fileDirs.Add(prefixNew + hashInfo.Directory + "/" + hashInfo.Extension);
+                }
+
+                if (hashInfo.FileState == HashFileInfo.State.Modified) {
+                  NodeAsset assetMod = new NodeAsset(
+                    prefixMod + hashInfo.Directory + "/" + hashInfo.Extension + "/"
+                      + hashInfo.FileName + "." + hashInfo.Extension,
+                    prefixMod + hashInfo.Directory + "/" + hashInfo.Extension,
+                    hashInfo.FileName + "." + hashInfo.Extension,
+                    hashInfo
+                  );
+
+                  _assetDict.Add(
+                    prefixMod + hashInfo.Directory + "/" + hashInfo.Extension + "/"
+                      + hashInfo.FileName + "." + hashInfo.Extension,
+                    assetMod
+                  );
+                  fileDirs.Add(prefixMod + hashInfo.Directory + "/" + hashInfo.Extension);
+                }
               }
             }
           }
-        }
 
-        libsDone++;
-        backgroundWorker2.ReportProgress(libsDone * 100 / totalLibs);
+          libsDone++;
+          backgroundWorker2.ReportProgress(libsDone * 100 / totalLibs);
+        }
       }
       #endregion
 
@@ -610,6 +617,48 @@ namespace PugTools {
         if (!_assetDict.ContainsKey(dir)) _assetDict.Add(dir, asset);
       }
     }
+    private void BuildComparedGr2Assets(HashSet<String> fileDirs) {
+      List<BuildFileDifference> differences = BuildAssetComparer
+        .Compare(_currentAssets, _previousAssets)
+        .Where(x => x.DisplayRecord?.HashInfo != null
+          && x.DisplayRecord.HashInfo.Extension.Equals("GR2", StringComparison.OrdinalIgnoreCase))
+        .ToList();
+
+      foreach (BuildFileDifference difference in differences) {
+        HashFileInfo info = difference.DisplayRecord.HashInfo;
+        String prefix = difference.State switch {
+          BuildFileState.New => "/assets/new",
+          BuildFileState.Changed => "/assets/changed",
+          BuildFileState.Removed => "/assets/removed",
+          _ => "/assets"
+        };
+
+        String directory;
+        String displayName;
+        if (info.IsNamed) {
+          directory = info.Directory;
+          displayName = info.FileName;
+        } else {
+          directory = "/unknown/" + info.Source.Replace(".tor", String.Empty)
+            + "/" + info.Extension;
+          displayName = info.FileName + "." + info.Extension;
+        }
+
+        String parent = prefix + directory;
+        String id = parent + "/" + displayName;
+        if (_assetDict.ContainsKey(id)) id += " [" + info.Source + "]";
+
+        NodeAsset asset = new NodeAsset(id, parent, displayName, info) {
+          compareState = difference.State,
+          previousHashInfo = difference.Previous?.HashInfo
+        };
+        _assetDict.Add(id, asset);
+        fileDirs.Add(parent);
+      }
+
+      backgroundWorker2.ReportProgress(100);
+    }
+
     private void BackgroundWorker2Completed(Object sender, RunWorkerCompletedEventArgs e) {
       if (_closing) return;
 
@@ -647,7 +696,11 @@ namespace PugTools {
       // treeViewFast1.Visible = true;
 
       ProgressBarHide();
-      StatusBarText("Loading Complete.");
+      StatusBarText(
+        _compareFiles
+          ? "Comparison loaded. GR2 Assets show New, Changed and Removed files."
+          : "Loading Complete."
+      );
       ProgressBarValue(0);
       ProgressBarStyle(System.Windows.Forms.ProgressBarStyle.Continuous);
 
@@ -1863,7 +1916,11 @@ namespace PugTools {
           ProgressBarHide();
           RenderPanelShow();
           // treeViewFast1.Enabled = true;
-          StatusBarText("GR2 File Loaded.");
+          StatusBarText(
+            asset.compareState != BuildFileState.None
+              ? "GR2 File Loaded. Compare State: " + asset.compareState
+              : "GR2 File Loaded."
+          );
 
         } else if (asset.Obj != null) {
           GomObject obj = asset.Obj;

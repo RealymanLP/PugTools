@@ -98,42 +98,43 @@ namespace SlimDXNet {
 
             public static readonly int Stride = Marshal.SizeOf(typeof(TerrainCP));
         }
+        [StructLayout(LayoutKind.Sequential)]
         public struct PosNormalTexTanSkinned {
             public Vector3 Pos;
             public Vector3 Normal;
             public Vector2 Tex;
-            public Vector4 Tan;
-            public float Weight;
+            public Vector3 Tan;
+            public Vector4 Weights;
             public BonePalette BoneIndices;
 
-            public static readonly int Stride = Marshal.SizeOf(typeof(PosNormalTexTanSkinned));
+            public static readonly int Stride =
+                Marshal.SizeOf(typeof(PosNormalTexTanSkinned));
 
-            public PosNormalTexTanSkinned(Vector3 pos, Vector3 norm, Vector2 uv, Vector3 tan, float weight, byte[] boneIndices) {
+            public PosNormalTexTanSkinned(
+                Vector3 pos,
+                Vector3 norm,
+                Vector2 uv,
+                Vector3 tan,
+                Vector4 weights,
+                byte bone0,
+                byte bone1,
+                byte bone2,
+                byte bone3
+            ) {
                 Pos = pos;
                 Normal = norm;
                 Tex = uv;
-                Tan = new Vector4(tan, 0);
-                Weight = weight;
-                BoneIndices = new BonePalette();
-                for (int index = 0; index < boneIndices.Length; index++) {
-                    switch (index) {
-                        case 0:
-                            BoneIndices.B0 = boneIndices[index];
-                            break;
-                        case 1:
-                            BoneIndices.B1 = boneIndices[index];
-                            break;
-                        case 2:
-                            BoneIndices.B2 = boneIndices[index];
-                            break;
-                        case 3:
-                            BoneIndices.B3 = boneIndices[index];
-                            break;
-                    }
-                }
-                
+                Tan = tan;
+                Weights = weights;
+                BoneIndices = new BonePalette {
+                    B0 = bone0,
+                    B1 = bone1,
+                    B2 = bone2,
+                    B3 = bone3
+                };
             }
         }
+        [StructLayout(LayoutKind.Sequential, Pack = 1)]
         public struct BonePalette {
             public byte B0, B1, B2, B3;
         }

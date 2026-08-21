@@ -457,6 +457,12 @@ namespace PugTools {
           area.RoomList.Count, assetModels.Count, totalInstances, matchedAssets,
           loadedModels, missingGr2Files, failedGr2Loads, area.DebugHeaderInfo));
 
+        string terrainTexInfo = string.Format(
+          "TerrainTextureNames.Count = {0}\n{1}",
+          area.TerrainTextureNames.Count,
+          string.Join("\n", area.TerrainTextureNames.Select(kv => kv.Key + " = " + kv.Value)));
+        Invoke(new Action(() => MessageBox.Show(terrainTexInfo, "Terrain Textures Debug")));
+
         panelRender.LoadModel(models, materials, area.RoomList, area.Id.ToString());
         render = new Thread(panelRender.StartRender) {
           IsBackground = true

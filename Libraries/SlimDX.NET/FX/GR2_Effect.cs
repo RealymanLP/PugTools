@@ -10,6 +10,11 @@
         public readonly EffectTechnique AnimatedUVAlphaBlend;
         public readonly EffectTechnique Creature;
         public readonly EffectTechnique Generic;
+        public readonly EffectTechnique GenericSkinned;
+        public readonly EffectTechnique EyeSkinned;
+        public readonly EffectTechnique GarmentSkinned;
+        public readonly EffectTechnique HairCSkinned;
+        public readonly EffectTechnique SkinBSkinned;
         public readonly EffectTechnique DiffuseFlat;
         public readonly EffectTechnique EmissiveOnly;
         public readonly EffectTechnique Eye;
@@ -62,6 +67,7 @@
         // Constants
         private readonly EffectMatrixVariable _world;
         private readonly EffectMatrixVariable _mvMatrix;
+        private readonly EffectMatrixVariable _skinPalette;
 
         // Channel Filters
         public readonly EffectTechnique filterDiffuseMap;
@@ -83,6 +89,11 @@
             AnimatedUVAlphaBlend = FX.GetTechniqueByName("AnimatedUVAlphaBlend");
             Creature = FX.GetTechniqueByName("Creature");
             Generic = FX.GetTechniqueByName("Generic");
+            GenericSkinned = FX.GetTechniqueByName("GenericSkinned");
+            EyeSkinned = FX.GetTechniqueByName("EyeSkinned");
+            GarmentSkinned = FX.GetTechniqueByName("GarmentSkinned");
+            HairCSkinned = FX.GetTechniqueByName("HairCSkinned");
+            SkinBSkinned = FX.GetTechniqueByName("SkinBSkinned");
             DiffuseFlat = FX.GetTechniqueByName("DiffuseFlat");
             EmissiveOnly = FX.GetTechniqueByName("EmissiveOnly");
             Eye = FX.GetTechniqueByName("Eye");
@@ -133,6 +144,7 @@
             // Constants
             _world = FX.GetVariableByName("world").AsMatrix();
             _mvMatrix = FX.GetVariableByName("mvMatrix").AsMatrix();
+            _skinPalette = FX.GetVariableByName("SkinPalette").AsMatrix();
 
             // Channel Filters
             filterDiffuseMap = FX.GetTechniqueByName("FilterDiffuse");
@@ -246,6 +258,14 @@
         public void SetMvMatrix(Matrix m)
         {
             _mvMatrix.SetMatrix(m);
+        }
+
+        public void SetSkinPalette(Matrix[] matrices)
+        {
+            if (matrices == null || matrices.Length == 0)
+                return;
+
+            _skinPalette.SetMatrixArray(matrices);
         }
     }
 }

@@ -17,42 +17,234 @@ namespace FileFormats {
     internal List<JBA_Bone> Bones { get; } = new List<JBA_Bone>();
     internal List<JBA_Block> Blocks { get; } = new List<JBA_Block>();
 
+    // JBA key data is already decoded by the reader. Build one compact pose
+    // per source frame once, then playback only interpolates between arrays.
+    private JBATransform[][] _sampleFrames;
+
     public Int32 FrameCount =>
       FPS > 0 ? Math.Max(1, (Int32)Math.Round(Length * FPS) + 1) : 1;
 
-    public JBAFrame Sample(Single time) {
-      Int32 frame = FPS > 0 ? Math.Max(0, (Int32)Math.Floor(time * FPS)) : 0;
-      frame = Math.Min(frame, Math.Max(0, FrameCount - 1));
+    public void PrepareSamples() {
+      EnsureSampleFrames();
+    }
 
-      List<JBATransform> result = new List<JBATransform>(BoneCount);
-      for (Int32 i = 0; i < BoneCount; i++)
-        result.Add(new JBATransform(Vector3.Zero, Quaternion.Identity, false));
+    // Jedipedia treats a translation channel whose complete quantized reach is
+    // below 0.01 Morpheme centimetres as a repeated rig offset, not motion.
+    // Such channels must use the target GR2 skeleton's bind-local translation;
+    // otherwise a clip authored on a slightly different rig can visibly pull
+    // bones toward the source rig and distort the motion arc.
+    internal Boolean UsesRigBindTranslation(Int32 channel) {
+      if (channel < 0 || channel >= Bones.Count)
+        return false;
 
-      foreach (JBA_Block block in Blocks) {
-        if (frame < block.StartFrame || frame >= block.StartFrame + block.NumFrames)
-          continue;
+      Vector3 stride = Bones[channel].TranslationStride;
+      const Single constantReach = 0.01F;
 
-        Int32 localFrame = frame - block.StartFrame;
+      return Math.Abs(stride.X) * 2047.0F <= constantReach
+        && Math.Abs(stride.Y) * 2047.0F <= constantReach
+        && Math.Abs(stride.Z) * 1023.0F <= constantReach;
+    }
 
-        for (Int32 b = 0; b < block.Layout.Count && b < result.Count; b++) {
-          JBA_KeyLayout k = block.Layout[b];
+    private void EnsureSampleFrames() {
+      if (_sampleFrames != null
+          && _sampleFrames.Length == FrameCount)
+        return;
 
-          Quaternion rot = k.Rotations.Count > 0
-            ? k.Rotations[Math.Min(localFrame, k.Rotations.Count - 1)]
-            : Quaternion.Identity;
+      Int32 count = Math.Max(1, FrameCount);
+      _sampleFrames = new JBATransform[count][];
 
-          Vector3 pos = k.Translations.Count > 0
-            ? k.Translations[Math.Min(localFrame, k.Translations.Count - 1)]
-            : Vector3.Zero;
+      for (Int32 frame = 0; frame < count; frame++) {
+        JBATransform[] result = new JBATransform[BoneCount];
 
-          result[b] = new JBATransform(pos, rot, k.HasTranslation);
+        for (Int32 i = 0; i < result.Length; i++) {
+          result[i] = new JBATransform(
+            Vector3.Zero,
+            Quaternion.Identity,
+            false
+          );
         }
 
-        break;
+        foreach (JBA_Block block in Blocks) {
+          if (frame < block.StartFrame
+              || frame >= block.StartFrame + block.NumFrames)
+            continue;
+
+          Int32 localFrame = frame - block.StartFrame;
+
+          for (Int32 b = 0;
+               b < block.Layout.Count && b < result.Length;
+               b++) {
+
+            JBA_KeyLayout k = block.Layout[b];
+
+            Quaternion rot = k.Rotations.Count > 0
+              ? k.Rotations[
+                  Math.Min(
+                    localFrame,
+                    k.Rotations.Count - 1
+                  )
+                ]
+              : Quaternion.Identity;
+
+            Vector3 pos = k.Translations.Count > 0
+              ? k.Translations[
+                  Math.Min(
+                    localFrame,
+                    k.Translations.Count - 1
+                  )
+                ]
+              : Vector3.Zero;
+
+            result[b] = new JBATransform(
+              pos,
+              rot,
+              k.HasTranslation
+            );
+          }
+
+          break;
+        }
+
+        _sampleFrames[frame] = result;
+      }
+    }
+
+    internal Int32 SampleInto(Single time, JBATransform[] result) {
+      EnsureSampleFrames();
+
+      if (result == null)
+        throw new ArgumentNullException(nameof(result));
+
+      if (result.Length < BoneCount)
+        throw new ArgumentException(
+          "The JBA sample buffer is smaller than the animation bone count.",
+          nameof(result)
+        );
+
+      if (_sampleFrames == null || _sampleFrames.Length == 0) {
+        for (Int32 i = 0; i < BoneCount; i++) {
+          result[i] = new JBATransform(
+            Vector3.Zero,
+            Quaternion.Identity,
+            false
+          );
+        }
+        return 0;
       }
 
+      if (FPS <= 0.0F || _sampleFrames.Length == 1) {
+        Array.Copy(_sampleFrames[0], result, BoneCount);
+        return 0;
+      }
+
+      Single framePosition = time * FPS;
+
+      if (!Single.IsFinite(framePosition))
+        framePosition = 0.0F;
+
+      framePosition = Math.Max(
+        0.0F,
+        Math.Min(
+          _sampleFrames.Length - 1,
+          framePosition
+        )
+      );
+
+      Int32 frame0 = Math.Min(
+        _sampleFrames.Length - 1,
+        (Int32)Math.Floor(framePosition)
+      );
+
+      Int32 frame1 = Math.Min(
+        _sampleFrames.Length - 1,
+        frame0 + 1
+      );
+
+      Single alpha = framePosition - frame0;
+
+      if (frame0 == frame1 || alpha <= 0.00001F) {
+        Array.Copy(_sampleFrames[frame0], result, BoneCount);
+        return frame0;
+      }
+
+      JBATransform[] a = _sampleFrames[frame0];
+      JBATransform[] b = _sampleFrames[frame1];
+      Int32 boneCount = Math.Min(a.Length, b.Length);
+
+      for (Int32 i = 0; i < boneCount; i++) {
+        JBATransform ta = a[i];
+        JBATransform tb = b[i];
+
+        Quaternion qa = ta.Rotation;
+        Quaternion qb = tb.Rotation;
+
+        if (qa.LengthSquared() <= 0.000001F)
+          qa = Quaternion.Identity;
+        else
+          qa = Quaternion.Normalize(qa);
+
+        if (qb.LengthSquared() <= 0.000001F)
+          qb = Quaternion.Identity;
+        else
+          qb = Quaternion.Normalize(qb);
+
+        Quaternion rotation =
+          Quaternion.Slerp(qa, qb, alpha);
+
+        Boolean hasTranslation =
+          ta.HasTranslation || tb.HasTranslation;
+
+        Vector3 translation;
+
+        if (ta.HasTranslation && tb.HasTranslation) {
+          translation = Vector3.Lerp(
+            ta.Translation,
+            tb.Translation,
+            alpha
+          );
+        }
+        else if (ta.HasTranslation) {
+          translation = ta.Translation;
+        }
+        else if (tb.HasTranslation) {
+          translation = tb.Translation;
+        }
+        else {
+          translation = Vector3.Zero;
+        }
+
+        result[i] = new JBATransform(
+          translation,
+          rotation,
+          hasTranslation
+        );
+      }
+
+      for (Int32 i = boneCount; i < BoneCount; i++) {
+        result[i] = new JBATransform(
+          Vector3.Zero,
+          Quaternion.Identity,
+          false
+        );
+      }
+
+      return frame0;
+    }
+
+    public JBAFrame Sample(Single time) {
+      EnsureSampleFrames();
+
+      if (_sampleFrames == null || _sampleFrames.Length == 0)
+        return new JBAFrame(
+          0,
+          Array.Empty<JBATransform>()
+        );
+
+      JBATransform[] result = new JBATransform[BoneCount];
+      Int32 frame = SampleInto(time, result);
       return new JBAFrame(frame, result);
     }
+
   }
 
   public readonly struct JBATransform {

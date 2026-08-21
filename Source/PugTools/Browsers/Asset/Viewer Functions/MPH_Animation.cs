@@ -64,6 +64,7 @@ namespace FileFormats {
 
       Dictionary<UInt32, MPHRigSection> rigs =
         new Dictionary<UInt32, MPHRigSection>();
+      MPHRigSection firstRig = null;
       Dictionary<UInt32, MPHMapSection> maps =
         new Dictionary<UInt32, MPHMapSection>();
       List<MPHAnimationList> animationLists =
@@ -82,8 +83,26 @@ namespace FileFormats {
         try {
           if (type == 1)
             animationLists.Add(ReadAnimationList(br, sectionStart, is64));
-          else if (type == 2)
-            rigs[index] = ReadRig(br, sectionStart, index, is64);
+          else if (type == 2) {
+            MPHRigSection parsedRig = ReadRig(
+              br,
+              sectionStart,
+              index,
+              is64
+            );
+            rigs[index] = parsedRig;
+
+            // Jedipedia's standalone JBA binder deliberately uses the first
+            // real type-2 rig section in file order. AnimationList's
+            // jointSectionIndex is metadata for the network subsection and is
+            // not the selector used by jbaApplyMphMapping().
+            if (firstRig == null
+                && parsedRig != null
+                && parsedRig.Bones != null
+                && parsedRig.Bones.Count > 0) {
+              firstRig = parsedRig;
+            }
+          }
           else if (type == 3)
             maps[index] = ReadMap(br, sectionStart, index, is64);
         }
@@ -92,10 +111,15 @@ namespace FileFormats {
           // Keep scanning instead of making JBA preview fail completely.
         }
 
-        pos = sectionEnd;
+        // Match Jedipedia mphSections() exactly. The section payload length
+        // ends BEFORE the alignment padding. Morpheme aligns every following
+        // section header to 16 bytes; in the 64-bit dialect the section stream
+        // itself is offset by eight bytes, so alignment is relative to that
+        // base. Omitting this step makes small networks such as
+        // placeable_openclose.mph lose their type-2/type-3 rig sections.
         pos = is64
-          ? ((pos - 8 + 15) & ~15L) + 8
-          : (pos + 15) & ~15L;
+          ? (((sectionEnd - 8 + 15) & ~15L) + 8)
+          : ((sectionEnd + 15) & ~15L);
       }
 
       String wanted = Path.GetFileNameWithoutExtension(clipName);
@@ -113,8 +137,18 @@ namespace FileFormats {
                   StringComparison.OrdinalIgnoreCase))
               continue;
 
-            if (!rigs.TryGetValue(set.RigSectionIndex, out MPHRigSection rig))
+            // Match Jedipedia jbaApplyRigToAnimMap(): the standalone JBA
+            // page pairs the selected RigToAnimMap with the first type-2 rig
+            // section. Using AnimationList.jointSectionIndex here can select a
+            // mask/joint subsection whose bone names belong to another layout,
+            // which yields a full-looking 102/102 map that binds to the wrong
+            // GR2 bones (notably npc/ithorian).
+            MPHRigSection rig = firstRig;
+            if (rig == null
+                || rig.Bones == null
+                || rig.Bones.Count == 0)
               continue;
+
             if (!maps.TryGetValue(entry.BoneMappingIndex, out MPHMapSection map))
               continue;
 
@@ -136,62 +170,57 @@ namespace FileFormats {
     ) {
       MPHAnimationList list = new MPHAnimationList();
 
+      // Morpheme's 64-bit serialization uses pointer-width SPACING, but the
+      // relative offsets/counts themselves remain 32-bit values. This is the
+      // layout used by Jedipedia's mphParseAnimationList(). Treating these as
+      // UInt64 shifts every field after the first one and produces an empty or
+      // unrelated RigToAnimMap for current SWTOR clips.
       UInt32 numSets = ReadUInt32At(br, start);
       UInt32 subsectionListOffset = ReadUInt32At(br, start + (is64 ? 8 : 4));
       UInt32 jbaOffset = ReadUInt32At(br, start + (is64 ? 16 : 8));
 
-      Int64 offsetPos = start + subsectionListOffset;
-      List<UInt64> setOffsets = new List<UInt64>();
+      if (numSets == 0 || numSets > 64 || subsectionListOffset == 0)
+        return list;
 
-      for (UInt32 i = 0; i < numSets; i++) {
-        UInt64 off = is64
-          ? ReadUInt64At(br, offsetPos)
-          : ReadUInt32At(br, offsetPos);
-        offsetPos += is64 ? 8 : 4;
-        setOffsets.Add(off);
-      }
+      for (UInt32 setIndex = 0; setIndex < numSets; setIndex++) {
+        Int64 offsetWord = start + subsectionListOffset
+          + setIndex * (is64 ? 8L : 4L);
+        UInt32 rawOffset = ReadUInt32At(br, offsetWord);
+        if (rawOffset == 0) break;
 
-      foreach (UInt64 rawOffset in setOffsets) {
-        Int64 p = start + (Int64)rawOffset;
+        Int64 subStart = start + rawOffset;
+        UInt32 rigIndex = ReadUInt32At(br, subStart + (is64 ? 8 : 4));
+        UInt32 numEntries = ReadUInt32At(br, subStart + (is64 ? 16 : 8));
 
-        UInt64 unkStart = ReadWide(br, ref p, is64);
-        UInt64 rigIndex = ReadWide(br, ref p, is64);
-        UInt64 numEntries = ReadWide(br, ref p, is64);
-        UInt64 subsectionStart = ReadWide(br, ref p, is64);
-        UInt64 subsectionLength = ReadWide(br, ref p, is64);
+        if (numEntries == 0 || numEntries > 100000)
+          break;
+
+        Int64 entryStart = subStart + (is64 ? 40 : 20);
+        Int32 stride = is64 ? 0x58 : 0x34;
+        Int32 animField = is64 ? 0x50 : 0x2C;
 
         MPHAnimationSet set = new MPHAnimationSet {
-          RigSectionIndex = (UInt32)rigIndex
+          RigSectionIndex = rigIndex
         };
 
-        Int32 stride = is64 ? 0x58 : 0x34;
-
-        for (UInt64 i = 0; i < numEntries; i++) {
-          Int64 entry = start + (Int64)rawOffset
-            + (Int64)subsectionStart
-            + (Int64)i * stride;
-
-          UInt32 animIndex;
-          UInt32 mappingIndex;
-
-          if (is64) {
-            animIndex = ReadUInt32At(br, entry + 0x50);
-            mappingIndex = ReadUInt32At(br, entry + 0x54);
-          } else {
-            animIndex = ReadUInt32At(br, entry + 0x2C);
-            mappingIndex = ReadUInt32At(br, entry + 0x30);
-          }
+        for (UInt32 i = 0; i < numEntries; i++) {
+          Int64 entry = entryStart + i * (Int64)stride;
+          if (entry < 0 || entry + stride > br.BaseStream.Length)
+            break;
 
           set.Entries.Add(new MPHAnimationEntry {
-            AnimIndex = animIndex,
-            BoneMappingIndex = mappingIndex
+            AnimIndex = ReadUInt32At(br, entry + animField),
+            BoneMappingIndex = ReadUInt32At(br, entry + animField + 4)
           });
         }
 
+        if (set.Entries.Count == 0)
+          break;
         list.Sets.Add(set);
       }
 
-      list.Names = ReadStringTable(br, start + jbaOffset, is64);
+      if (jbaOffset != 0)
+        list.Names = ReadStringTable(br, start + jbaOffset, is64);
       return list;
     }
 
@@ -201,41 +230,25 @@ namespace FileFormats {
       UInt32 index,
       Boolean is64
     ) {
-      Int64 p = start + 16; // skip compiler rig-header quaternion
+      // Same packed/padded layout as Jedipedia mphParseRig(). Relative
+      // pointers remain u32 in both dialects.
+      UInt32 parentsOffset = ReadUInt32At(br, start + 16);
+      UInt32 namesOffset = ReadUInt32At(br, start + (is64 ? 32 : 28));
+      UInt32 rotationsOffset = ReadUInt32At(br, start + (is64 ? 40 : 32));
+      UInt32 translationsOffset = ReadUInt32At(br, start + (is64 ? 48 : 36));
 
-      UInt64 parentsOffset = ReadWide(br, ref p, is64);
-      UInt32 trajectory = ReadUInt32At(br, p); p += 4;
-      UInt32 root = ReadUInt32At(br, p); p += 4;
-
-      UInt64 namesOffset = ReadWide(br, ref p, is64);
-      UInt64 rotationsOffset = ReadWide(br, ref p, is64);
-      UInt64 translationsOffset = ReadWide(br, ref p, is64);
-
-      Int64 parents = start + (Int64)parentsOffset;
+      Int64 parents = start + parentsOffset;
       UInt32 numBones = ReadUInt32At(br, parents);
+      if (numBones == 0 || numBones > 4096)
+        return new MPHRigSection { Index = index };
+
       Int64 parentData = parents + (is64 ? 16 : 8);
-
-      List<Int32> parentIndices = new List<Int32>();
-      for (UInt32 i = 0; i < numBones; i++)
-        parentIndices.Add(ReadInt32At(br, parentData + i * 4L));
-
-      List<String> names = ReadStringTable(
-        br,
-        start + (Int64)namesOffset,
-        is64
-      );
-
+      List<String> names = ReadStringTable(br, start + namesOffset, is64);
       MPHRigSection rig = new MPHRigSection { Index = index };
 
       for (Int32 i = 0; i < numBones; i++) {
-        Int64 tp = start + (Int64)translationsOffset + i * 16L;
-        Int64 rp = start + (Int64)rotationsOffset + i * 16L;
-
-        Vector3 translation = new Vector3(
-          ReadSingleAt(br, tp),
-          ReadSingleAt(br, tp + 4),
-          ReadSingleAt(br, tp + 8)
-        );
+        Int64 rp = start + rotationsOffset + i * 16L;
+        Int64 tp = start + translationsOffset + i * 16L;
 
         Quaternion rotation = new Quaternion(
           ReadSingleAt(br, rp),
@@ -243,19 +256,22 @@ namespace FileFormats {
           ReadSingleAt(br, rp + 8),
           ReadSingleAt(br, rp + 12)
         );
-
         if (rotation.LengthSquared() > 0.000001F)
           rotation = Quaternion.Normalize(rotation);
         else
           rotation = Quaternion.Identity;
 
         rig.Bones.Add(new JBARigBone {
-          Name = i < names.Count && names[i] != null
+          Name = i < names.Count && !String.IsNullOrEmpty(names[i])
             ? names[i]
             : "bone_" + i,
-          Parent = parentIndices[i],
-          BindTranslation = translation,
-          BindRotation = rotation
+          Parent = ReadInt32At(br, parentData + i * 4L),
+          BindRotation = rotation,
+          BindTranslation = new Vector3(
+            ReadSingleAt(br, tp),
+            ReadSingleAt(br, tp + 4),
+            ReadSingleAt(br, tp + 8)
+          )
         });
       }
 
@@ -268,21 +284,29 @@ namespace FileFormats {
       UInt32 index,
       Boolean is64
     ) {
-      Int64 p = start;
-      UInt64 count = ReadWide(br, ref p, is64);
-      UInt64 entriesOffset = ReadWide(br, ref p, is64);
+      // Exact layout used by Jedipedia mphParseRigMap():
+      //   u32 numEntries
+      //   32-bit: 4 bytes header/pad, entries start at +8
+      //   64-bit: 12 bytes header/pad, entries start at +16
+      // Each entry is { u16 rigIndex, u16 animIndex }. There is no pointer
+      // that needs to equal 0x08/0x10; treating the padding word as one made
+      // valid small placeable maps look empty.
+      UInt32 count = ReadUInt32At(br, start);
+      if (count == 0 || count > 4096)
+        return new MPHMapSection { Index = index };
+
+      Int64 p = start + (is64 ? 16L : 8L);
+      if (p < 0 || p + count * 4L > br.BaseStream.Length)
+        return new MPHMapSection { Index = index };
 
       List<(UInt16 rig, UInt16 anim)> pairs =
         new List<(UInt16, UInt16)>();
       Int32 maxAnim = -1;
 
-      p = start + (Int64)entriesOffset;
-
-      for (UInt64 i = 0; i < count; i++) {
+      for (UInt32 i = 0; i < count; i++) {
         UInt16 rig = ReadUInt16At(br, p);
         UInt16 anim = ReadUInt16At(br, p + 2);
         p += 4;
-
         pairs.Add((rig, anim));
         maxAnim = Math.Max(maxAnim, anim);
       }
@@ -290,7 +314,8 @@ namespace FileFormats {
       Int32[] map = new Int32[Math.Max(0, maxAnim + 1)];
       for (Int32 i = 0; i < map.Length; i++) map[i] = -1;
       foreach (var pair in pairs)
-        map[pair.anim] = pair.rig;
+        if (pair.anim < map.Length)
+          map[pair.anim] = pair.rig;
 
       return new MPHMapSection {
         Index = index,
@@ -305,27 +330,52 @@ namespace FileFormats {
     ) {
       UInt32 numStrings = ReadUInt32At(br, start);
       UInt32 stringDataLength = ReadUInt32At(br, start + 4);
+      if (numStrings > 100000)
+        return new List<String>();
 
-      Int64 p = start + 8;
-      UInt64 indicesOffset = ReadWide(br, ref p, is64);
-      UInt64 lengthsOffset = ReadWide(br, ref p, is64);
-      UInt64 stringsOffset = ReadWide(br, ref p, is64);
+      // Offsets are u32 values placed at pointer-width aligned words.
+      UInt32 indicesOffset = ReadUInt32At(br, start + 8);
+      UInt32 lengthsOffset = ReadUInt32At(br, start + (is64 ? 16 : 12));
+      UInt32 stringsOffset = ReadUInt32At(br, start + (is64 ? 24 : 16));
 
-      Int64 indicesPos = start + (Int64)indicesOffset;
-      Int64 offsetsPos = start + (Int64)lengthsOffset;
-      Int64 stringsPos = start + (Int64)stringsOffset;
+      Int64 indicesPos = start + indicesOffset;
+      Int64 offsetsPos = start + lengthsOffset;
+      Int64 stringsPos = start + stringsOffset;
 
+      // IMPORTANT: Morpheme string-table ids are SPARSE. numStrings is the
+      // number of stored records, not the largest id plus one. AnimationList
+      // entries routinely reference ids in the thousands (Jedipedia documents
+      // e.g. entry.animIndex 3264) even when far fewer strings are physically
+      // present. A dense List(numStrings) therefore silently drops exactly the
+      // names needed to resolve small placeable networks such as
+      // placeable_openclose.mph.
+      //
+      // JavaScript arrays grow on assignment; reproduce that behavior here.
+      // Keep a generous sanity cap so corrupt assets cannot request an
+      // unbounded allocation.
+      const Int32 maxSparseStringIndex = 1000000;
       List<String> result = new List<String>();
-      for (Int32 i = 0; i < numStrings; i++) result.Add(null);
 
       for (Int32 i = 0; i < numStrings; i++) {
-        Int32 index = ReadInt32At(br, indicesPos + i * 4L);
+        Int32 stringIndex = ReadInt32At(br, indicesPos + i * 4L);
         UInt32 off = ReadUInt32At(br, offsetsPos + i * 4L);
 
-        if (index < 0 || index >= result.Count || off >= stringDataLength)
+        // -1 marks unnamed/removed slots and its offset word can contain
+        // arbitrary compiler residue.
+        if (stringIndex < 0
+            || stringIndex > maxSparseStringIndex
+            || off >= stringDataLength) {
           continue;
+        }
 
-        result[index] = ReadCString(br, stringsPos + off);
+        while (result.Count <= stringIndex)
+          result.Add(null);
+
+        String value = ReadCString(br, stringsPos + off);
+        if (String.IsNullOrEmpty(result[stringIndex]))
+          result[stringIndex] = value;
+        else
+          result[stringIndex] += " + " + value;
       }
 
       return result;

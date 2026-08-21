@@ -89,6 +89,87 @@ namespace FileFormats {
       FileToShaderResource(ref device, file, ref srv);
     }
 
+    /// <summary>
+    /// SWTOR materials keep the authored texture in &lt;value&gt; and, for a
+    /// number of shipped materials, the actually packed texture in
+    /// &lt;variable&gt;. The game and Jedipedia fall back to &lt;variable&gt; when
+    /// &lt;value&gt; does not resolve. PugTools historically ignored that field,
+    /// which leaves otherwise valid materials grey/white (or on the generic
+    /// fallback texture).
+    /// </summary>
+    private static String ResolveTextureResourcePath(
+      Assets assets,
+      String value,
+      String variable
+    ) {
+      String primary = NormalizeTextureResourcePath(value);
+      if (!String.IsNullOrWhiteSpace(primary)
+          && TextureResourceExists(assets, primary))
+        return primary;
+
+      String fallback = NormalizeTextureResourcePath(variable);
+      if (!String.IsNullOrWhiteSpace(fallback)
+          && TextureResourceExists(assets, fallback))
+        return fallback;
+
+      // Preserve the authored path for diagnostics/callers even when neither
+      // file exists. The caller decides whether to use a neutral fallback.
+      return primary;
+    }
+
+    private static Boolean TextureResourceExists(Assets assets, String path) {
+      if (assets == null || String.IsNullOrWhiteSpace(path)) return false;
+      using File file = assets.FindFile(path);
+      return file != null;
+    }
+
+    private static String NormalizeTextureResourcePath(String value) {
+      if (String.IsNullOrWhiteSpace(value)) return null;
+
+      String path = value.Trim().Replace('\\', '/');
+      while (path.Contains("//")) path = path.Replace("//", "/");
+
+      if (path.StartsWith("resources/", StringComparison.OrdinalIgnoreCase))
+        path = "/" + path;
+      else if (!path.StartsWith("/resources/", StringComparison.OrdinalIgnoreCase)) {
+        if (path.StartsWith("/")) path = path.Substring(1);
+        path = "/resources/" + path;
+      }
+
+      if (!path.EndsWith(".dds", StringComparison.OrdinalIgnoreCase))
+        path += ".dds";
+
+      return path.Replace("//", "/");
+    }
+
+    private static void LoadMaterialTexture(
+      ref Device device,
+      Assets assets,
+      XmlNode inputNode,
+      ref String ddsPath,
+      ref ShaderResourceView srv,
+      Boolean useBlueFallback = false
+    ) {
+      String value = inputNode?["value"]?.InnerText;
+      String variable = inputNode?["variable"]?.InnerText;
+      String resolved = ResolveTextureResourcePath(assets, value, variable);
+
+      if (!String.IsNullOrWhiteSpace(resolved)) {
+        using File file = assets?.FindFile(resolved);
+        if (file != null) {
+          ddsPath = resolved;
+          FileToShaderResource(ref device, file, ref srv);
+          return;
+        }
+      }
+
+      ddsPath = resolved;
+      if (useBlueFallback) {
+        ddsPath = "/resources/art/defaultassets/blue.dds";
+        FileToShaderResource(ref device, ddsPath, ref srv);
+      }
+    }
+
     public void ParseMAT(Device device, List<GR2_Material> parentMaterials = null) {
       String materialFileName = "/resources/art/shaders/materials/" + materialName + ".mat";
       Assets currentAssets = AssetHandler.Instance.GetCurrentAssets();
@@ -205,24 +286,20 @@ namespace FileFormats {
 
         foreach (XmlNode node in nodeList) {
           String semantic = node["semantic"].InnerText;
-          String value = node["value"].InnerText.Replace("\\", "/");
+          String value = node["value"]?.InnerText?.Replace("\\", "/") ?? String.Empty;
 
           if (semantic == "DiffuseMap") {
-            diffuseDDS = ("/resources/" + value.Replace("\\", "/") + ".dds").Replace("//", "/");
-            File diffuseFile = currentAssets.FindFile(diffuseDDS);
-
-            if (diffuseFile != null && device != null) {
-              FileToShaderResource(ref device, diffuseFile, ref diffuseSRV);
-            } else {
-              diffuseDDS = "/resources/art/defaultassets/blue.dds";
-              FileToShaderResource(ref device, diffuseDDS, ref diffuseSRV);
-            }
+            LoadMaterialTexture(
+              ref device, currentAssets, node, ref diffuseDDS, ref diffuseSRV, true
+            );
           } else if (semantic == "RotationMap1") {
-            rotationDDS = ("/resources/" + value + ".dds").Replace("//", "/");
-            FileToShaderResource(ref device, rotationDDS, ref rotationSRV);
+            LoadMaterialTexture(
+              ref device, currentAssets, node, ref rotationDDS, ref rotationSRV
+            );
           } else if (semantic == "GlossMap") {
-            glossDDS = ("/resources/" + value + ".dds").Replace("//", "/");
-            FileToShaderResource(ref device, glossDDS, ref glossSRV);
+            LoadMaterialTexture(
+              ref device, currentAssets, node, ref glossDDS, ref glossSRV
+            );
           } else if (semantic == "UsesEmissive") {
             useEmissive = Convert.ToBoolean(value);
           }
@@ -231,11 +308,13 @@ namespace FileFormats {
               || derived == "HairC" || derived == "Eye") {
 
             if (semantic == "PaletteMap") {
-              paletteDDS = ("/resources/" + value + ".dds").Replace("//", "/");
-              FileToShaderResource(ref device, paletteDDS, ref paletteSRV);
+              LoadMaterialTexture(
+                ref device, currentAssets, node, ref paletteDDS, ref paletteSRV
+              );
             } else if (semantic == "PaletteMaskMap") {
-              paletteMaskDDS = ("/resources/" + value + ".dds").Replace("//", "/");
-              FileToShaderResource(ref device, paletteMaskDDS, ref paletteMaskSRV);
+              LoadMaterialTexture(
+                ref device, currentAssets, node, ref paletteMaskDDS, ref paletteMaskSRV
+              );
             } else if (semantic == "palette1") {
               if (palette1 == new Vector4())
                 palette1 = FileHelpers.StringToVec4(value);
@@ -255,14 +334,17 @@ namespace FileFormats {
 
           if (derived == "SkinB") {
             if (semantic == "ComplexionMap") {
-              complexionDDS = ("/resources/" + value + ".dds").Replace("//", "/");
-              FileToShaderResource(ref device, complexionDDS, ref complexionSRV);
+              LoadMaterialTexture(
+                ref device, currentAssets, node, ref complexionDDS, ref complexionSRV
+              );
             } else if (semantic == "FacepaintMap") {
-              facepaintDDS = ("/resources/" + value + ".dds").Replace("//", "/");
-              FileToShaderResource(ref device, facepaintDDS, ref facepaintSRV);
+              LoadMaterialTexture(
+                ref device, currentAssets, node, ref facepaintDDS, ref facepaintSRV
+              );
             } else if (semantic == "AgeMap") {
-              ageDDS = ("/resources/" + value + ".dds").Replace("//", "/");
-              FileToShaderResource(ref device, ageDDS, ref ageSRV);
+              LoadMaterialTexture(
+                ref device, currentAssets, node, ref ageDDS, ref ageSRV
+              );
             } else if (semantic == "FlushTone") {
               if (flushTone == new Vector4())
                 flushTone = FileHelpers.StringToVec4(value);

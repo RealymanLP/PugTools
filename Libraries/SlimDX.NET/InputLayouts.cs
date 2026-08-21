@@ -75,6 +75,22 @@ namespace SlimDXNet {
         System.Diagnostics.Debug.WriteLine(ex.Message + ex.StackTrace);
         PosNormalTexTan = null;
       }
+
+      try {
+        var tech = Effects.GR2_FX;
+        if (tech != null && tech.GenericSkinned != null) {
+          var passDesc = tech.GenericSkinned.GetPassByIndex(0).Description;
+          PosNormalTexTanSkinned = new InputLayout(
+            device,
+            passDesc.Signature,
+            InputLayoutDescriptions.PosNormalTexTanSkinned
+          );
+        }
+      }
+      catch (Exception ex) {
+        System.Diagnostics.Debug.WriteLine(ex.Message + ex.StackTrace);
+        PosNormalTexTanSkinned = null;
+      }
       /*
       try {
           var tech = Effects.TerrainFX;

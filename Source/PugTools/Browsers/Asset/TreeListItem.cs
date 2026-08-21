@@ -6,6 +6,8 @@ namespace PugTools {
     internal String Id { get; set; }
     internal String DisplayName { get; set; }
     internal HashFileInfo HashInfo { get; set; }
+    internal HashFileInfo PreviousHashInfo { get; set; }
+    internal BuildFileState CompareState { get; set; }
     internal String ParentId { get; set; }
 
     internal TreeListItem(String id, String parent, String display, HashFileInfo hashInfo) {

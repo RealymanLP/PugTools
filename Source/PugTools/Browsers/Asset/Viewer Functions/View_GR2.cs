@@ -1,7 +1,10 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Diagnostics;
+using Stopwatch = System.Diagnostics.Stopwatch;
 using System.Drawing;
+using System.Drawing.Imaging;
+using System.Drawing.Text;
+using System.IO;
 using System.Linq;
 using System.Windows.Forms;
 using FileFormats;
@@ -32,14 +35,105 @@ namespace PugTools {
     private GR2 _model;
     private JBAAnimation _jbaAnimation;
     private JBARig _jbaRig;
+
+    // Files prefixed with ad_ are Morpheme additive overlays, not complete
+    // poses. Jedipedia layers them over ex_stand_idle_1/ex_idle_1 when that
+    // sibling clip exists, otherwise over the GR2 bind pose. Keep the base
+    // layer separate because it has its own duration/frame rate and loops on
+    // its own timeline.
+    private Boolean _jbaIsAdditive;
+    private JBAAnimation _jbaBaseAnimation;
+    private JBARig _jbaBaseRig;
+    private Single _jbaBaseTime;
+    private Double _jbaBasePlaybackStartTime;
+
     private Dictionary<String, Matrix> _jbaSkinMatrices =
       new Dictionary<String, Matrix>(StringComparer.OrdinalIgnoreCase);
+
+    // Reused for every JBA frame. Avoid allocating large managed arrays
+    // while the render thread is running.
+    private readonly Dictionary<GR2_Mesh, Matrix[]> _jbaPaletteCache =
+      new Dictionary<GR2_Mesh, Matrix[]>();
+
+    private readonly Dictionary<GR2_Mesh, PosNormalTexTan[]> _jbaSkinnedCache =
+      new Dictionary<GR2_Mesh, PosNormalTexTan[]>();
+
+    private readonly Dictionary<GR2_Mesh, Buffer> _jbaGpuVertexBuffers =
+      new Dictionary<GR2_Mesh, Buffer>();
     private Single _jbaTime;
     private Int32 _jbaFrame = -1;
     private Boolean _jbaPlaying;
     private Boolean _jbaLoop = true;
+
+    // JBA playback is driven from an absolute high-resolution clock instead of
+    // accumulating render-loop deltas. This mirrors Jedipedia's wall-clock
+    // playback and prevents a slow render/GC frame from permanently skewing
+    // animation timing.
+    private readonly Stopwatch _jbaPlaybackClock = new Stopwatch();
+    private Double _jbaPlaybackStartTime;
+
+    // Everything below is reused for the lifetime of the loaded JBA/model pair.
+    // The old hot path allocated dictionaries/arrays and repeatedly rebuilt
+    // matrices on every redraw. Keeping bind/inverse-bind and mapping data here
+    // removes that pressure while still using the real GR2 bind pose.
+    private JBATransform[] _jbaPoseSamples;
+    private Int32[] _jbaSkeletonToChannel;
+    private Boolean[] _jbaUseBindTranslation;
+
+    // Diagnostic counts reflect the FINAL name binding against the actual GR2
+    // skeleton, not merely the raw RigToAnimMap entry count. This makes a
+    // misleading "102/102" MPH map distinguishable from a map whose rig bone
+    // names really drive the loaded body.
+    private Int32 _jbaBoundSkeletonBoneCount;
+    private Int32 _jbaBoundChannelCount;
+    private Int32 _jbaBaseBoundSkeletonBoneCount;
+    private Int32 _jbaBaseBoundChannelCount;
+
+    // Additive-base equivalents. The overlay deliberately does NOT use the
+    // constant-translation substitution: its translations are deltas and zero
+    // must remain zero. The substitution belongs only to a full/base pose.
+    private JBATransform[] _jbaBasePoseSamples;
+    private Int32[] _jbaBaseSkeletonToChannel;
+    private Boolean[] _jbaBaseUseBindTranslation;
+
+    // Retained for compatibility/debugging with the older Hero-space pose
+    // helpers.  The active JBA path below composes the corresponding bind
+    // rotation/translation in Morpheme space instead.
+    private Matrix[] _jbaBindLocal;
+    private Matrix[] _jbaBindLocalFull;
+    private Matrix[] _jbaInverseBind;
+    private Matrix[] _jbaCurrentWorld;
+    private Boolean[] _jbaCurrentValid;
+
+    // Exact Jedipedia/Morpheme pose state.  Bind rotations recovered from a
+    // GR2 rootToBone matrix are not necessarily unit quaternions (exporter
+    // scale/shear is intentionally left in them by the old gl-matrix
+    // getRotation() used by Jedipedia).  Matrix-multiplying those locals is
+    // NOT equivalent to Jedipedia's quat.mul()/vec3.transformQuat() path.
+    // Keep the pose in Morpheme quaternion/vector form until the final skin
+    // matrix so rigs such as Ithorian reproduce the reader exactly.
+    private System.Numerics.Quaternion[] _jbaBindRotationMorpheme;
+    private System.Numerics.Vector3[] _jbaBindTranslationMorpheme;
+    private System.Numerics.Quaternion[] _jbaWorldRotationMorpheme;
+    private System.Numerics.Vector3[] _jbaWorldTranslationMorpheme;
+
     private Buffer _jbaBoneBuffer;
     private Int32 _jbaBoneVertexCount;
+    private Int32 _jbaBoneBufferCapacity;
+    private PosNormalTexTan[] _jbaBoneVertices;
+    private volatile Boolean _showSkeleton;
+
+    // JBA bone labels are rendered through a viewer-local D3D11 text atlas.
+    // This avoids depending on SpriteTextRenderer inside D3DPanelApp (where the
+    // previous label path never produced visible output) and keeps the labels
+    // in the same swap chain as the model/skeleton overlay.
+    private ShaderResourceView _jbaLabelTexture;
+    private Buffer _jbaLabelBuffer;
+    private PosNormalTexTan[] _jbaLabelVertices;
+    private Vector4[] _jbaLabelUvRects;
+    private Vector2[] _jbaLabelPixelSizes;
+    private Int32 _jbaLabelBufferCapacity;
+    private Int32 _jbaLabelVertexCount;
     private GR2_Material _jbaMaterial;
     private readonly LookAtCamera _camera;
     private Single _cameraZoomSpeed; // = 0.40f;
@@ -59,6 +153,70 @@ namespace PugTools {
       _camera = new LookAtCamera();
       _lastMousePos = new Point();
     }
+    private static Byte JbaBoneIndexByte(Single normalizedIndex) {
+      Int32 value = (Int32)Math.Round(normalizedIndex * 255.0F);
+      if (value < 0) value = 0;
+      if (value > 255) value = 255;
+      return (Byte)value;
+    }
+
+    private void ReleaseJbaGpuVertexBuffers() {
+      foreach (Buffer stored in _jbaGpuVertexBuffers.Values) {
+        Buffer buffer = stored;
+        Util.ReleaseCom(ref buffer);
+      }
+
+      _jbaGpuVertexBuffers.Clear();
+    }
+
+    private EffectTechnique GetGpuSkinnedTechnique(EffectTechnique technique) {
+      if (technique == _fx.Eye) return _fx.EyeSkinned;
+      if (technique == _fx.Garment) return _fx.GarmentSkinned;
+      if (technique == _fx.HairC) return _fx.HairCSkinned;
+      if (technique == _fx.SkinB) return _fx.SkinBSkinned;
+      return _fx.GenericSkinned;
+    }
+
+    private Boolean PrepareGpuSkinning(
+      GR2_Mesh mesh,
+      out Buffer vertexBuffer
+    ) {
+      vertexBuffer = null;
+
+      if (_jbaAnimation == null
+          || _fx == null
+          || InputLayouts.PosNormalTexTanSkinned == null
+          || mesh == null
+          || mesh.meshBones == null
+          || mesh.meshBones.Count == 0
+          || mesh.meshBones.Count > 256
+          || !_jbaGpuVertexBuffers.TryGetValue(mesh, out vertexBuffer)) {
+        return false;
+      }
+
+      if (!_jbaPaletteCache.TryGetValue(mesh, out Matrix[] palette)
+          || palette.Length != mesh.meshBones.Count) {
+        palette = new Matrix[mesh.meshBones.Count];
+        _jbaPaletteCache[mesh] = palette;
+      }
+
+      for (Int32 i = 0; i < palette.Length; i++) {
+        String boneName = CanonicalAnimationBoneName(
+          mesh.meshBones[i].boneName
+        );
+
+        palette[i] = _jbaSkinMatrices.TryGetValue(
+          boneName,
+          out Matrix skin
+        )
+          ? skin
+          : Matrix.Identity;
+      }
+
+      _fx.SetSkinPalette(palette);
+      return true;
+    }
+
     private void BuildGeometry() {
       if (_model.numMeshes > 0) {
         foreach (GR2_Mesh mesh in _model.meshes) {
@@ -87,6 +245,51 @@ namespace PugTools {
             new DataStream(_vertices.ToArray(), false, false),
             vbd
           );
+
+          if (mesh.meshBones != null
+              && mesh.meshBones.Count > 0
+              && mesh.meshBones.Count <= 256) {
+
+            PosNormalTexTanSkinned[] gpuVertices =
+              new PosNormalTexTanSkinned[mesh.meshVerts.Count];
+
+            for (Int32 i = 0; i < mesh.meshVerts.Count; i++) {
+              GR2_Mesh_Vertex vertex = mesh.meshVerts[i];
+
+              gpuVertices[i] = new PosNormalTexTanSkinned(
+                new Vector3(vertex.X, vertex.Y, vertex.Z),
+                new Vector3(vertex.normX, vertex.normY, vertex.normZ),
+                new Vector2(vertex.texU, vertex.texV),
+                new Vector3(vertex.tanX, vertex.tanY, vertex.tanZ),
+                new Vector4(
+                  vertex.boneWeight1,
+                  vertex.boneWeight2,
+                  vertex.boneWeight3,
+                  vertex.boneWeight4
+                ),
+                JbaBoneIndexByte(vertex.boneIndex1),
+                JbaBoneIndexByte(vertex.boneIndex2),
+                JbaBoneIndexByte(vertex.boneIndex3),
+                JbaBoneIndexByte(vertex.boneIndex4)
+              );
+            }
+
+            BufferDescription skinVbd = new BufferDescription(
+              PosNormalTexTanSkinned.Stride * gpuVertices.Length,
+              ResourceUsage.Immutable,
+              BindFlags.VertexBuffer,
+              CpuAccessFlags.None,
+              ResourceOptionFlags.None,
+              0
+            );
+
+            _jbaGpuVertexBuffers[mesh] = new Buffer(
+              Device,
+              new DataStream(gpuVertices, false, false),
+              skinVbd
+            );
+          }
+
           UInt16[] indexArray = mesh.meshVertIndex.Select(
             GR2_Mesh_Vertex_Index => GR2_Mesh_Vertex_Index.index
           ).ToArray();
@@ -123,11 +326,18 @@ namespace PugTools {
         _model.Dispose();
       }
       Util.ReleaseCom(ref _jbaBoneBuffer);
+      ReleaseJbaGpuVertexBuffers();
       _jbaAnimation = null;
       _jbaRig = null;
       _jbaSkinMatrices.Clear();
+      ReleaseJbaGpuVertexBuffers();
+      _jbaPaletteCache.Clear();
+      _jbaSkinnedCache.Clear();
       _jbaFrame = -1;
       _jbaBoneVertexCount = 0;
+      _jbaBoneBufferCapacity = 0;
+      _jbaBoneVertices = null;
+      _showSkeleton = false;
       if (_jbaMaterial != null) {
         Util.ReleaseCom(ref _jbaMaterial.diffuseSRV);
         Util.ReleaseCom(ref _jbaMaterial.rotationSRV);
@@ -162,12 +372,24 @@ namespace PugTools {
           }
 
           Util.ReleaseCom(ref _jbaBoneBuffer);
+          ReleaseJbaGpuVertexBuffers();
+          _jbaPaletteCache.Clear();
+          _jbaSkinnedCache.Clear();
+
           if (_jbaMaterial != null) {
             Util.ReleaseCom(ref _jbaMaterial.diffuseSRV);
             Util.ReleaseCom(ref _jbaMaterial.rotationSRV);
             Util.ReleaseCom(ref _jbaMaterial.glossSRV);
             _jbaMaterial = null;
           }
+
+          Util.ReleaseCom(ref _jbaLabelBuffer);
+          Util.ReleaseCom(ref _jbaLabelTexture);
+          _jbaLabelVertices = null;
+          _jbaLabelUvRects = null;
+          _jbaLabelPixelSizes = null;
+          _jbaLabelBufferCapacity = 0;
+          _jbaLabelVertexCount = 0;
 
           Effects.DestroyAll();
           InputLayouts.DestroyAll();
@@ -305,10 +527,11 @@ namespace PugTools {
       )
     : 0;
 
+        // GPU skinning only uploads bone matrices. Rebuild the pose every
+        // render frame while playing so JBA frame-to-frame interpolation is
+        // visible instead of snapping at the source FPS.
         if (_jbaPlaying
-    || _jbaBoneBuffer == null
-    || expectedFrame != _jbaFrame) {
-
+            || expectedFrame != _jbaFrame) {
           RebuildAnimationSkeletonBuffer();
         }
       }
@@ -358,24 +581,70 @@ namespace PugTools {
       foreach (GR2_Mesh mesh in _model.meshes) {
         if (mesh.meshName.Contains("collision")) continue;
 
-        foreach (GR2_Mesh_Piece piece in mesh.meshPieces) {
-          ImmediateContext.InputAssembler.SetVertexBuffers(0, new VertexBufferBinding(
+        Boolean gpuSkinned = PrepareGpuSkinning(
+          mesh,
+          out Buffer drawVertexBuffer
+        );
+
+        if (gpuSkinned) {
+          ImmediateContext.InputAssembler.InputLayout =
+            InputLayouts.PosNormalTexTanSkinned;
+
+          ImmediateContext.InputAssembler.SetVertexBuffers(
+            0,
+            new VertexBufferBinding(
+              drawVertexBuffer,
+              PosNormalTexTanSkinned.Stride,
+              0
+            )
+          );
+        }
+        else {
+          ImmediateContext.InputAssembler.InputLayout =
+            InputLayouts.PosNormalTexTan;
+
+          ImmediateContext.InputAssembler.SetVertexBuffers(
+            0,
+            new VertexBufferBinding(
               mesh.vertBuffer,
               PosNormalTexTan.Stride,
               0
             )
           );
-          ImmediateContext.InputAssembler.SetIndexBuffer(mesh.idxBuffer, Format.R16_UInt, 0);
+        }
+
+        ImmediateContext.InputAssembler.SetIndexBuffer(
+          mesh.idxBuffer,
+          Format.R16_UInt,
+          0
+        );
+
+        foreach (GR2_Mesh_Piece piece in mesh.meshPieces) {
+          EffectTechnique pieceTech = activeTech;
 
           if (piece.matId >= 0 && piece.matId < _model.materials.Count) {
-            activeTech = ApplyMaterial(_model.materials[piece.matId], activeTech);
-          } else if (_model.materials.Count > 0) {
-            activeTech = ApplyMaterial(_model.materials[0], activeTech);
-          } else if (_jbaMaterial != null) {
-            activeTech = ApplyMaterial(_jbaMaterial, activeTech);
+            pieceTech = ApplyMaterial(
+              _model.materials[piece.matId],
+              pieceTech
+            );
+          }
+          else if (_model.materials.Count > 0) {
+            pieceTech = ApplyMaterial(
+              _model.materials[0],
+              pieceTech
+            );
+          }
+          else if (_jbaMaterial != null) {
+            pieceTech = ApplyMaterial(
+              _jbaMaterial,
+              pieceTech
+            );
           }
 
-          activeTech.GetPassByIndex(0).Apply(ImmediateContext);
+          if (gpuSkinned)
+            pieceTech = GetGpuSkinnedTechnique(pieceTech);
+
+          pieceTech.GetPassByIndex(0).Apply(ImmediateContext);
 
           ImmediateContext.DrawIndexed(
             ((Int32)piece.numPieceFaces) * 3,
@@ -385,7 +654,10 @@ namespace PugTools {
         }
       }
 
-      //DrawAnimationSkeleton(activeTech);
+      if (_showSkeleton) {
+        DrawAnimationSkeleton(activeTech);
+        DrawAnimationSkeletonLabels();
+      }
 
       SwapChain.Present(1, PresentFlags.None);
 
@@ -405,10 +677,14 @@ namespace PugTools {
       }
       InputLayouts.InitAll(Device);
       RenderStates.InitAll(Device);
+
       return true;
     }
     internal void LoadModel(GR2 model = null) {
       if (model != null) _model = model;
+
+      _jbaPaletteCache.Clear();
+      _jbaSkinnedCache.Clear();
 
       _globalBoxMin = new Vector3(
         model.globalBox.minX,
@@ -447,14 +723,49 @@ namespace PugTools {
 
       BuildGeometry();
     }
-    internal void LoadAnimation(JBAAnimation animation, JBARig rig = null) {
+    internal void LoadAnimation(
+      JBAAnimation animation,
+      JBARig rig = null,
+      JBAAnimation baseAnimation = null,
+      JBARig baseRig = null,
+      Boolean additive = false
+    ) {
+      _jbaPlaybackClock.Stop();
       _jbaRig = rig;
       _jbaAnimation = animation;
+      _jbaIsAdditive = additive && animation != null;
+      _jbaBaseAnimation = _jbaIsAdditive ? baseAnimation : null;
+      _jbaBaseRig = _jbaIsAdditive ? baseRig : null;
+
+      // Front-load discrete JBA decoding once. Playback then interpolates
+      // between cached source frames without allocating a new pose per redraw.
+      if (_jbaAnimation != null)
+        _jbaAnimation.PrepareSamples();
+      if (_jbaBaseAnimation != null)
+        _jbaBaseAnimation.PrepareSamples();
+
       _jbaTime = 0.0F;
+      _jbaBaseTime = 0.0F;
       _jbaFrame = -1;
+      _jbaPlaybackStartTime = 0.0;
+      _jbaBasePlaybackStartTime = 0.0;
       _jbaPlaying = animation != null;
       Util.ReleaseCom(ref _jbaBoneBuffer);
       _jbaBoneVertexCount = 0;
+      _jbaBoneBufferCapacity = 0;
+      _jbaBoneVertices = null;
+      _showSkeleton = false;
+
+      Util.ReleaseCom(ref _jbaLabelBuffer);
+      Util.ReleaseCom(ref _jbaLabelTexture);
+      _jbaLabelVertices = null;
+      _jbaLabelUvRects = null;
+      _jbaLabelPixelSizes = null;
+      _jbaLabelBufferCapacity = 0;
+      _jbaLabelVertexCount = 0;
+
+      BuildJbaBindingCache();
+      BuildAnimationSkeletonLabelAtlas();
 
       if (_jbaMaterial == null) {
         try {
@@ -471,26 +782,119 @@ namespace PugTools {
     internal Single AnimationLength => _jbaAnimation?.Length ?? 0.0F;
     internal Int32 AnimationFrame => _jbaFrame < 0 ? 0 : _jbaFrame;
     internal Int32 AnimationFrameCount => _jbaAnimation?.FrameCount ?? 1;
+    internal Int32 AnimationBoundSkeletonBoneCount => _jbaBoundSkeletonBoneCount;
+    internal Int32 AnimationBoundChannelCount => _jbaBoundChannelCount;
+    internal Int32 AnimationSkeletonBoneCount => _model?.skeleton_bones?.Count ?? 0;
+    internal Int32 AnimationBaseBoundSkeletonBoneCount => _jbaBaseBoundSkeletonBoneCount;
+    internal Int32 AnimationBaseBoundChannelCount => _jbaBaseBoundChannelCount;
+    internal Boolean ShowSkeleton => _showSkeleton;
+
+    internal void SetShowSkeleton(Boolean show) {
+      _showSkeleton = show;
+
+      // Force one pose rebuild when enabling the overlay while paused. The
+      // render thread owns the D3D buffers, so the UI thread only flips this
+      // flag/frame marker and never touches ImmediateContext directly.
+      if (show)
+        _jbaFrame = -1;
+      else
+        _jbaBoneVertexCount = 0;
+    }
 
     internal void PlayAnimation() {
       if (_jbaAnimation == null) return;
-      if (_jbaTime >= _jbaAnimation.Length)
+
+      if (_jbaTime >= _jbaAnimation.Length) {
         _jbaTime = 0.0F;
+        _jbaBaseTime = 0.0F;
+      }
+
+      _jbaPlaybackStartTime = _jbaTime;
+      _jbaBasePlaybackStartTime = _jbaBaseTime;
+      _jbaPlaybackClock.Restart();
       _jbaPlaying = true;
     }
 
     internal void PauseAnimation() {
+      UpdateJbaPlaybackTime();
       _jbaPlaying = false;
+      _jbaPlaybackClock.Stop();
+      _jbaPlaybackStartTime = _jbaTime;
+      _jbaBasePlaybackStartTime = _jbaBaseTime;
     }
 
     internal void StopAnimation() {
       _jbaPlaying = false;
+      _jbaPlaybackClock.Reset();
+      _jbaPlaybackStartTime = 0.0;
+      _jbaBasePlaybackStartTime = 0.0;
       _jbaTime = 0.0F;
+      _jbaBaseTime = 0.0F;
       _jbaFrame = -1;
     }
 
     internal void SetAnimationLoop(Boolean loop) {
+      Boolean clockWasRunning = _jbaPlaybackClock.IsRunning;
+      if (clockWasRunning)
+        UpdateJbaPlaybackTime();
+
       _jbaLoop = loop;
+      _jbaPlaybackStartTime = _jbaTime;
+      _jbaBasePlaybackStartTime = _jbaBaseTime;
+
+      if (_jbaPlaying && clockWasRunning)
+        _jbaPlaybackClock.Restart();
+    }
+
+    private void UpdateJbaPlaybackTime() {
+      if (!_jbaPlaying
+          || _jbaAnimation == null
+          || _jbaAnimation.Length <= 0.0F) {
+        return;
+      }
+
+      // LoadAnimation is called before the render thread starts. Start the
+      // wall clock on the first actual render update so file/material loading
+      // time is not counted as animation time.
+      if (!_jbaPlaybackClock.IsRunning) {
+        _jbaPlaybackStartTime = _jbaTime;
+        _jbaBasePlaybackStartTime = _jbaBaseTime;
+        _jbaPlaybackClock.Restart();
+        return;
+      }
+
+      Double elapsed = _jbaPlaybackClock.Elapsed.TotalSeconds;
+      Double time = _jbaPlaybackStartTime + elapsed;
+      Double length = _jbaAnimation.Length;
+
+      if (_jbaLoop) {
+        time %= length;
+        if (time < 0.0)
+          time += length;
+      }
+      else if (time >= length) {
+        time = length;
+        _jbaPlaying = false;
+        _jbaPlaybackClock.Stop();
+      }
+
+      _jbaTime = (Single)time;
+
+      // Morpheme layers keep independent clocks. The base idle continues to
+      // loop on its own period even when the overlay has a different FPS or
+      // duration; deriving this from the overlay frame/time would slowly drift
+      // and then jump at every overlay loop.
+      if (_jbaIsAdditive
+          && _jbaBaseAnimation != null
+          && _jbaBaseAnimation.Length > 0.0F) {
+
+        Double baseTime = _jbaBasePlaybackStartTime + elapsed;
+        Double baseLength = _jbaBaseAnimation.Length;
+        baseTime %= baseLength;
+        if (baseTime < 0.0)
+          baseTime += baseLength;
+        _jbaBaseTime = (Single)baseTime;
+      }
     }
 
     private static Vector3 BoneBindPosition(GR2_Bone_Skeleton bone) {
@@ -511,7 +915,12 @@ namespace PugTools {
             || mesh.meshBones.Count == 0)
           continue;
 
-        Matrix[] palette = new Matrix[mesh.meshBones.Count];
+        if (!_jbaPaletteCache.TryGetValue(mesh, out Matrix[] palette)
+            || palette.Length != mesh.meshBones.Count) {
+          palette = new Matrix[mesh.meshBones.Count];
+          _jbaPaletteCache[mesh] = palette;
+        }
+
         Int32 mappedPaletteBones = 0;
         for (Int32 i = 0; i < palette.Length; i++) {
           String boneName = CanonicalAnimationBoneName(
@@ -526,18 +935,12 @@ namespace PugTools {
           }
         }
 
-        if (_jbaPlaying && _jbaFrame <= 1) {
-          System.Diagnostics.Debug.WriteLine(
-            "JBA mesh palette: "
-            + mappedPaletteBones
-            + " / "
-            + palette.Length
-            + " mesh bones mapped for "
-            + mesh.meshName
-          );
-        }
 
-        PosNormalTexTan[] skinned = new PosNormalTexTan[mesh.meshVerts.Count];
+        if (!_jbaSkinnedCache.TryGetValue(mesh, out PosNormalTexTan[] skinned)
+            || skinned.Length != mesh.meshVerts.Count) {
+          skinned = new PosNormalTexTan[mesh.meshVerts.Count];
+          _jbaSkinnedCache[mesh] = skinned;
+        }
 
         for (Int32 i = 0; i < mesh.meshVerts.Count; i++) {
           GR2_Mesh_Vertex src = mesh.meshVerts[i];
@@ -560,36 +963,66 @@ namespace PugTools {
           Vector3 tan = Vector3.Zero;
           Single totalWeight = 0.0F;
 
-          Single[] weights = {
-            src.boneWeight1, src.boneWeight2, src.boneWeight3, src.boneWeight4
-          };
-          Single[] indices = {
-            src.boneIndex1, src.boneIndex2, src.boneIndex3, src.boneIndex4
-          };
+          // IMPORTANT: Do not allocate weight/index arrays here.
+          // This loop runs once for every vertex of every animation frame.
+          // The old code created TWO managed arrays per vertex, producing
+          // massive Gen0 GC pressure and visible periodic animation stalls.
+          Single weight;
+          Int32 boneIndex;
+          Matrix skin;
 
-          for (Int32 w = 0; w < 4; w++) {
-            Single weight = weights[w];
-            if (weight <= 0.00001F) continue;
+          weight = src.boneWeight1;
+          if (weight > 0.00001F) {
+            boneIndex = (Int32)Math.Round(src.boneIndex1 * 255.0F);
+            if (boneIndex >= 0 && boneIndex < palette.Length) {
+              skin = palette[boneIndex];
+              pos += Vector3.TransformCoordinate(originalPos, skin) * weight;
+              totalWeight += weight;
+            }
+          }
 
-            Int32 boneIndex = (Int32)Math.Round(indices[w] * 255.0F);
-            if (boneIndex < 0 || boneIndex >= palette.Length) continue;
+          weight = src.boneWeight2;
+          if (weight > 0.00001F) {
+            boneIndex = (Int32)Math.Round(src.boneIndex2 * 255.0F);
+            if (boneIndex >= 0 && boneIndex < palette.Length) {
+              skin = palette[boneIndex];
+              pos += Vector3.TransformCoordinate(originalPos, skin) * weight;
+              totalWeight += weight;
+            }
+          }
 
-            Matrix skin = palette[boneIndex];
-            pos += Vector3.TransformCoordinate(originalPos, skin) * weight;
-            norm += Vector3.TransformNormal(originalNormal, skin) * weight;
-            tan += Vector3.TransformNormal(originalTangent, skin) * weight;
-            totalWeight += weight;
+          weight = src.boneWeight3;
+          if (weight > 0.00001F) {
+            boneIndex = (Int32)Math.Round(src.boneIndex3 * 255.0F);
+            if (boneIndex >= 0 && boneIndex < palette.Length) {
+              skin = palette[boneIndex];
+              pos += Vector3.TransformCoordinate(originalPos, skin) * weight;
+              totalWeight += weight;
+            }
+          }
+
+          weight = src.boneWeight4;
+          if (weight > 0.00001F) {
+            boneIndex = (Int32)Math.Round(src.boneIndex4 * 255.0F);
+            if (boneIndex >= 0 && boneIndex < palette.Length) {
+              skin = palette[boneIndex];
+              pos += Vector3.TransformCoordinate(originalPos, skin) * weight;
+              totalWeight += weight;
+            }
           }
 
           if (totalWeight <= 0.00001F) {
             pos = originalPos;
-            norm = originalNormal;
-            tan = originalTangent;
           } else if (Math.Abs(totalWeight - 1.0F) > 0.0001F) {
             pos /= totalWeight;
-            norm /= totalWeight;
-            tan /= totalWeight;
           }
+
+          // Fast preview path: keep the original vertex basis. Updating
+          // normals/tangents through up to four skin matrices costs roughly
+          // twice as much as the position skinning itself and is not required
+          // for a usable animation preview.
+          norm = originalNormal;
+          tan = originalTangent;
 
           if (norm.LengthSquared() > 0.000001F) norm.Normalize();
           if (tan.LengthSquared() > 0.000001F) tan.Normalize();
@@ -663,6 +1096,345 @@ namespace PugTools {
       catch {
         return Matrix.Identity;
       }
+    }
+
+    // Jedipedia's jbaSkeletonBindLocals() extracts only rotation and
+    // translation from a GR2 bind-local before using it as an animation local.
+    // This is important for humanoid face/helper bones: exporter scale/shear in
+    // the bind matrix belongs to the inverse-bind relation, not to the animated
+    // local chain. Carrying that scale forward every frame crumples the head.
+    // Keep the exact bind-world separately for inverse skinning; pose locals are
+    // deliberately rigid transforms.
+    private static Matrix HeroToMorphemeBasis() {
+      // Row-vector form of Jedipedia's morphemeSpaceMatrix. Hero/GR2 uses
+      // decametres with Y-up; Morpheme/JBA uses centimetres with Z-up.
+      return new Matrix {
+        M11 = 1000.0F,
+        M23 = 1000.0F,
+        M32 = -1000.0F,
+        M44 = 1.0F
+      };
+    }
+
+    private static Matrix MorphemeToHeroBasis() {
+      return new Matrix {
+        M11 = 0.001F,
+        M23 = -0.001F,
+        M32 = 0.001F,
+        M44 = 1.0F
+      };
+    }
+
+    // Jedipedia's jbaSkeletonBindLocals() FIRST converts the complete GR2
+    // parent-relative matrix into Morpheme space and only THEN calls the
+    // version of gl-matrix mat4.getRotation() shipped with the reader.
+    //
+    // A subtle but important detail: that old gl-matrix implementation does
+    // NOT perform a Matrix.Decompose(), does NOT orthogonalize scale/shear and
+    // does NOT normalize the resulting quaternion. SlimDX Decompose therefore
+    // produces a different bind rotation for exporter matrices that contain
+    // scale/shear. Most creature rigs hide the difference; Ithorian does not.
+    //
+    // This is the row-vector/transposed equivalent of the exact gl-matrix
+    // getRotation() formula used by Jedipedia.
+    private static Boolean TryJedipediaBindRotation(
+      Matrix matrix,
+      out SlimDX.Quaternion rotation
+    ) {
+      rotation = SlimDX.Quaternion.Identity;
+
+      Single m00 = matrix.M11;
+      Single m11 = matrix.M22;
+      Single m22 = matrix.M33;
+      Single trace = m00 + m11 + m22;
+      Single scale;
+
+      try {
+        if (trace > 0.0F) {
+          scale = 2.0F * (Single)Math.Sqrt(trace + 1.0F);
+          if (Math.Abs(scale) <= 0.0000001F) return false;
+
+          rotation.W = 0.25F * scale;
+          rotation.X = (matrix.M23 - matrix.M32) / scale;
+          rotation.Y = (matrix.M31 - matrix.M13) / scale;
+          rotation.Z = (matrix.M12 - matrix.M21) / scale;
+        }
+        else if (m00 > m11 && m00 > m22) {
+          scale = 2.0F * (Single)Math.Sqrt(1.0F + m00 - m11 - m22);
+          if (Math.Abs(scale) <= 0.0000001F) return false;
+
+          rotation.W = (matrix.M23 - matrix.M32) / scale;
+          rotation.X = 0.25F * scale;
+          rotation.Y = (matrix.M12 + matrix.M21) / scale;
+          rotation.Z = (matrix.M31 + matrix.M13) / scale;
+        }
+        else if (m11 > m22) {
+          scale = 2.0F * (Single)Math.Sqrt(1.0F + m11 - m00 - m22);
+          if (Math.Abs(scale) <= 0.0000001F) return false;
+
+          rotation.W = (matrix.M31 - matrix.M13) / scale;
+          rotation.X = (matrix.M12 + matrix.M21) / scale;
+          rotation.Y = 0.25F * scale;
+          rotation.Z = (matrix.M23 + matrix.M32) / scale;
+        }
+        else {
+          scale = 2.0F * (Single)Math.Sqrt(1.0F + m22 - m00 - m11);
+          if (Math.Abs(scale) <= 0.0000001F) return false;
+
+          rotation.W = (matrix.M12 - matrix.M21) / scale;
+          rotation.X = (matrix.M31 + matrix.M13) / scale;
+          rotation.Y = (matrix.M23 + matrix.M32) / scale;
+          rotation.Z = 0.25F * scale;
+        }
+      }
+      catch {
+        return false;
+      }
+
+      return Single.IsFinite(rotation.X)
+        && Single.IsFinite(rotation.Y)
+        && Single.IsFinite(rotation.Z)
+        && Single.IsFinite(rotation.W);
+    }
+
+    private static Matrix JedipediaRotationMatrix(
+      SlimDX.Quaternion rotation
+    ) {
+      // Exact gl-matrix mat4.fromQuat()/fromRotationTranslation() 3x3,
+      // transposed into SlimDX row-vector storage. This deliberately consumes
+      // a non-unit quaternion verbatim.
+      Single x = rotation.X;
+      Single y = rotation.Y;
+      Single z = rotation.Z;
+      Single w = rotation.W;
+      Single x2 = x + x;
+      Single y2 = y + y;
+      Single z2 = z + z;
+      Single xx = x * x2;
+      Single xy = x * y2;
+      Single xz = x * z2;
+      Single yy = y * y2;
+      Single yz = y * z2;
+      Single zz = z * z2;
+      Single wx = w * x2;
+      Single wy = w * y2;
+      Single wz = w * z2;
+
+      return new Matrix {
+        M11 = 1.0F - (yy + zz),
+        M12 = xy + wz,
+        M13 = xz - wy,
+        M14 = 0.0F,
+
+        M21 = xy - wz,
+        M22 = 1.0F - (xx + zz),
+        M23 = yz + wx,
+        M24 = 0.0F,
+
+        M31 = xz + wy,
+        M32 = yz - wx,
+        M33 = 1.0F - (xx + yy),
+        M34 = 0.0F,
+
+        M41 = 0.0F,
+        M42 = 0.0F,
+        M43 = 0.0F,
+        M44 = 1.0F
+      };
+    }
+
+    private static Matrix RigidAnimationLocal(Matrix matrix) {
+      Matrix heroToMorpheme = HeroToMorphemeBasis();
+      Matrix morphemeToHero = MorphemeToHeroBasis();
+      Matrix temp;
+      Matrix morpheme;
+
+      // Row-vector transpose of Jedipedia:
+      //   localM = H2M_col * localH_col * M2H_col
+      // becomes
+      //   localM_row = M2H_row * localH_row * H2M_row.
+      Matrix.Multiply(ref morphemeToHero, ref matrix, out temp);
+      Matrix.Multiply(ref temp, ref heroToMorpheme, out morpheme);
+
+      if (!TryJedipediaBindRotation(
+            morpheme,
+            out SlimDX.Quaternion rotation)) {
+        return matrix;
+      }
+
+      // mat4.getTranslation() is simply elements 12/13/14. In SlimDX's
+      // transposed row-vector representation those are M41/M42/M43.
+      Vector3 translation = new Vector3(
+        morpheme.M41,
+        morpheme.M42,
+        morpheme.M43
+      );
+
+      if (!Single.IsFinite(translation.X)
+          || !Single.IsFinite(translation.Y)
+          || !Single.IsFinite(translation.Z)) {
+        return matrix;
+      }
+
+      // Deliberately do NOT normalize `rotation`: Jedipedia's gl-matrix 2.x
+      // getRotation() does not either, and mat4.fromRotationTranslation()
+      // consumes that quaternion verbatim.
+      Matrix rigidMorpheme = JedipediaRotationMatrix(rotation);
+      rigidMorpheme.M41 = translation.X;
+      rigidMorpheme.M42 = translation.Y;
+      rigidMorpheme.M43 = translation.Z;
+      rigidMorpheme.M44 = 1.0F;
+
+      // Convert the extracted animation-local representation back to Hero
+      // row-vector space so the existing renderer can keep its proven
+      // skinning path (inverseBind * animatedWorld).
+      Matrix rigidHeroTemp;
+      Matrix rigidHero;
+      Matrix.Multiply(
+        ref heroToMorpheme,
+        ref rigidMorpheme,
+        out rigidHeroTemp
+      );
+      Matrix.Multiply(
+        ref rigidHeroTemp,
+        ref morphemeToHero,
+        out rigidHero
+      );
+      return rigidHero;
+    }
+
+    private static System.Numerics.Quaternion JbaQuatMultiply(
+      System.Numerics.Quaternion a,
+      System.Numerics.Quaternion b
+    ) {
+      // gl-matrix quat.mul(out, a, b), copied component-for-component.  Do not
+      // normalize: bind quaternions recovered by mat4.getRotation() can be
+      // non-unit when the source matrix contains scale/shear.
+      return new System.Numerics.Quaternion(
+        a.X * b.W + a.W * b.X + a.Y * b.Z - a.Z * b.Y,
+        a.Y * b.W + a.W * b.Y + a.Z * b.X - a.X * b.Z,
+        a.Z * b.W + a.W * b.Z + a.X * b.Y - a.Y * b.X,
+        a.W * b.W - a.X * b.X - a.Y * b.Y - a.Z * b.Z
+      );
+    }
+
+    private static System.Numerics.Vector3 JbaTransformQuat(
+      System.Numerics.Vector3 v,
+      System.Numerics.Quaternion q
+    ) {
+      // Exact gl-matrix vec3.transformQuat() arithmetic.  In particular this
+      // deliberately does not normalize q before transforming the vector.
+      Single x = v.X;
+      Single y = v.Y;
+      Single z = v.Z;
+      Single qx = q.X;
+      Single qy = q.Y;
+      Single qz = q.Z;
+      Single qw = q.W;
+
+      Single ix = qw * x + qy * z - qz * y;
+      Single iy = qw * y + qz * x - qx * z;
+      Single iz = qw * z + qx * y - qy * x;
+      Single iw = -qx * x - qy * y - qz * z;
+
+      return new System.Numerics.Vector3(
+        ix * qw + iw * -qx + iy * -qz - iz * -qy,
+        iy * qw + iw * -qy + iz * -qx - ix * -qz,
+        iz * qw + iw * -qz + ix * -qy - iy * -qx
+      );
+    }
+
+    private static Boolean JbaFinite(System.Numerics.Quaternion q) {
+      return Single.IsFinite(q.X)
+        && Single.IsFinite(q.Y)
+        && Single.IsFinite(q.Z)
+        && Single.IsFinite(q.W);
+    }
+
+    private static Boolean JbaFinite(System.Numerics.Vector3 v) {
+      return Single.IsFinite(v.X)
+        && Single.IsFinite(v.Y)
+        && Single.IsFinite(v.Z);
+    }
+
+    private static System.Numerics.Quaternion JbaSampleQuaternion(
+      JBATransform sample
+    ) {
+      System.Numerics.Quaternion q = sample.Rotation;
+      if (!JbaFinite(q) || q.LengthSquared() <= 0.000001F)
+        return System.Numerics.Quaternion.Identity;
+
+      // jba-read.js normalizes every decoded key.  SampleInto() also slerps
+      // normalized endpoints, so this is normally a no-op but protects the
+      // pose path from malformed data exactly where Jedipedia would have a
+      // normalized quaternion.
+      return System.Numerics.Quaternion.Normalize(q);
+    }
+
+    private static Matrix JbaMorphemePoseToHero(
+      System.Numerics.Quaternion rotation,
+      System.Numerics.Vector3 translation
+    ) {
+      SlimDX.Quaternion slimRotation = new SlimDX.Quaternion(
+        rotation.X,
+        rotation.Y,
+        rotation.Z,
+        rotation.W
+      );
+
+      Matrix morpheme = JedipediaRotationMatrix(slimRotation);
+      morpheme.M41 = translation.X;
+      morpheme.M42 = translation.Y;
+      morpheme.M43 = translation.Z;
+      morpheme.M44 = 1.0F;
+
+      // Transpose-equivalent of Jedipedia jbaPoseMatrices():
+      //   heroCol = B^-1 * morphemeCol * B
+      // becomes, for SlimDX row vectors,
+      //   heroRow = B^T * morphemeRow * (B^-1)^T.
+      Matrix heroToMorpheme = HeroToMorphemeBasis();
+      Matrix morphemeToHero = MorphemeToHeroBasis();
+      Matrix temp;
+      Matrix hero;
+      Matrix.Multiply(ref heroToMorpheme, ref morpheme, out temp);
+      Matrix.Multiply(ref temp, ref morphemeToHero, out hero);
+      return hero;
+    }
+
+    private static Boolean TryJbaBindLocalMorpheme(
+      Matrix heroBindLocal,
+      out System.Numerics.Quaternion rotation,
+      out System.Numerics.Vector3 translation
+    ) {
+      rotation = System.Numerics.Quaternion.Identity;
+      translation = System.Numerics.Vector3.Zero;
+
+      Matrix heroToMorpheme = HeroToMorphemeBasis();
+      Matrix morphemeToHero = MorphemeToHeroBasis();
+      Matrix temp;
+      Matrix morpheme;
+      Matrix.Multiply(ref morphemeToHero, ref heroBindLocal, out temp);
+      Matrix.Multiply(ref temp, ref heroToMorpheme, out morpheme);
+
+      if (!TryJedipediaBindRotation(
+            morpheme,
+            out SlimDX.Quaternion bindRotation)) {
+        return false;
+      }
+
+      rotation = new System.Numerics.Quaternion(
+        bindRotation.X,
+        bindRotation.Y,
+        bindRotation.Z,
+        bindRotation.W
+      );
+      translation = new System.Numerics.Vector3(
+        morpheme.M41,
+        morpheme.M42,
+        morpheme.M43
+      );
+
+      return JbaFinite(rotation) && JbaFinite(translation);
     }
 
     private static SlimDX.Quaternion MorphemeRotationToHero(
@@ -739,15 +1511,653 @@ namespace PugTools {
       );
     }
 
-    private static SlimDX.Quaternion JbaModelSpaceTurn() {
-      // Jedipedia MPH_MODEL_SPACE_ROTATION = quat(0, 0, 1, 0).
-      // The clip starts below the exporter root, so every newly-driven root
-      // gets this 180 degree Morpheme-Z turn once.
-      return new SlimDX.Quaternion(0.0F, 0.0F, 1.0F, 0.0F);
+    private static void BuildChannelBinding(
+      JBAAnimation animation,
+      JBARig rig,
+      IList<GR2_Bone_Skeleton> skeleton,
+      out Int32[] skeletonToChannel,
+      out Boolean[] useBindTranslation
+    ) {
+      Int32 skeletonCount = skeleton?.Count ?? 0;
+      skeletonToChannel = new Int32[skeletonCount];
+      useBindTranslation = new Boolean[skeletonCount];
+
+      for (Int32 i = 0; i < skeletonCount; i++)
+        skeletonToChannel[i] = -1;
+
+      if (animation == null || skeleton == null)
+        return;
+
+      Int32 sampleCount = Math.Max(0, animation.BoneCount);
+      Dictionary<String, Int32> channelByName =
+        new Dictionary<String, Int32>(
+          StringComparer.OrdinalIgnoreCase
+        );
+
+      // Jedipedia treats names already attached to the JBA as authoritative.
+      // That includes both creature clips that self-name and names recovered
+      // from an AMX sidecar. Once those exist it does NOT layer an MPH mapping
+      // on top; doing so can bind one channel to two different skeleton bones
+      // when the shared MPH rig and AMX list differ.
+      Boolean hasAuthoritativeNames = animation.BoneNames != null
+        && animation.BoneNames
+          .Take(Math.Min(animation.BoneNames.Count, sampleCount))
+          .Any(name => !String.IsNullOrWhiteSpace(name)
+            && !name.StartsWith(
+                 "bone_",
+                 StringComparison.OrdinalIgnoreCase));
+
+      // For unnamed 64-bit clips, recover names from the exact RigToAnimMap.
+      if (!hasAuthoritativeNames
+          && rig != null
+          && rig.Bones != null
+          && rig.AnimToRig != null) {
+
+        for (Int32 channel = 0;
+             channel < rig.AnimToRig.Length;
+             channel++) {
+
+          Int32 rigIndex = rig.AnimToRig[channel];
+          if (rigIndex < 0 || rigIndex >= rig.Bones.Count)
+            continue;
+
+          String name = CanonicalAnimationBoneName(
+            rig.Bones[rigIndex].Name
+          );
+
+          if (!String.IsNullOrWhiteSpace(name))
+            channelByName[name] = channel;
+        }
+      }
+
+      if (hasAuthoritativeNames) {
+        Int32 namedCount = Math.Min(
+          animation.BoneNames.Count,
+          sampleCount
+        );
+
+        for (Int32 channel = 0; channel < namedCount; channel++) {
+          String name = animation.BoneNames[channel];
+
+          if (String.IsNullOrWhiteSpace(name)
+              || name.StartsWith(
+                   "bone_",
+                   StringComparison.OrdinalIgnoreCase)) {
+            continue;
+          }
+
+          name = CanonicalAnimationBoneName(name);
+          channelByName[name] = channel;
+        }
+      }
+
+      for (Int32 i = 0; i < skeletonCount; i++) {
+        String name = CanonicalAnimationBoneName(
+          skeleton[i].boneName
+        );
+
+        if (channelByName.TryGetValue(name, out Int32 channel)
+            && channel >= 0
+            && channel < sampleCount) {
+
+          skeletonToChannel[i] = channel;
+          useBindTranslation[i] =
+            animation.UsesRigBindTranslation(channel);
+        }
+      }
+    }
+
+    private void BuildJbaBindingCache() {
+      _jbaPoseSamples = null;
+      _jbaSkeletonToChannel = null;
+      _jbaUseBindTranslation = null;
+      _jbaBoundSkeletonBoneCount = 0;
+      _jbaBoundChannelCount = 0;
+      _jbaBaseBoundSkeletonBoneCount = 0;
+      _jbaBaseBoundChannelCount = 0;
+      _jbaBasePoseSamples = null;
+      _jbaBaseSkeletonToChannel = null;
+      _jbaBaseUseBindTranslation = null;
+      _jbaBindLocal = null;
+      _jbaBindLocalFull = null;
+      _jbaInverseBind = null;
+      _jbaCurrentWorld = null;
+      _jbaCurrentValid = null;
+      _jbaBindRotationMorpheme = null;
+      _jbaBindTranslationMorpheme = null;
+      _jbaWorldRotationMorpheme = null;
+      _jbaWorldTranslationMorpheme = null;
+      _jbaSkinMatrices.Clear();
+
+      if (_jbaAnimation == null || _model == null)
+        return;
+
+      IList<GR2_Bone_Skeleton> skeleton = _model.skeleton_bones;
+      if (skeleton == null || skeleton.Count == 0)
+        return;
+
+      _jbaPoseSamples = new JBATransform[
+        Math.Max(0, _jbaAnimation.BoneCount)
+      ];
+
+      if (_jbaIsAdditive && _jbaBaseAnimation != null) {
+        _jbaBasePoseSamples = new JBATransform[
+          Math.Max(0, _jbaBaseAnimation.BoneCount)
+        ];
+      }
+
+      Int32 count = skeleton.Count;
+      _jbaBindLocal = new Matrix[count];
+      _jbaBindLocalFull = new Matrix[count];
+      _jbaInverseBind = new Matrix[count];
+      _jbaCurrentWorld = new Matrix[count];
+      _jbaCurrentValid = new Boolean[count];
+      _jbaBindRotationMorpheme = new System.Numerics.Quaternion[count];
+      _jbaBindTranslationMorpheme = new System.Numerics.Vector3[count];
+      _jbaWorldRotationMorpheme = new System.Numerics.Quaternion[count];
+      _jbaWorldTranslationMorpheme = new System.Numerics.Vector3[count];
+
+      // IMPORTANT: GR2_Bone_Skeleton already inverts BOTH matrices while
+      // reading them (FileHelpers.ReadMatrix(..., true)). The on-disk
+      // `rootToBone` is the inverse bind matrix, but `bone.root` here is
+      // therefore the BIND-WORLD matrix in SlimDX row-vector form.
+      //
+      // For row vectors:
+      //   bindWorld(child) = bindLocal(child) * bindWorld(parent)
+      //   bindLocal(child) = bindWorld(child) * inverse(bindWorld(parent))
+      //   skin             = inverse(bindWorld) * animatedWorld
+      for (Int32 i = 0; i < count; i++) {
+        GR2_Bone_Skeleton bone = skeleton[i];
+
+        Matrix bindWorld = bone.root;
+
+        // GR2_Bone_Skeleton now preserves the on-disk rootToBone.  That is
+        // already the exact inverse-bind matrix Jedipedia multiplies after the
+        // animated world transform, so never obtain it by inverting the
+        // already inverted `bone.root` a second time.
+        _jbaInverseBind[i] = bone.rootToBoneRaw;
+
+        Int32 parent = bone.parentBoneIndex;
+        Matrix bindLocal;
+
+        if (parent >= 0 && parent < i) {
+          Matrix parentInverseBind = skeleton[parent].rootToBoneRaw;
+          Matrix.Multiply(
+            ref bindWorld,
+            ref parentInverseBind,
+            out bindLocal
+          );
+        }
+        else {
+          bindLocal = bindWorld;
+        }
+
+        _jbaBindLocalFull[i] = bindLocal;
+        _jbaBindLocal[i] = RigidAnimationLocal(bindLocal);
+
+        if (!TryJbaBindLocalMorpheme(
+              bindLocal,
+              out _jbaBindRotationMorpheme[i],
+              out _jbaBindTranslationMorpheme[i])) {
+          // A malformed/non-invertible skeleton did not give Jedipedia a
+          // recoverable bind local either.  Keep a harmless identity entry;
+          // targetValid will still prevent non-finite data reaching the shader.
+          _jbaBindRotationMorpheme[i] = System.Numerics.Quaternion.Identity;
+          _jbaBindTranslationMorpheme[i] = System.Numerics.Vector3.Zero;
+        }
+      }
+
+      BuildChannelBinding(
+        _jbaAnimation,
+        _jbaRig,
+        skeleton,
+        out _jbaSkeletonToChannel,
+        out _jbaUseBindTranslation
+      );
+
+      if (_jbaSkeletonToChannel != null) {
+        HashSet<Int32> boundChannels = new HashSet<Int32>();
+        for (Int32 i = 0; i < _jbaSkeletonToChannel.Length; i++) {
+          Int32 channel = _jbaSkeletonToChannel[i];
+          if (channel < 0) continue;
+          _jbaBoundSkeletonBoneCount++;
+          boundChannels.Add(channel);
+        }
+        _jbaBoundChannelCount = boundChannels.Count;
+      }
+
+      if (_jbaIsAdditive && _jbaBaseAnimation != null) {
+        BuildChannelBinding(
+          _jbaBaseAnimation,
+          _jbaBaseRig,
+          skeleton,
+          out _jbaBaseSkeletonToChannel,
+          out _jbaBaseUseBindTranslation
+        );
+
+        HashSet<Int32> baseBoundChannels = new HashSet<Int32>();
+        for (Int32 i = 0; i < _jbaBaseSkeletonToChannel.Length; i++) {
+          Int32 channel = _jbaBaseSkeletonToChannel[i];
+          if (channel < 0) continue;
+          _jbaBaseBoundSkeletonBoneCount++;
+          baseBoundChannels.Add(channel);
+        }
+        _jbaBaseBoundChannelCount = baseBoundChannels.Count;
+      }
+      else {
+        _jbaBaseSkeletonToChannel = new Int32[count];
+        _jbaBaseUseBindTranslation = new Boolean[count];
+        for (Int32 i = 0; i < count; i++)
+          _jbaBaseSkeletonToChannel[i] = -1;
+      }
+    }
+
+    private void BuildJbaWorldPose(
+      IReadOnlyList<JBATransform> poseFrame,
+      Matrix[] targetWorld,
+      Boolean[] targetValid
+    ) {
+      IList<GR2_Bone_Skeleton> skeleton = _model?.skeleton_bones;
+
+      if (poseFrame == null
+          || skeleton == null
+          || _jbaSkeletonToChannel == null
+          || _jbaBindRotationMorpheme == null
+          || _jbaBindTranslationMorpheme == null
+          || _jbaWorldRotationMorpheme == null
+          || _jbaWorldTranslationMorpheme == null
+          || targetWorld == null
+          || targetValid == null) {
+        return;
+      }
+
+      Int32 count = Math.Min(
+        skeleton.Count,
+        Math.Min(targetWorld.Length, targetValid.Length)
+      );
+
+      // This is intentionally a literal C# translation of Jedipedia's
+      // jbaComposeWorld().  Do the hierarchy arithmetic as Morpheme
+      // quaternions/vectors and only create a matrix after the complete world
+      // pose is known.  The distinction is essential for bind quaternions
+      // recovered from scale/shear matrices: quat.mul() followed by one
+      // fromRotationTranslation() is not the same operation as multiplying a
+      // matrix per local when those quaternions are not unit length.
+      for (Int32 i = 0; i < count; i++) {
+        GR2_Bone_Skeleton bone = skeleton[i];
+        Int32 channel = _jbaSkeletonToChannel[i];
+        Boolean driven = channel >= 0 && channel < poseFrame.Count;
+
+        System.Numerics.Quaternion rotation;
+        System.Numerics.Vector3 translation;
+
+        if (driven) {
+          JBATransform sample = poseFrame[channel];
+          rotation = JbaSampleQuaternion(sample);
+
+          // Jedipedia's jbaRigTranslations() substitutes the target rig bind
+          // offset only for constant channels.  Otherwise it uses the decoded
+          // translation array verbatim (including TranslationBase on a block
+          // that stored no per-frame translation keys).
+          translation = _jbaUseBindTranslation[i]
+            ? _jbaBindTranslationMorpheme[i]
+            : sample.Translation;
+        }
+        else {
+          rotation = _jbaBindRotationMorpheme[i];
+          translation = _jbaBindTranslationMorpheme[i];
+        }
+
+        if (!JbaFinite(rotation) || !JbaFinite(translation)) {
+          targetValid[i] = false;
+          _jbaWorldRotationMorpheme[i] = System.Numerics.Quaternion.Identity;
+          _jbaWorldTranslationMorpheme[i] = System.Numerics.Vector3.Zero;
+          targetWorld[i] = Matrix.Identity;
+          continue;
+        }
+
+        Int32 parent = bone.parentBoneIndex;
+        Boolean parentDriven =
+          parent >= 0
+          && parent < i
+          && _jbaSkeletonToChannel[parent] >= 0;
+
+        if (parent >= 0
+            && parent < i
+            && targetValid[parent]
+            && (!driven || parentDriven)) {
+
+          System.Numerics.Quaternion parentRotation =
+            _jbaWorldRotationMorpheme[parent];
+
+          _jbaWorldRotationMorpheme[i] = JbaQuatMultiply(
+            parentRotation,
+            rotation
+          );
+          _jbaWorldTranslationMorpheme[i] =
+            JbaTransformQuat(translation, parentRotation)
+            + _jbaWorldTranslationMorpheme[parent];
+        }
+        else {
+          _jbaWorldRotationMorpheme[i] = rotation;
+          _jbaWorldTranslationMorpheme[i] = translation;
+        }
+
+        targetWorld[i] = JbaMorphemePoseToHero(
+          _jbaWorldRotationMorpheme[i],
+          _jbaWorldTranslationMorpheme[i]
+        );
+        targetValid[i] = true;
+      }
+    }
+
+    private static Matrix JbaRotationMatrix(JBATransform sample) {
+      System.Numerics.Quaternion nq = sample.Rotation;
+
+      if (!Single.IsFinite(nq.X)
+          || !Single.IsFinite(nq.Y)
+          || !Single.IsFinite(nq.Z)
+          || !Single.IsFinite(nq.W)
+          || nq.LengthSquared() <= 0.000001F) {
+        nq = System.Numerics.Quaternion.Identity;
+      }
+      else {
+        nq = System.Numerics.Quaternion.Normalize(nq);
+      }
+
+      return Matrix.RotationQuaternion(
+        MorphemeRotationToHero(nq)
+      );
+    }
+
+    private static Matrix RotationOnly(Matrix matrix) {
+      matrix.M41 = 0.0F;
+      matrix.M42 = 0.0F;
+      matrix.M43 = 0.0F;
+      matrix.M44 = 1.0F;
+      return matrix;
+    }
+
+    private void BuildJbaAdditiveWorldPose(
+      IReadOnlyList<JBATransform> overlayFrame,
+      IReadOnlyList<JBATransform> baseFrame,
+      Matrix[] targetWorld,
+      Boolean[] targetValid
+    ) {
+      IList<GR2_Bone_Skeleton> skeleton = _model?.skeleton_bones;
+
+      if (overlayFrame == null
+          || skeleton == null
+          || _jbaSkeletonToChannel == null
+          || _jbaBaseSkeletonToChannel == null
+          || _jbaBindRotationMorpheme == null
+          || _jbaBindTranslationMorpheme == null
+          || _jbaWorldRotationMorpheme == null
+          || _jbaWorldTranslationMorpheme == null
+          || targetWorld == null
+          || targetValid == null) {
+        return;
+      }
+
+      Int32 count = Math.Min(
+        skeleton.Count,
+        Math.Min(targetWorld.Length, targetValid.Length)
+      );
+
+      // Literal equivalent of jbaComposeAdditiveLocals() +
+      // jbaComposeWorld(): compose the additive LOCAL quaternion on the left,
+      // add its local translation, then walk the hierarchy in Morpheme space.
+      for (Int32 i = 0; i < count; i++) {
+        GR2_Bone_Skeleton bone = skeleton[i];
+
+        Int32 overlayChannel = _jbaSkeletonToChannel[i];
+        Boolean overlayDriven =
+          overlayChannel >= 0
+          && overlayChannel < overlayFrame.Count;
+
+        Int32 baseChannel = _jbaBaseSkeletonToChannel[i];
+        Boolean baseDriven =
+          baseFrame != null
+          && baseChannel >= 0
+          && baseChannel < baseFrame.Count;
+
+        System.Numerics.Quaternion baseRotation =
+          _jbaBindRotationMorpheme[i];
+        System.Numerics.Vector3 baseTranslation =
+          _jbaBindTranslationMorpheme[i];
+
+        if (baseDriven) {
+          JBATransform baseSample = baseFrame[baseChannel];
+          baseRotation = JbaSampleQuaternion(baseSample);
+          baseTranslation = _jbaBaseUseBindTranslation[i]
+            ? _jbaBindTranslationMorpheme[i]
+            : baseSample.Translation;
+        }
+
+        System.Numerics.Quaternion overlayRotation =
+          System.Numerics.Quaternion.Identity;
+        System.Numerics.Vector3 overlayTranslation =
+          System.Numerics.Vector3.Zero;
+
+        if (overlayDriven) {
+          JBATransform overlaySample = overlayFrame[overlayChannel];
+          overlayRotation = JbaSampleQuaternion(overlaySample);
+          // Additive translations are deltas.  Never substitute the rig's bind
+          // offset here, even when the delta channel is constant zero.
+          overlayTranslation = overlaySample.Translation;
+        }
+
+        System.Numerics.Quaternion localRotation =
+          overlayDriven
+            ? JbaQuatMultiply(overlayRotation, baseRotation)
+            : baseRotation;
+        System.Numerics.Vector3 localTranslation =
+          baseTranslation + overlayTranslation;
+
+        if (!JbaFinite(localRotation) || !JbaFinite(localTranslation)) {
+          targetValid[i] = false;
+          _jbaWorldRotationMorpheme[i] = System.Numerics.Quaternion.Identity;
+          _jbaWorldTranslationMorpheme[i] = System.Numerics.Vector3.Zero;
+          targetWorld[i] = Matrix.Identity;
+          continue;
+        }
+
+        Boolean driven = overlayDriven || baseDriven;
+        Int32 parent = bone.parentBoneIndex;
+        Boolean parentDriven = false;
+        if (parent >= 0 && parent < i) {
+          Boolean parentOverlayDriven = _jbaSkeletonToChannel[parent] >= 0;
+          Boolean parentBaseDriven = _jbaBaseSkeletonToChannel[parent] >= 0;
+          parentDriven = parentOverlayDriven || parentBaseDriven;
+        }
+
+        if (parent >= 0
+            && parent < i
+            && targetValid[parent]
+            && (!driven || parentDriven)) {
+
+          System.Numerics.Quaternion parentRotation =
+            _jbaWorldRotationMorpheme[parent];
+
+          _jbaWorldRotationMorpheme[i] = JbaQuatMultiply(
+            parentRotation,
+            localRotation
+          );
+          _jbaWorldTranslationMorpheme[i] =
+            JbaTransformQuat(localTranslation, parentRotation)
+            + _jbaWorldTranslationMorpheme[parent];
+        }
+        else {
+          _jbaWorldRotationMorpheme[i] = localRotation;
+          _jbaWorldTranslationMorpheme[i] = localTranslation;
+        }
+
+        targetWorld[i] = JbaMorphemePoseToHero(
+          _jbaWorldRotationMorpheme[i],
+          _jbaWorldTranslationMorpheme[i]
+        );
+        targetValid[i] = true;
+      }
+    }
+
+    private static Boolean IsFinitePoint(Vector3 point) {
+      return Single.IsFinite(point.X)
+        && Single.IsFinite(point.Y)
+        && Single.IsFinite(point.Z);
+    }
+
+    private void RebuildAnimationSkeletonDebugGeometry() {
+      _jbaBoneVertexCount = 0;
+
+      if (!_showSkeleton
+          || Device == null
+          || ImmediateContext == null
+          || _model == null
+          || _jbaCurrentWorld == null
+          || _jbaCurrentValid == null) {
+        return;
+      }
+
+      IList<GR2_Bone_Skeleton> skeleton = _model.skeleton_bones;
+      if (skeleton == null || skeleton.Count <= 1)
+        return;
+
+      // Two vertices per parent-child link. Allocate for the skeleton once and
+      // update it with WRITE_DISCARD as the animation advances. This keeps the
+      // debug overlay out of the GC-heavy playback path that caused the first
+      // JBA stutter issue.
+      Int32 requiredCapacity = Math.Max(2, (skeleton.Count - 1) * 2);
+
+      if (_jbaBoneVertices == null
+          || _jbaBoneVertices.Length < requiredCapacity) {
+        _jbaBoneVertices = new PosNormalTexTan[requiredCapacity];
+      }
+
+      Int32 vertexCount = 0;
+      Int32 count = Math.Min(
+        skeleton.Count,
+        Math.Min(_jbaCurrentWorld.Length, _jbaCurrentValid.Length)
+      );
+
+      for (Int32 i = 0; i < count; i++) {
+        Int32 parent = skeleton[i].parentBoneIndex;
+        if (parent < 0 || parent >= count)
+          continue;
+
+        if (!_jbaCurrentValid[i] || !_jbaCurrentValid[parent])
+          continue;
+
+        Matrix childWorld = _jbaCurrentWorld[i];
+        Matrix parentWorld = _jbaCurrentWorld[parent];
+
+        Vector3 child = new Vector3(
+          childWorld.M41,
+          childWorld.M42,
+          childWorld.M43
+        );
+        Vector3 parentPos = new Vector3(
+          parentWorld.M41,
+          parentWorld.M42,
+          parentWorld.M43
+        );
+
+        if (!IsFinitePoint(child) || !IsFinitePoint(parentPos))
+          continue;
+
+        // The generic GR2 shader only needs a valid vertex basis. The skeleton
+        // uses the neutral preview material; normals/tangents are irrelevant
+        // for line topology but keep the input layout fully initialized.
+        _jbaBoneVertices[vertexCount++] = new PosNormalTexTan(
+          parentPos,
+          Vector3.UnitZ,
+          Vector2.Zero,
+          Vector3.UnitX
+        );
+        _jbaBoneVertices[vertexCount++] = new PosNormalTexTan(
+          child,
+          Vector3.UnitZ,
+          Vector2.Zero,
+          Vector3.UnitX
+        );
+      }
+
+      if (vertexCount <= 0)
+        return;
+
+      if (_jbaBoneBuffer == null
+          || _jbaBoneBufferCapacity < requiredCapacity) {
+        Util.ReleaseCom(ref _jbaBoneBuffer);
+
+        BufferDescription vbd = new BufferDescription(
+          PosNormalTexTan.Stride * requiredCapacity,
+          ResourceUsage.Dynamic,
+          BindFlags.VertexBuffer,
+          CpuAccessFlags.Write,
+          ResourceOptionFlags.None,
+          0
+        );
+
+        _jbaBoneBuffer = new Buffer(
+          Device,
+          new DataStream(_jbaBoneVertices, false, false),
+          vbd
+        );
+        _jbaBoneBufferCapacity = requiredCapacity;
+      }
+
+      try {
+        DataBox mapped = ImmediateContext.MapSubresource(
+          _jbaBoneBuffer,
+          MapMode.WriteDiscard,
+          SlimDX.Direct3D11.MapFlags.None
+        );
+        mapped.Data.WriteRange(_jbaBoneVertices);
+        ImmediateContext.UnmapSubresource(_jbaBoneBuffer, 0);
+        _jbaBoneVertexCount = vertexCount;
+      }
+      catch (Exception ex) {
+        _jbaBoneVertexCount = 0;
+        System.Diagnostics.Debug.WriteLine(
+          "JBA skeleton overlay update failed: " + ex.Message
+        );
+      }
+    }
+
+    private Boolean IsJbaSkeletonBoneDriven(Int32 skeletonIndex) {
+      if (skeletonIndex < 0) return false;
+
+      Boolean mainDriven = _jbaSkeletonToChannel != null
+        && skeletonIndex < _jbaSkeletonToChannel.Length
+        && _jbaSkeletonToChannel[skeletonIndex] >= 0;
+
+      if (mainDriven) return true;
+
+      return _jbaIsAdditive
+        && _jbaBaseSkeletonToChannel != null
+        && skeletonIndex < _jbaBaseSkeletonToChannel.Length
+        && _jbaBaseSkeletonToChannel[skeletonIndex] >= 0;
+    }
+
+    private Int32 JbaDrivenAncestor(Int32 skeletonIndex) {
+      IList<GR2_Bone_Skeleton> skeleton = _model?.skeleton_bones;
+      if (skeleton == null
+          || skeletonIndex < 0
+          || skeletonIndex >= skeleton.Count)
+        return -1;
+
+      Int32 at = skeletonIndex;
+      while (at >= 0 && at < skeleton.Count) {
+        if (IsJbaSkeletonBoneDriven(at)) return at;
+
+        Int32 parent = skeleton[at].parentBoneIndex;
+        if (parent < 0 || parent >= at) break;
+        at = parent;
+      }
+
+      return -1;
     }
 
     private void RebuildAnimationSkeletonBuffer() {
-      Util.ReleaseCom(ref _jbaBoneBuffer);
       _jbaBoneVertexCount = 0;
 
       if (_jbaAnimation == null
@@ -756,398 +2166,139 @@ namespace PugTools {
         return;
       }
 
-      JBAFrame frame = _jbaAnimation.Sample(_jbaTime);
-      JBAFrame referenceFrame = _jbaAnimation.Sample(0.0F);
-      _jbaFrame = frame.Frame;
-
       IList<GR2_Bone_Skeleton> skeleton = _model.skeleton_bones;
       if (skeleton == null || skeleton.Count == 0)
         return;
 
-      Dictionary<String, Int32> channelByName =
-        new Dictionary<String, Int32>(
-          StringComparer.OrdinalIgnoreCase
-        );
+      if (_jbaPoseSamples == null
+          || _jbaSkeletonToChannel == null
+          || _jbaBindLocal == null
+          || _jbaBindLocalFull == null
+          || _jbaInverseBind == null
+          || _jbaBindRotationMorpheme == null
+          || _jbaBindTranslationMorpheme == null
+          || _jbaWorldRotationMorpheme == null
+          || _jbaWorldTranslationMorpheme == null
+          || _jbaSkeletonToChannel.Length != skeleton.Count) {
+        BuildJbaBindingCache();
+      }
 
-      if (_jbaRig != null
-          && _jbaRig.Bones != null
-          && _jbaRig.AnimToRig != null) {
+      if (_jbaPoseSamples == null
+          || _jbaCurrentWorld == null
+          || _jbaCurrentValid == null
+          || _jbaBindLocal == null
+          || _jbaInverseBind == null
+          || _jbaBindRotationMorpheme == null
+          || _jbaBindTranslationMorpheme == null
+          || _jbaWorldRotationMorpheme == null
+          || _jbaWorldTranslationMorpheme == null) {
+        return;
+      }
 
-        for (Int32 channel = 0;
-             channel < _jbaRig.AnimToRig.Length;
-             channel++) {
+      _jbaFrame = _jbaAnimation.SampleInto(
+        _jbaTime,
+        _jbaPoseSamples
+      );
 
-          Int32 rigIndex = _jbaRig.AnimToRig[channel];
-          if (rigIndex < 0 || rigIndex >= _jbaRig.Bones.Count)
-            continue;
+      if (_jbaIsAdditive) {
+        IReadOnlyList<JBATransform> baseFrame = null;
 
-          String name = CanonicalAnimationBoneName(
-            _jbaRig.Bones[rigIndex].Name
+        if (_jbaBaseAnimation != null
+            && _jbaBasePoseSamples != null) {
+          _jbaBaseAnimation.SampleInto(
+            _jbaBaseTime,
+            _jbaBasePoseSamples
           );
-
-          if (!String.IsNullOrWhiteSpace(name))
-            channelByName[name] = channel;
+          baseFrame = _jbaBasePoseSamples;
         }
-      }
 
-      if (_jbaAnimation.BoneNames != null) {
-        Int32 namedCount = Math.Min(
-          _jbaAnimation.BoneNames.Count,
-          frame.Bones.Count
+        BuildJbaAdditiveWorldPose(
+          _jbaPoseSamples,
+          baseFrame,
+          _jbaCurrentWorld,
+          _jbaCurrentValid
         );
-
-        for (Int32 channel = 0;
-             channel < namedCount;
-             channel++) {
-
-          String name = _jbaAnimation.BoneNames[channel];
-
-          if (String.IsNullOrWhiteSpace(name)
-              || name.StartsWith(
-                   "bone_",
-                   StringComparison.OrdinalIgnoreCase))
-            continue;
-
-          name = CanonicalAnimationBoneName(name);
-
-          if (!channelByName.ContainsKey(name))
-            channelByName[name] = channel;
-        }
       }
-
-      Int32 count = skeleton.Count;
-      Int32[] skeletonToChannel = new Int32[count];
-      Int32[] source = new Int32[count];
-
-      for (Int32 i = 0; i < count; i++) {
-        String name = CanonicalAnimationBoneName(
-          skeleton[i].boneName
+      else {
+        BuildJbaWorldPose(
+          _jbaPoseSamples,
+          _jbaCurrentWorld,
+          _jbaCurrentValid
         );
-
-        skeletonToChannel[i] =
-          channelByName.TryGetValue(name, out Int32 channel)
-            && channel >= 0
-            && channel < frame.Bones.Count
-              ? channel
-              : -1;
-
-        if (skeletonToChannel[i] >= 0) {
-          source[i] = i;
-        }
-        else {
-          Int32 parent = skeleton[i].parentBoneIndex;
-          source[i] =
-            parent >= 0 && parent < i
-              ? source[parent]
-              : -1;
-        }
-      }
-
-      Matrix[] referenceWorld = new Matrix[count];
-      Matrix[] currentWorld = new Matrix[count];
-      Boolean[] referenceValid = new Boolean[count];
-      Boolean[] currentValid = new Boolean[count];
-
-      SlimDX.Quaternion rootTurn = JbaModelSpaceTurn();
-      Matrix rootTurnMatrix = Matrix.RotationQuaternion(rootTurn);
-
-      /*
-       * Build the exact same GR2-skeleton pose twice:
-       *   - JBA frame 0  -> reference pose
-       *   - current JBA frame -> animated pose
-       *
-       * CPU skinning then applies ONLY the difference between those poses.
-       * This deliberately avoids GR2 bind-matrix convention problems.
-       *
-       * Consequences:
-       *   - a blank/constant clip produces identity matrices and cannot
-       *     destroy the model;
-       *   - frame 0 always preserves the original GR2 mesh;
-       *   - later frames still contain the real JBA motion.
-       */
-      /*
-       * Build hierarchy with MATRICES, not quaternion multiplication.
-       *
-       * This is important in SlimDX because the render path uses DirectX
-       * row-vector matrix composition:
-       *
-       *     world = local * parentWorld
-       *
-       * The previous version composed parent/local quaternions separately.
-       * That is easy to get backwards and produced the remaining twisted
-       * limbs even though the overall animation was already recognizable.
-       */
-      Matrix rootTurnHero =
-        PoseToModelMatrix(
-          rootTurn,
-          Vector3.Zero
-        );
-
-      for (Int32 pass = 0; pass < 2; pass++) {
-        JBAFrame poseFrame =
-          pass == 0 ? referenceFrame : frame;
-
-        Matrix[] targetWorld =
-          pass == 0 ? referenceWorld : currentWorld;
-
-        Boolean[] targetValid =
-          pass == 0 ? referenceValid : currentValid;
-
-        for (Int32 i = 0; i < count; i++) {
-          Int32 channel = skeletonToChannel[i];
-
-          if (channel < 0 || channel >= poseFrame.Bones.Count) {
-            targetValid[i] = false;
-            continue;
-          }
-
-          GR2_Bone_Skeleton bone = skeleton[i];
-          JBATransform sample = poseFrame.Bones[channel];
-
-          System.Numerics.Quaternion nq = sample.Rotation;
-
-          if (!Single.IsFinite(nq.X)
-              || !Single.IsFinite(nq.Y)
-              || !Single.IsFinite(nq.Z)
-              || !Single.IsFinite(nq.W)
-              || nq.LengthSquared() <= 0.000001F) {
-            nq = System.Numerics.Quaternion.Identity;
-          }
-          else {
-            nq = System.Numerics.Quaternion.Normalize(nq);
-          }
-
-          SlimDX.Quaternion heroRotation =
-            MorphemeRotationToHero(nq);
-
-          Vector3 heroTranslation;
-
-          if (sample.HasTranslation
-              && Single.IsFinite(sample.Translation.X)
-              && Single.IsFinite(sample.Translation.Y)
-              && Single.IsFinite(sample.Translation.Z)) {
-
-            heroTranslation =
-              MorphemeTranslationToHero(
-                sample.Translation
-              );
-          }
-          else {
-            /*
-             * No translation channel means "keep the GR2 bind-local
-             * translation", not zero.
-             */
-            heroTranslation = new Vector3(
-              bone.parent.M41,
-              bone.parent.M42,
-              bone.parent.M43
-            );
-          }
-
-          Matrix localHero =
-            Matrix.RotationQuaternion(heroRotation);
-
-          localHero.M41 = heroTranslation.X;
-          localHero.M42 = heroTranslation.Y;
-          localHero.M43 = heroTranslation.Z;
-          localHero.M44 = 1.0F;
-
-          Int32 parent = bone.parentBoneIndex;
-
-          if (parent >= 0
-              && parent < i
-              && skeletonToChannel[parent] >= 0
-              && targetValid[parent]) {
-
-            Matrix parentWorld = targetWorld[parent];
-
-            Matrix.Multiply(
-              ref localHero,
-              ref parentWorld,
-              out targetWorld[i]
-            );
-          }
-          else {
-            /*
-             * A driven bone below an undriven parent begins a new authored
-             * JBA chain. Apply the omitted model-space half-turn exactly once.
-             */
-            Matrix.Multiply(
-              ref localHero,
-              ref rootTurnHero,
-              out targetWorld[i]
-            );
-          }
-
-          targetValid[i] = true;
-        }
       }
 
       _jbaSkinMatrices.Clear();
 
-      Vector3[] debugPos = new Vector3[count];
-      List<Int32> debugParents = new List<Int32>(count);
-
-      Int32 drivenCount = 0;
+      Int32 count = skeleton.Count;
 
       for (Int32 i = 0; i < count; i++) {
         String boneName = CanonicalAnimationBoneName(
           skeleton[i].boneName
         );
 
-        Int32 parent = skeleton[i].parentBoneIndex;
-        debugParents.Add(parent);
+        Matrix skin = Matrix.Identity;
 
-        if (referenceValid[i] && currentValid[i]) {
-          Matrix inverseReference =
-            InverseMatrix(referenceWorld[i]);
-
-          Matrix current = currentWorld[i];
-
-          // Row-vector convention:
-          // reference * delta = current
-          // => delta = inverse(reference) * current
+        if (_jbaCurrentValid[i]) {
+          // Exact transpose-equivalent of Jedipedia jbaPoseMatrices():
+          //   skinCol = animatedWorldCol * rootToBoneCol
+          // SlimDX/PugTools uses row vectors, therefore:
+          //   skinRow = rootToBoneRow * animatedWorldRow
+          Matrix inverseBind = _jbaInverseBind[i];
+          Matrix current = _jbaCurrentWorld[i];
           Matrix.Multiply(
-            ref inverseReference,
+            ref inverseBind,
             ref current,
-            out Matrix delta
+            out skin
           );
 
-          // Very short "blank" clips can contain tiny compression noise.
-          // Keep near-identity deltas at identity so they cannot visibly
-          // deform the mesh.
-          Single deltaError =
-            Math.Abs(delta.M11 - 1.0F)
-            + Math.Abs(delta.M22 - 1.0F)
-            + Math.Abs(delta.M33 - 1.0F)
-            + Math.Abs(delta.M12)
-            + Math.Abs(delta.M13)
-            + Math.Abs(delta.M21)
-            + Math.Abs(delta.M23)
-            + Math.Abs(delta.M31)
-            + Math.Abs(delta.M32)
-            + Math.Abs(delta.M41)
-            + Math.Abs(delta.M42)
-            + Math.Abs(delta.M43);
+          Boolean validSkin =
+            Single.IsFinite(skin.M11)
+            && Single.IsFinite(skin.M12)
+            && Single.IsFinite(skin.M13)
+            && Single.IsFinite(skin.M14)
+            && Single.IsFinite(skin.M21)
+            && Single.IsFinite(skin.M22)
+            && Single.IsFinite(skin.M23)
+            && Single.IsFinite(skin.M24)
+            && Single.IsFinite(skin.M31)
+            && Single.IsFinite(skin.M32)
+            && Single.IsFinite(skin.M33)
+            && Single.IsFinite(skin.M34)
+            && Single.IsFinite(skin.M41)
+            && Single.IsFinite(skin.M42)
+            && Single.IsFinite(skin.M43)
+            && Single.IsFinite(skin.M44);
 
-          if (deltaError < 0.0005F)
-            delta = Matrix.Identity;
-
-          _jbaSkinMatrices[boneName] = delta;
-          drivenCount++;
-
-          debugPos[i] = new Vector3(
-            current.M41,
-            current.M42,
-            current.M43
-          );
-        }
-        else {
-          /*
-           * Jedipedia-style undriven helpers inherit the nearest driven
-           * ancestor's skin delta. With no driven ancestor they stay identity.
-           */
-          Int32 from = source[i];
-
-          if (from >= 0) {
-            String sourceName = CanonicalAnimationBoneName(
-              skeleton[from].boneName
-            );
-
-            if (_jbaSkinMatrices.TryGetValue(
-                  sourceName,
-                  out Matrix inherited)) {
-              _jbaSkinMatrices[boneName] = inherited;
+          if (!validSkin) {
+            Int32 parent = skeleton[i].parentBoneIndex;
+            if (parent >= 0 && parent < i) {
+              String parentName = CanonicalAnimationBoneName(
+                skeleton[parent].boneName
+              );
+              if (_jbaSkinMatrices.TryGetValue(parentName, out Matrix inherited))
+                skin = inherited;
+              else
+                skin = Matrix.Identity;
             }
             else {
-              _jbaSkinMatrices[boneName] = Matrix.Identity;
+              skin = Matrix.Identity;
             }
-
-            debugPos[i] = debugPos[from];
-          }
-          else {
-            _jbaSkinMatrices[boneName] = Matrix.Identity;
-            debugPos[i] = Vector3.Zero;
           }
         }
+
+        _jbaSkinMatrices[boneName] = skin;
       }
 
-      UpdateSkinnedGeometry();
-
-      if (_jbaPlaying) {
-        System.Diagnostics.Debug.WriteLine(
-          "JBA reference-delta frame="
-          + frame.Frame
-          + " driven="
-          + drivenCount
-          + "/"
-          + skeleton.Count
-          + " channels="
-          + frame.Bones.Count
-        );
-      }
-
-      List<PosNormalTexTan> lines =
-        new List<PosNormalTexTan>();
-
-      Vector3 normal = Vector3.UnitY;
-      Vector2 tex = Vector2.Zero;
-      Vector3 tan = Vector3.UnitX;
-
-      for (Int32 i = 0; i < debugPos.Length; i++) {
-        Int32 parent = debugParents[i];
-
-        if (parent < 0 || parent >= debugPos.Length)
-          continue;
-
-        lines.Add(
-          new PosNormalTexTan(
-            debugPos[parent],
-            normal,
-            tex,
-            tan
-          )
-        );
-
-        lines.Add(
-          new PosNormalTexTan(
-            debugPos[i],
-            normal,
-            tex,
-            tan
-          )
-        );
-      }
-
-      if (lines.Count == 0)
-        return;
-
-      BufferDescription vbd =
-        new BufferDescription(
-          PosNormalTexTan.Stride * lines.Count,
-          ResourceUsage.Immutable,
-          BindFlags.VertexBuffer,
-          CpuAccessFlags.None,
-          ResourceOptionFlags.None,
-          0
-        );
-
-      _jbaBoneBuffer =
-        new Buffer(
-          Device,
-          new DataStream(
-            lines.ToArray(),
-            false,
-            false
-          ),
-          vbd
-        );
-
-      _jbaBoneVertexCount = lines.Count;
+      // GPU path: only the matrix palette changes per redraw. The model's
+      // immutable skinned vertex buffers remain untouched.
+      RebuildAnimationSkeletonDebugGeometry();
     }
 
     private void DrawAnimationSkeleton(EffectTechnique activeTech) {
-      if (_jbaAnimation == null || _model == null || activeTech == null) return;
+      if (!_showSkeleton
+          || _jbaAnimation == null
+          || _model == null
+          || activeTech == null) return;
 
       if (_jbaBoneBuffer == null || _jbaBoneVertexCount <= 0) return;
 
@@ -1157,6 +2308,12 @@ namespace PugTools {
         0,
         new VertexBufferBinding(_jbaBoneBuffer, PosNormalTexTan.Stride, 0)
       );
+
+      // Draw bones through the mesh, matching Jedipedia's diagnostic overlay.
+      // Restore the normal depth state afterwards so the next frame's model
+      // rendering is unaffected.
+      ImmediateContext.OutputMerger.DepthStencilState = RenderStates.NoDepthDSS;
+      ImmediateContext.Rasterizer.State = RenderStates.TwoSidedRS;
 
       if (_jbaMaterial != null) {
         _fx.SetDiffuseMap(_jbaMaterial.diffuseSRV);
@@ -1172,9 +2329,272 @@ namespace PugTools {
       _fx.SetWorldMatrix(mvMatrix);
       _fx.SetMvMatrix(wvp);
 
-      activeTech.GetPassByIndex(0).Apply(ImmediateContext);
+      _fx.Generic.GetPassByIndex(0).Apply(ImmediateContext);
       ImmediateContext.Draw(_jbaBoneVertexCount, 0);
+
+      ImmediateContext.OutputMerger.DepthStencilState = RenderStates.LessEqualDSS;
+      ImmediateContext.Rasterizer.State = RenderStates.OneSidedRS;
       ImmediateContext.InputAssembler.PrimitiveTopology = PrimitiveTopology.TriangleList;
+    }
+
+    private static Int32 NextPowerOfTwo(Int32 value) {
+      Int32 result = 1;
+      while (result < value && result < 4096)
+        result <<= 1;
+      return Math.Min(4096, Math.Max(1, result));
+    }
+
+    private void BuildAnimationSkeletonLabelAtlas() {
+      Util.ReleaseCom(ref _jbaLabelBuffer);
+      Util.ReleaseCom(ref _jbaLabelTexture);
+      _jbaLabelVertices = null;
+      _jbaLabelUvRects = null;
+      _jbaLabelPixelSizes = null;
+      _jbaLabelBufferCapacity = 0;
+      _jbaLabelVertexCount = 0;
+
+      IList<GR2_Bone_Skeleton> skeleton = _model?.skeleton_bones;
+      if (Device == null || skeleton == null || skeleton.Count == 0)
+        return;
+
+      try {
+        Int32 count = skeleton.Count;
+        _jbaLabelUvRects = new Vector4[count];
+        _jbaLabelPixelSizes = new Vector2[count];
+
+        const Int32 atlasWidth = 2048;
+        const Int32 paddingX = 6;
+        const Int32 paddingY = 4;
+
+        var rects = new Rectangle[count];
+        var labels = new String[count];
+        Int32 x = 0;
+        Int32 y = 0;
+        Int32 rowHeight = 0;
+
+        using (var measureBitmap = new Bitmap(1, 1, PixelFormat.Format32bppArgb))
+        using (Graphics graphics = Graphics.FromImage(measureBitmap))
+        using (var font = new Font("Segoe UI", 9.0F, FontStyle.Regular, GraphicsUnit.Point)) {
+          graphics.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+
+          for (Int32 i = 0; i < count; i++) {
+            String label = CanonicalAnimationBoneName(skeleton[i].boneName);
+            if (String.IsNullOrWhiteSpace(label)) label = "Bone " + i;
+            labels[i] = label;
+
+            SizeF measured = graphics.MeasureString(
+              label,
+              font,
+              Int32.MaxValue,
+              StringFormat.GenericTypographic
+            );
+            Int32 width = Math.Max(2, (Int32)Math.Ceiling(measured.Width) + paddingX);
+            Int32 height = Math.Max(2, (Int32)Math.Ceiling(measured.Height) + paddingY);
+
+            if (x > 0 && x + width > atlasWidth) {
+              x = 0;
+              y += rowHeight;
+              rowHeight = 0;
+            }
+
+            rects[i] = new Rectangle(x, y, Math.Min(width, atlasWidth), height);
+            x += width;
+            rowHeight = Math.Max(rowHeight, height);
+          }
+        }
+
+        Int32 usedHeight = y + Math.Max(1, rowHeight);
+        Int32 atlasHeight = NextPowerOfTwo(usedHeight);
+        if (usedHeight > atlasHeight) {
+          System.Diagnostics.Debug.WriteLine(
+            "JBA label atlas too tall; labels beyond " + atlasHeight + " px will be skipped."
+          );
+        }
+
+        using (var atlas = new Bitmap(atlasWidth, atlasHeight, PixelFormat.Format32bppArgb))
+        using (Graphics graphics = Graphics.FromImage(atlas))
+        using (var font = new Font("Segoe UI", 9.0F, FontStyle.Regular, GraphicsUnit.Point))
+        using (var shadowBrush = new SolidBrush(Color.FromArgb(230, 0, 0, 0)))
+        using (var textBrush = new SolidBrush(Color.FromArgb(255, 255, 205, 30))) {
+          graphics.Clear(Color.Transparent);
+          graphics.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+
+          for (Int32 i = 0; i < count; i++) {
+            Rectangle rect = rects[i];
+            if (rect.Bottom > atlasHeight || rect.Width <= 0 || rect.Height <= 0)
+              continue;
+
+            Single tx = rect.X + 2.0F;
+            Single ty = rect.Y + 1.0F;
+            graphics.DrawString(labels[i], font, shadowBrush, tx + 1.0F, ty + 1.0F, StringFormat.GenericTypographic);
+            graphics.DrawString(labels[i], font, textBrush, tx, ty, StringFormat.GenericTypographic);
+
+            _jbaLabelUvRects[i] = new Vector4(
+              (Single)rect.Left / atlasWidth,
+              (Single)rect.Top / atlasHeight,
+              (Single)rect.Right / atlasWidth,
+              (Single)rect.Bottom / atlasHeight
+            );
+            _jbaLabelPixelSizes[i] = new Vector2(rect.Width, rect.Height);
+          }
+
+          using (var stream = new MemoryStream()) {
+            atlas.Save(stream, ImageFormat.Png);
+            _jbaLabelTexture = ShaderResourceView.FromMemory(Device, stream.ToArray());
+          }
+        }
+
+        _jbaLabelBufferCapacity = Math.Max(6, count * 6);
+        _jbaLabelVertices = new PosNormalTexTan[_jbaLabelBufferCapacity];
+        var description = new BufferDescription(
+          PosNormalTexTan.Stride * _jbaLabelBufferCapacity,
+          ResourceUsage.Dynamic,
+          BindFlags.VertexBuffer,
+          CpuAccessFlags.Write,
+          ResourceOptionFlags.None,
+          0
+        );
+        _jbaLabelBuffer = new Buffer(
+          Device,
+          new DataStream(_jbaLabelVertices, false, false),
+          description
+        );
+      }
+      catch (Exception ex) {
+        System.Diagnostics.Debug.WriteLine(
+          "ViewGR2: skeleton label atlas init failed: " + ex
+        );
+        Util.ReleaseCom(ref _jbaLabelBuffer);
+        Util.ReleaseCom(ref _jbaLabelTexture);
+        _jbaLabelVertices = null;
+        _jbaLabelUvRects = null;
+        _jbaLabelPixelSizes = null;
+        _jbaLabelBufferCapacity = 0;
+      }
+    }
+
+    private void DrawAnimationSkeletonLabels() {
+      if (!_showSkeleton
+          || _jbaAnimation == null
+          || _model?.skeleton_bones == null
+          || _jbaCurrentWorld == null
+          || _jbaCurrentValid == null
+          || _jbaLabelTexture == null
+          || _jbaLabelBuffer == null
+          || _jbaLabelVertices == null
+          || _jbaLabelUvRects == null
+          || _jbaLabelPixelSizes == null
+          || ClientWidth <= 0
+          || ClientHeight <= 0) {
+        return;
+      }
+
+      IList<GR2_Bone_Skeleton> skeleton = _model.skeleton_bones;
+      Int32 count = Math.Min(
+        skeleton.Count,
+        Math.Min(_jbaCurrentWorld.Length, _jbaCurrentValid.Length)
+      );
+      count = Math.Min(count, Math.Min(_jbaLabelUvRects.Length, _jbaLabelPixelSizes.Length));
+      if (count <= 0) return;
+
+      Matrix viewProjection;
+      Matrix.Multiply(ref _cMatrix, ref _pMatrix, out viewProjection);
+
+      Int32 vertexCount = 0;
+      for (Int32 i = 0; i < count; i++) {
+        if (!_jbaCurrentValid[i]) continue;
+        if (vertexCount + 6 > _jbaLabelVertices.Length) break;
+
+        Matrix world = _jbaCurrentWorld[i];
+        Vector3 bone = new Vector3(world.M41, world.M42, world.M43);
+        if (!IsFinitePoint(bone)) continue;
+
+        Vector3 screen = Vector3.Project(
+          bone,
+          0.0F,
+          0.0F,
+          ClientWidth,
+          ClientHeight,
+          0.0F,
+          1.0F,
+          viewProjection
+        );
+
+        if (!IsFinitePoint(screen)
+            || screen.Z < 0.0F
+            || screen.Z > 1.0F
+            || screen.X < -220.0F
+            || screen.X > ClientWidth + 20.0F
+            || screen.Y < -30.0F
+            || screen.Y > ClientHeight + 30.0F) {
+          continue;
+        }
+
+        Vector2 size = _jbaLabelPixelSizes[i];
+        if (size.X <= 0.0F || size.Y <= 0.0F) continue;
+        Vector4 uv = _jbaLabelUvRects[i];
+
+        Single pxLeft = screen.X + 3.0F;
+        Single pxTop = screen.Y - (size.Y * 0.5F);
+        Single pxRight = pxLeft + size.X;
+        Single pxBottom = pxTop + size.Y;
+
+        Single left = (pxLeft / ClientWidth) * 2.0F - 1.0F;
+        Single right = (pxRight / ClientWidth) * 2.0F - 1.0F;
+        Single top = 1.0F - (pxTop / ClientHeight) * 2.0F;
+        Single bottom = 1.0F - (pxBottom / ClientHeight) * 2.0F;
+
+        Vector3 normal = Vector3.UnitZ;
+        Vector3 tangent = Vector3.UnitX;
+        _jbaLabelVertices[vertexCount++] = new PosNormalTexTan(new Vector3(left, top, 0.0F), normal, new Vector2(uv.X, uv.Y), tangent);
+        _jbaLabelVertices[vertexCount++] = new PosNormalTexTan(new Vector3(right, top, 0.0F), normal, new Vector2(uv.Z, uv.Y), tangent);
+        _jbaLabelVertices[vertexCount++] = new PosNormalTexTan(new Vector3(right, bottom, 0.0F), normal, new Vector2(uv.Z, uv.W), tangent);
+        _jbaLabelVertices[vertexCount++] = new PosNormalTexTan(new Vector3(left, top, 0.0F), normal, new Vector2(uv.X, uv.Y), tangent);
+        _jbaLabelVertices[vertexCount++] = new PosNormalTexTan(new Vector3(right, bottom, 0.0F), normal, new Vector2(uv.Z, uv.W), tangent);
+        _jbaLabelVertices[vertexCount++] = new PosNormalTexTan(new Vector3(left, bottom, 0.0F), normal, new Vector2(uv.X, uv.W), tangent);
+      }
+
+      _jbaLabelVertexCount = vertexCount;
+      if (vertexCount <= 0) return;
+
+      try {
+        DataBox mapped = ImmediateContext.MapSubresource(
+          _jbaLabelBuffer,
+          MapMode.WriteDiscard,
+          SlimDX.Direct3D11.MapFlags.None
+        );
+        mapped.Data.WriteRange(_jbaLabelVertices);
+        ImmediateContext.UnmapSubresource(_jbaLabelBuffer, 0);
+
+        ImmediateContext.InputAssembler.InputLayout = InputLayouts.PosNormalTexTan;
+        ImmediateContext.InputAssembler.PrimitiveTopology = PrimitiveTopology.TriangleList;
+        ImmediateContext.InputAssembler.SetVertexBuffers(
+          0,
+          new VertexBufferBinding(_jbaLabelBuffer, PosNormalTexTan.Stride, 0)
+        );
+
+        ImmediateContext.OutputMerger.DepthStencilState = RenderStates.NoDepthDSS;
+        ImmediateContext.OutputMerger.BlendState = RenderStates.TransparentBS;
+        ImmediateContext.Rasterizer.State = RenderStates.TwoSidedRS;
+
+        _fx.SetDiffuseMap(_jbaLabelTexture);
+        Matrix identity = Matrix.Identity;
+        _fx.SetWorldMatrix(identity);
+        _fx.SetMvMatrix(identity);
+        _fx.filterDiffuseMap.GetPassByIndex(0).Apply(ImmediateContext);
+        ImmediateContext.Draw(vertexCount, 0);
+      }
+      catch (Exception ex) {
+        System.Diagnostics.Debug.WriteLine(
+          "JBA skeleton label draw failed: " + ex.Message
+        );
+      }
+      finally {
+        ImmediateContext.OutputMerger.DepthStencilState = RenderStates.LessEqualDSS;
+        ImmediateContext.OutputMerger.BlendState = RenderStates.AlphaToCoverageBS;
+        ImmediateContext.Rasterizer.State = RenderStates.OneSidedRS;
+        ImmediateContext.InputAssembler.PrimitiveTopology = PrimitiveTopology.TriangleList;
+      }
     }
 
     internal void MakeScreenshot(ImageFileFormat format) {
@@ -1282,20 +2702,13 @@ namespace PugTools {
         // if (Util.IsKeyDown(Keys.PageDown)) _camera.Zoom(_flyingCameraSpeed * dt);
       }
 
-      if (_jbaPlaying && _jbaAnimation != null && _jbaAnimation.Length > 0) {
-        _jbaTime += dt;
+      UpdateJbaPlaybackTime();
 
-        if (_jbaTime >= _jbaAnimation.Length) {
-          if (_jbaLoop) {
-            _jbaTime %= _jbaAnimation.Length;
-          } else {
-            _jbaTime = _jbaAnimation.Length;
-            _jbaPlaying = false;
-          }
-        }
-      }
-
-      System.Threading.Thread.Sleep(1); // Fix for UI lag. Sleeps the thread for 1 millisecond...
+      // Present(1) already yields to the display refresh while JBA playback is
+      // active. The extra sleep could make a near-budget frame miss the next
+      // vblank and turn a small workload spike into a visible 33 ms hitch.
+      if (!_jbaPlaying)
+        System.Threading.Thread.Sleep(1);
     }
   }
 }

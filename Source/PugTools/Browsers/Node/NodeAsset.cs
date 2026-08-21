@@ -6,6 +6,8 @@ namespace PugTools {
     private readonly DataObjectModel _dom;
     private GomObject _obj;
     internal String displayName;
+    internal BuildFileState compareState;
+    internal TorArchive.HashFileInfo previousHashInfo;
     internal Object dynObject;
     internal String id;
     internal GomObjectData objData;

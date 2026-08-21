@@ -22,6 +22,8 @@ namespace FileFormats {
     //     Unknown
     // }
 
+    public Dictionary<uint, string> TerrainTextureNames { get; private set; } = new Dictionary<uint, string>();
+
     // Binary Format File Regions
     uint roomsOffset;
     uint assetsOffset;
@@ -189,6 +191,25 @@ namespace FileFormats {
 
       // Move to terrainTexOffset
       br.BaseStream.Seek(terrainTexOffset, SeekOrigin.Begin);
+
+      uint numTerrainTextures = br.ReadUInt32();
+
+      for (int i = 0; i < numTerrainTextures; i++) {
+        uint terrainTexId = br.ReadUInt32();
+        br.ReadUInt32(); // layer - usually zero, meaning unknown/unused
+        uint terrainTexNameLength = br.ReadUInt32();
+        string terrainTexName = FileHelpers.ReadString(br, (uint)br.BaseStream.Position);
+
+        TerrainTextureNames[terrainTexId] = terrainTexName;
+
+        // Move to beginning of next terrain texture entry
+        br.BaseStream.Seek(terrainTexNameLength, SeekOrigin.Current);
+      }
+
+      DebugHeaderInfo += " | terrainTextures=" + TerrainTextureNames.Count;
+      if (TerrainTextureNames.Count > 0) {
+        DebugHeaderInfo += " (" + string.Join(", ", TerrainTextureNames.Values.Take(5)) + ")";
+      }
 
       // Move to dynDetailTexOffset
       br.BaseStream.Seek(dynDetailTexOffset, SeekOrigin.Begin);

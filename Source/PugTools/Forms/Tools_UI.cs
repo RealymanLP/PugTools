@@ -42,8 +42,24 @@ namespace PugTools {
     }
     private void BtnAssetBrowser_Click(Object sender, EventArgs e) {
       if (AssetBrowser == null || AssetBrowser.IsDisposed) {
+        if (chkBuildCompare.Checked && String.IsNullOrWhiteSpace(txtPrevAssetsPath.Text)) {
+          MessageBox.Show(
+            "Please select a Previous Assets Path before opening the browser in compare mode.",
+            "Compare Builds",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Warning
+          );
+          return;
+        }
+
         Boolean usePTS = chkAssetsUsePTS.Checked;
-        AssetBrowser = new AssetBrowser(txtAssetsPath.Text, usePTS);
+        AssetBrowser = new AssetBrowser(
+          txtAssetsPath.Text,
+          usePTS,
+          txtPrevAssetsPath.Text,
+          chkPrevAssetsUsePTS.Checked,
+          chkBuildCompare.Checked
+        );
         AssetBrowser.FormClosed += OnAssetBrowserClosed;
         AssetBrowser.Show();
         AssetBrowser.Focus();
@@ -323,6 +339,16 @@ namespace PugTools {
     }
     private void BtnModelBrowser_Click(Object sender, EventArgs e) {
       if (ModelBrowser == null || ModelBrowser.IsDisposed) {
+        if (chkBuildCompare.Checked && String.IsNullOrWhiteSpace(txtPrevAssetsPath.Text)) {
+          MessageBox.Show(
+            "Please select a Previous Assets Path before opening the browser in compare mode.",
+            "Compare Builds",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Warning
+          );
+          return;
+        }
+
         Boolean usePTS = chkAssetsUsePTS.Checked;
         ModelBrowser =
           new ModelBrowser(

@@ -21,7 +21,17 @@ namespace TorArchive {
     /// Creates hash metadata without probing file contents when detectUnknownExtension is false.
     /// Browser indexes use this overload to avoid opening/decompressing unknown TOR entries at startup.
     /// </summary>
-    public HashFileInfo(UInt32 ph, UInt32 sh, File file, Boolean detectUnknownExtension) {
+    public HashFileInfo(UInt32 ph, UInt32 sh, File file, Boolean detectUnknownExtension)
+      : this(ph, sh, file, detectUnknownExtension, true) {
+    }
+
+    /// <summary>
+    /// Creates hash metadata and optionally avoids updating the persistent hash dictionary CRC.
+    /// Build-to-build comparisons use updateDictionary=false so inspecting an older build cannot
+    /// make that older CRC become the new baseline.
+    /// </summary>
+    public HashFileInfo(UInt32 ph, UInt32 sh, File file, Boolean detectUnknownExtension,
+                        Boolean updateDictionary) {
       if (ph == 0 && sh == 0 && file == null) {
         return;
       }
@@ -47,10 +57,11 @@ namespace TorArchive {
 
         if (info.CRC != data.Crc) {
           FileState = State.Modified;
-          HashDictionaryInstance.Instance.Dictionary.UpdateCRC(info.PrimaryHash,
-                                                               info.SecondaryHash,
-                                                               info.CRC,
-                                                               file.Archive.StrippedFileName);
+          if (updateDictionary)
+            HashDictionaryInstance.Instance.Dictionary.UpdateCRC(info.PrimaryHash,
+                                                                 info.SecondaryHash,
+                                                                 info.CRC,
+                                                                 file.Archive.StrippedFileName);
         } else if (info.CRC == data.Crc) {
           FileState = State.Unchanged;
         }
@@ -62,17 +73,19 @@ namespace TorArchive {
         if (data == null) {
           FileState = State.New;
           FileName = $"{info.Checksum:X8}_{info.FileId:X16}";
-          HashDictionaryInstance.Instance.Dictionary.AddHash(info.PrimaryHash,
-                                                             info.SecondaryHash,
-                                                             "",
-                                                             info.CRC,
-                                                             file.Archive.StrippedFileName);
-        } else if (info.CRC != data.Crc) {
-          FileState = State.Modified;
-          HashDictionaryInstance.Instance.Dictionary.UpdateCRC(info.PrimaryHash,
+          if (updateDictionary)
+            HashDictionaryInstance.Instance.Dictionary.AddHash(info.PrimaryHash,
                                                                info.SecondaryHash,
+                                                               "",
                                                                info.CRC,
                                                                file.Archive.StrippedFileName);
+        } else if (info.CRC != data.Crc) {
+          FileState = State.Modified;
+          if (updateDictionary)
+            HashDictionaryInstance.Instance.Dictionary.UpdateCRC(info.PrimaryHash,
+                                                                 info.SecondaryHash,
+                                                                 info.CRC,
+                                                                 file.Archive.StrippedFileName);
         } else if (info.CRC == data.Crc) {
           FileState = State.Unchanged;
         }

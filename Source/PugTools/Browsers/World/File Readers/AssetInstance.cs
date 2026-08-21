@@ -108,13 +108,15 @@ namespace FileFormats {
       try {
         string logPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "heightmap_debug.log");
         string line = string.Format(
-          "id={0} pos=({1:F1},{2:F1},{3:F1}) codec={4} succeeded={5} width={6} depth={7} " +
-          "headerBitflag={8} hasHoles={9}\n",
+          System.Globalization.CultureInfo.InvariantCulture,
+          "id={0} pos=({1:F1};{2:F1};{3:F1}) codec={4} succeeded={5} width={6} depth={7} " +
+          "headerBitflag={8} hasHoles={9} hidden={10}\n",
           ID, position.X, position.Y, position.Z, codecUsed, succeeded,
           heightMap != null ? heightMap.width.ToString() : "-",
           heightMap != null ? heightMap.depth.ToString() : "-",
           heightMap != null ? heightMap.headerBitFlag.ToString() : "-",
-          heightMap != null ? heightMap.hasHoles.ToString() : "-");
+          heightMap != null ? heightMap.hasHoles.ToString() : "-",
+          hidden);
         System.IO.File.AppendAllText(logPath, line);
       } catch {
         // Best-effort diagnostic only.

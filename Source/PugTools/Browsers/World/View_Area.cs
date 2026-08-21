@@ -440,7 +440,13 @@ namespace PugTools {
 
                 activeTech.GetPassByIndex(0).Apply(ImmediateContext);
 
-                ImmediateContext.DrawIndexed(instance.numFaces / 3, 0, 0);
+                // instance.numFaces already holds the INDEX count, not a triangle/face count -
+                // it's incremented by 3 per triangle (3 indices) in the loop above, same
+                // convention as the GR2 model draws just below (which correctly do
+                // numPieceFaces * 3 to go from face count to index count). Dividing by 3 here
+                // was throwing away two thirds of the indices, which is exactly why only a
+                // fraction of each terrain tile was ever actually drawn.
+                ImmediateContext.DrawIndexed(instance.numFaces, 0, 0);
             }
 
             if (models.Keys.Contains(instance.assetID)) {

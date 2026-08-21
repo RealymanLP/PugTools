@@ -1,4 +1,4 @@
-// ===================================================================================
+﻿// ===================================================================================
 // Shader Parameters
 //
 // Parameters with binding names are used in the material system.  (However, there
@@ -14,6 +14,13 @@ cbuffer cbPerObject
 
     int                 AlphaMode;
     float               AlphaTestValue;
+};
+
+cbuffer cbSkinning
+{
+    // Palette indices in SWTOR GR2 vertices are bytes, so 256 entries is
+    // sufficient and still well below the D3D11 constant-buffer limit.
+    float4x4            SkinPalette[256];
 };
 
 cbuffer cbPerFrame
@@ -37,6 +44,16 @@ struct Vertex
     float4 nor          : NORMAL;
     float4 tan          : TANGENT;
     float2 texCo        : TEXCOORD;
+};
+
+struct SkinnedVertex
+{
+    float3 pos          : POSITION;
+    float3 nor          : NORMAL;
+    float3 tan          : TANGENT;
+    float2 texCo        : TEXCOORD;
+    float4 weights      : BLENDWEIGHT;
+    uint4  indices      : BLENDINDICES;
 };
 
 struct outputVertex
@@ -399,6 +416,61 @@ outputVertex vsMain(Vertex In)
     vout.norW                          = mul(o_normal, float3x3(world[0].xyz, world[1].xyz, world[2].xyz));
     vout.tanW                          = mul(o_tangent, float3x3(world[0].xyz, world[1].xyz, world[2].xyz));
     vout.binW                          = cross(vout.norW, vout.tanW);
+
+    return vout;
+}
+
+outputVertex vsSkinned(SkinnedVertex In)
+{
+    outputVertex vout;
+
+    float3 o_normal  = (In.nor.xyz * (2.0f / 255.0f)) - 1.0f.xxx;
+    float3 o_tangent = (In.tan.xyz * (2.0f / 255.0f)) - 1.0f.xxx;
+    float4 o_pos     = float4(In.pos, 1.0f);
+
+    float weightSum = dot(In.weights, 1.0f.xxxx);
+
+    float4 skinnedPos = o_pos;
+    float3 skinnedNormal = o_normal;
+    float3 skinnedTangent = o_tangent;
+
+    if (weightSum > 0.00001f)
+    {
+        float4 w = In.weights / weightSum;
+
+        skinnedPos =
+            mul(o_pos, SkinPalette[In.indices.x]) * w.x +
+            mul(o_pos, SkinPalette[In.indices.y]) * w.y +
+            mul(o_pos, SkinPalette[In.indices.z]) * w.z +
+            mul(o_pos, SkinPalette[In.indices.w]) * w.w;
+
+        skinnedNormal =
+            mul(o_normal, (float3x3)SkinPalette[In.indices.x]) * w.x +
+            mul(o_normal, (float3x3)SkinPalette[In.indices.y]) * w.y +
+            mul(o_normal, (float3x3)SkinPalette[In.indices.z]) * w.z +
+            mul(o_normal, (float3x3)SkinPalette[In.indices.w]) * w.w;
+
+        skinnedTangent =
+            mul(o_tangent, (float3x3)SkinPalette[In.indices.x]) * w.x +
+            mul(o_tangent, (float3x3)SkinPalette[In.indices.y]) * w.y +
+            mul(o_tangent, (float3x3)SkinPalette[In.indices.z]) * w.z +
+            mul(o_tangent, (float3x3)SkinPalette[In.indices.w]) * w.w;
+    }
+
+    vout.pos   = mul(skinnedPos, mvMatrix);
+    vout.texCo = In.texCo;
+
+    vout.norW = mul(
+        normalize(skinnedNormal),
+        float3x3(world[0].xyz, world[1].xyz, world[2].xyz)
+    );
+
+    vout.tanW = mul(
+        normalize(skinnedTangent),
+        float3x3(world[0].xyz, world[1].xyz, world[2].xyz)
+    );
+
+    vout.binW = cross(vout.norW, vout.tanW);
 
     return vout;
 }
@@ -795,6 +867,16 @@ technique11 Generic
     }
 }
 
+technique11 GenericSkinned
+{
+    pass P0
+    {
+        SetVertexShader(CompileShader(vs_5_0, vsSkinned()));
+        SetGeometryShader(NULL);
+        SetPixelShader(CompileShader(ps_5_0, psMain()));
+    }
+}
+
 technique11 Eye
 {
     pass P0
@@ -804,6 +886,17 @@ technique11 Eye
         SetPixelShader(CompileShader(ps_5_0, psEye()));
     }
 }
+
+technique11 EyeSkinned
+{
+    pass P0
+    {
+        SetVertexShader(CompileShader(vs_5_0, vsSkinned()));
+        SetGeometryShader(NULL);
+        SetPixelShader(CompileShader(ps_5_0, psEye()));
+    }
+}
+
 
 technique11 Garment
 {
@@ -815,6 +908,17 @@ technique11 Garment
     }
 }
 
+technique11 GarmentSkinned
+{
+    pass P0
+    {
+        SetVertexShader(CompileShader(vs_5_0, vsSkinned()));
+        SetGeometryShader(NULL);
+        SetPixelShader(CompileShader(ps_5_0, psGarment()));
+    }
+}
+
+
 technique11 HairC
 {
     pass P0
@@ -825,6 +929,17 @@ technique11 HairC
     }
 }
 
+technique11 HairCSkinned
+{
+    pass P0
+    {
+        SetVertexShader(CompileShader(vs_5_0, vsSkinned()));
+        SetGeometryShader(NULL);
+        SetPixelShader(CompileShader(ps_5_0, psHairC()));
+    }
+}
+
+
 technique11 SkinB
 {
     pass P0
@@ -834,6 +949,17 @@ technique11 SkinB
         SetPixelShader(CompileShader(ps_5_0, psSkinB()));
     }
 }
+
+technique11 SkinBSkinned
+{
+    pass P0
+    {
+        SetVertexShader(CompileShader(vs_5_0, vsSkinned()));
+        SetGeometryShader(NULL);
+        SetPixelShader(CompileShader(ps_5_0, psSkinB()));
+    }
+}
+
 
 // ================================================================================================
 // PugTools Filters

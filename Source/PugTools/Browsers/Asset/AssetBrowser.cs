@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -29,10 +29,14 @@ namespace PugTools {
     #region Fields
     private Dictionary<String, TreeListItem> m_assetDict; // = new Dictionary<string, TreeListItem>();
     private readonly String m_assetsLocation;
+    private readonly String m_previousAssetsLocation;
+    private readonly Boolean m_previousAssetsUsePts;
+    private readonly Boolean m_compareFiles;
     private Boolean m_audioPlaying; // = false;
     private Boolean m_autoPreview; // = true;
     internal Boolean m_closing; // = false;
     private Assets m_currentAssets;
+    private Assets m_previousAssets;
     private Boolean m_extractByExtensions; // = false;
     private Int32 m_extractCount; // = 0;
     private HashSet<String> m_extractExtensions; // = new HashSet<String>();
@@ -60,22 +64,52 @@ namespace PugTools {
     // consistent with WEM/BNK playback.
     private Boolean m_jbaActive;
     private System.Windows.Forms.Timer m_jbaUiTimer;
+    private ToolStripButton m_jbaSkeletonButton;
+    private JBAAppearanceIndex m_jbaAppearanceIndex;
+    private DataObjectModel m_jbaDom;
+    private readonly Object m_jbaDependencyLock = new Object();
+    private Dictionary<String, List<String>> m_jbaMphParentsByJba;
+    private Boolean m_jbaDependencyIndexLoaded;
 
     #endregion
 
     #region Asset Browser
-    internal AssetBrowser(String assetLocation, Boolean usePTS) {
+    internal AssetBrowser(String assetLocation, Boolean usePTS,
+                          String previousAssetLocation = null, Boolean previousUsePTS = false,
+                          Boolean compareFiles = false) {
       InitializeComponent();
       Config.Load();
 
       m_assetsLocation = assetLocation;
       m_assetsUsePts = usePTS;
+      m_previousAssetsLocation = previousAssetLocation;
+      m_previousAssetsUsePts = previousUsePTS;
+      m_compareFiles = compareFiles && !String.IsNullOrWhiteSpace(previousAssetLocation);
       m_autoPreview = true;
       m_extractPath = Config.ExtractAssetsPath;
       m_hashData = HashDictionaryInstance.Instance;
 
       m_jbaUiTimer = new System.Windows.Forms.Timer { Interval = 50 };
       m_jbaUiTimer.Tick += JbaUiTimerTick;
+
+      // JBA-only diagnostic overlay. Keep this dynamic so the existing audio
+      // toolbar/designer stays untouched; when a JBA is selected the button is
+      // inserted immediately before the progress bar.
+      m_jbaSkeletonButton = new ToolStripButton {
+        AutoSize = true,
+        CheckOnClick = true,
+        DisplayStyle = ToolStripItemDisplayStyle.Text,
+        Text = "Skeleton",
+        ToolTipText = "Show animation skeleton",
+        Visible = false
+      };
+      m_jbaSkeletonButton.CheckedChanged += JbaSkeletonButtonCheckedChanged;
+
+      Int32 jbaProgressIndex = toolStrip1.Items.IndexOf(toolStrip1ProgressBar1);
+      if (jbaProgressIndex >= 0)
+        toolStrip1.Items.Insert(jbaProgressIndex, m_jbaSkeletonButton);
+      else
+        toolStrip1.Items.Add(m_jbaSkeletonButton);
 
       if (!m_hashData.Loaded) m_hashData.Load();
 
@@ -211,10 +245,27 @@ namespace PugTools {
       System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.Interactive;
 
       m_currentAssets = AssetHandler.Instance.GetCurrentAssets(m_assetsLocation, m_assetsUsePts);
+
+      if (m_compareFiles) {
+        m_previousAssets =
+          AssetHandler.Instance.GetPreviousAssets(m_previousAssetsLocation, m_previousAssetsUsePts);
+
+        // GetPreviousAssets historically unloads the shared hash dictionary. The browser
+        // needs it again to resolve paths for both snapshots.
+        if (!m_hashData.Loaded) m_hashData.Load();
+      }
     }
 
     private void BackgroundWorker1Completed(Object sender, RunWorkerCompletedEventArgs e) {
       if (m_closing) return;
+
+      if (e.Error != null) {
+        StatusLabel1Text("Unable to load assets for comparison.");
+        MessageBox.Show(e.Error.Message, "Asset Browser", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        LoadingSwirl1Hide();
+        ProgressBar1Hide();
+        return;
+      }
 
       m_assetDict = new Dictionary<String, TreeListItem>();
 
@@ -230,6 +281,11 @@ namespace PugTools {
 
     private void BackgroundWorker2Run(Object sender, DoWorkEventArgs e) {
       if (m_closing) return;
+
+      if (m_compareFiles && m_previousAssets != null) {
+        BuildCompareFileTree();
+        return;
+      }
 
       HashSet<String> allDirs = new HashSet<String>();
       HashSet<String> fileDirs = new HashSet<String>();
@@ -439,8 +495,126 @@ namespace PugTools {
       }
     }
 
+    private void BuildCompareFileTree() {
+      HashSet<String> allDirs = new HashSet<String>();
+      HashSet<String> fileDirs = new HashSet<String>();
+      List<BuildFileDifference> differences =
+        BuildAssetComparer.Compare(m_currentAssets, m_previousAssets);
+
+      Int32 newCount = 0;
+      Int32 changedCount = 0;
+      Int32 removedCount = 0;
+
+      foreach (BuildFileDifference difference in differences) {
+        if (m_closing) return;
+
+        BuildFileRecord display = difference.DisplayRecord;
+        if (display?.HashInfo == null) continue;
+
+        HashFileInfo info = display.HashInfo;
+        String prefix = difference.State switch {
+          BuildFileState.New => "/root/new",
+          BuildFileState.Changed => "/root/changed",
+          BuildFileState.Removed => "/root/removed",
+          _ => "/root"
+        };
+
+        String directory;
+        String displayName;
+
+        if (info.IsNamed) {
+          directory = info.Directory;
+          displayName = info.FileName;
+        } else {
+          // Keep the archive and guessed extension in the tree for unknown files,
+          // matching the normal Asset Browser layout.
+          directory = "/" + info.Source.Replace(".tor", String.Empty)
+            + "/" + info.Extension;
+          displayName = info.FileName + "." + info.Extension;
+        }
+
+        String parentId = prefix + directory;
+        String itemId = parentId + "/" + displayName;
+
+        // A named path should normally be unique. If a language/library collision does
+        // occur, retain both entries by adding the archive source to the internal id.
+        if (m_assetDict.ContainsKey(itemId))
+          itemId += " [" + info.Source + "]";
+
+        TreeListItem asset = new TreeListItem(itemId, parentId, displayName, info) {
+          CompareState = difference.State,
+          PreviousHashInfo = difference.Previous?.HashInfo
+        };
+
+        m_assetDict.Add(itemId, asset);
+        fileDirs.Add(parentId);
+
+        switch (difference.State) {
+          case BuildFileState.New:
+            newCount++;
+            break;
+          case BuildFileState.Changed:
+            changedCount++;
+            break;
+          case BuildFileState.Removed:
+            removedCount++;
+            break;
+        }
+      }
+
+      HashFileInfo empty = new HashFileInfo(0, 0, null);
+      m_assetDict.Add("/root", new TreeListItem("/root", String.Empty, "Root", empty));
+      m_assetDict.Add(
+        "/root/changed",
+        new TreeListItem(
+          "/root/changed", "/root", "Changed Files (" + changedCount + ")", empty
+        )
+      );
+      m_assetDict.Add(
+        "/root/new",
+        new TreeListItem("/root/new", "/root", "New Files (" + newCount + ")", empty)
+      );
+      m_assetDict.Add(
+        "/root/removed",
+        new TreeListItem(
+          "/root/removed", "/root", "Removed Files (" + removedCount + ")", empty
+        )
+      );
+
+      foreach (String dir in fileDirs) {
+        String[] temp = dir.Split('/');
+        for (Int32 i = 0; i <= temp.Length; i++) {
+          String output = String.Join("/", temp, 0, i);
+          if (output.Length > 0) allDirs.Add(output);
+        }
+      }
+
+      foreach (String dir in allDirs) {
+        String[] temp = dir.Split('/');
+        String parentDir = String.Join("/", temp.Take(temp.Length - 1));
+        if (parentDir.Length == 0) parentDir = "/root";
+
+        String display = temp.Last();
+        if (!m_assetDict.ContainsKey(dir))
+          m_assetDict.Add(dir, new TreeListItem(dir, parentDir, display, empty));
+      }
+
+      // This count is used only for hash-dictionary save prompts. Build comparison is
+      // read-only and deliberately does not change dictionary CRC baselines.
+      m_modNewCount = 0;
+      backgroundWorker2.ReportProgress(100);
+    }
+
     private void BackgroundWorker2Completed(Object sender, RunWorkerCompletedEventArgs e) {
       if (m_closing) return;
+
+      if (e.Error != null) {
+        StatusLabel1Text("Unable to compare asset builds.");
+        MessageBox.Show(e.Error.Message, "Asset Browser", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        LoadingSwirl1Hide();
+        ProgressBar1Hide();
+        return;
+      }
 
       ProgressBar1Value(0);
       ProgressBar1Style(ProgressBarStyle.Marquee);
@@ -475,7 +649,9 @@ namespace PugTools {
       m_panelRender.Init();
 
       loadingSwirl1.Hide();
-      toolStripStatusLabel1.Text = "Loading Complete.";
+      toolStripStatusLabel1.Text = m_compareFiles
+        ? "Comparison loaded. Showing New, Changed and Removed files only."
+        : "Loading Complete.";
       toolStripProgressBar1.Visible = false;
       toolStripProgressBar1.Value = 0;
       toolStripProgressBar1.Style = ProgressBarStyle.Continuous;
@@ -851,6 +1027,11 @@ namespace PugTools {
         // Stop JBA UI state before switching to another asset.
         m_jbaActive = false;
         m_jbaUiTimer?.Stop();
+        if (m_jbaSkeletonButton != null) {
+          m_jbaSkeletonButton.Checked = false;
+          m_jbaSkeletonButton.Visible = false;
+        }
+        m_panelRender?.SetShowSkeleton(false);
 
         // Restore the audio strip defaults; JBA temporarily repurposes button 3
         // as a Loop toggle.
@@ -1032,8 +1213,18 @@ namespace PugTools {
 
         treeViewGrid1.TopItemIndex = 0;
         loadingSwirl1.Visible = false;
-        toolStripStatusLabel1.Text = "File Loaded.";
-        toolStripStatusLabel2.Text = String.Empty;
+
+        // PreviewAssetJBA writes a detailed mapping/skeleton/appearance status
+        // from its UI callback. Do not overwrite it with the generic message
+        // after the background preview task completes.
+        if (!String.Equals(
+              asset.HashInfo.Extension,
+              "JBA",
+              StringComparison.OrdinalIgnoreCase)) {
+          toolStripStatusLabel1.Text = "File Loaded.";
+          toolStripStatusLabel2.Text = String.Empty;
+        }
+
         toolStripProgressBar1.Visible = false;
 
         ButtonsEnable();
@@ -1171,6 +1362,301 @@ namespace PugTools {
       catch (Exception) { }
     }
 
+    private static String NormalizeJbaAssetPath(String raw) {
+      String path = (raw ?? String.Empty).Replace('\\', '/').Trim();
+      const String namedPrefix = "/root/named";
+      if (path.StartsWith(namedPrefix, StringComparison.OrdinalIgnoreCase))
+        path = path.Substring(namedPrefix.Length);
+
+      while (path.Contains("//"))
+        path = path.Replace("//", "/");
+
+      if (path.Length > 0 && path[0] != '/')
+        path = "/" + path;
+
+      return path;
+    }
+
+    /// <summary>
+    /// Jedipedia resolves standalone JBA clips through global.dep, whose edge is
+    /// MPH -> JBA. PugTools already has a global.dep reader; build only the
+    /// animation reverse edges once, on demand, so a generic clip such as
+    /// placeable/airlockdoor/open.jba resolves to placeable_openclose.mph
+    /// without filename guessing.
+    /// </summary>
+    private void EnsureJbaDependencyIndex() {
+      if (m_jbaDependencyIndexLoaded)
+        return;
+
+      lock (m_jbaDependencyLock) {
+        if (m_jbaDependencyIndexLoaded)
+          return;
+
+        var result = new Dictionary<String, List<String>>(
+          StringComparer.OrdinalIgnoreCase
+        );
+
+        try {
+          TorArchive.File depFile = m_currentAssets?.FindFile(
+            "/resources/global.dep"
+          );
+
+          if (depFile != null) {
+            using Stream depStream = depFile.OpenCopyInMemory();
+            using BinaryReader depReader = new BinaryReader(depStream);
+            List<DEP_Entry> entries = ViewDEP.Read(
+              depReader,
+              m_hashData.Dictionary
+            );
+
+            foreach (DEP_Entry entry in entries ?? new List<DEP_Entry>()) {
+              String parent = NormalizeJbaAssetPath(entry?.Filename);
+              if (!parent.EndsWith(
+                    ".mph",
+                    StringComparison.OrdinalIgnoreCase)) {
+                continue;
+              }
+
+              foreach (String dependency in entry.Dependencies
+                ?? new List<String>()) {
+                String child = NormalizeJbaAssetPath(dependency);
+                if (!child.EndsWith(
+                      ".jba",
+                      StringComparison.OrdinalIgnoreCase)) {
+                  continue;
+                }
+
+                if (!result.TryGetValue(child, out List<String> parents)) {
+                  parents = new List<String>();
+                  result.Add(child, parents);
+                }
+
+                if (!parents.Contains(
+                      parent,
+                      StringComparer.OrdinalIgnoreCase)) {
+                  parents.Add(parent);
+                }
+              }
+            }
+          }
+        }
+        catch (Exception ex) {
+          System.Diagnostics.Debug.WriteLine(
+            "JBA global.dep index failed: " + ex
+          );
+        }
+
+        m_jbaMphParentsByJba = result;
+        m_jbaDependencyIndexLoaded = true;
+      }
+    }
+
+    private List<String> GetJbaMphParents(
+      String directory,
+      String clipName
+    ) {
+      EnsureJbaDependencyIndex();
+
+      String fullPath = NormalizeJbaAssetPath(
+        directory.TrimEnd('/', '\\') + "/" + clipName
+      );
+
+      if (m_jbaMphParentsByJba != null
+          && m_jbaMphParentsByJba.TryGetValue(
+            fullPath,
+            out List<String> parents)) {
+        return parents.ToList();
+      }
+
+      return new List<String>();
+    }
+
+    private Boolean TryApplyJbaAmxMapping(
+      String directory,
+      String clipName,
+      JBAAnimation animation,
+      out String sourcePath
+    ) {
+      sourcePath = null;
+      if (animation == null
+          || m_currentAssets == null
+          || m_jbaAppearanceIndex == null
+          || String.IsNullOrWhiteSpace(directory)) {
+        return false;
+      }
+
+      String folder = NormalizeJbaAssetPath(directory).TrimEnd('/') + "/";
+      String clipBase = Path.GetFileNameWithoutExtension(
+        clipName ?? String.Empty
+      ) ?? String.Empty;
+
+      var candidates = new List<String>();
+
+      void AddCandidate(String path) {
+        path = NormalizeJbaAssetPath(path);
+        if (String.IsNullOrWhiteSpace(path)) return;
+        if (!candidates.Contains(path, StringComparer.OrdinalIgnoreCase))
+          candidates.Add(path);
+      }
+
+      // Exact dependency parents first, matching Jedipedia's depParents path.
+      foreach (String parent in GetJbaMphParents(directory, clipName))
+        AddCandidate(parent + ".amx");
+
+      // Folder-wide AnimShare table is the next cheap/direct source.
+      AddCandidate(folder + "anim_sharing.mph.amx");
+
+      // Per-clip network naming fallback used by Jedipedia when global.dep is
+      // unavailable. Keep the sidecar before the MPH itself.
+      foreach (String mph in m_jbaAppearanceIndex.AnimationMphFiles
+        .Where(path =>
+          path.StartsWith(folder, StringComparison.OrdinalIgnoreCase)
+          && Path.GetFileNameWithoutExtension(path)
+            .EndsWith(clipBase, StringComparison.OrdinalIgnoreCase)
+        )
+        .OrderBy(path => path.Length)
+        .ThenBy(path => path, StringComparer.OrdinalIgnoreCase)) {
+        AddCandidate(mph + ".amx");
+      }
+
+      // AMX is tiny and each record names its clip explicitly. Probe any other
+      // sibling sidecars as a final AMX fallback; unrelated files reject
+      // themselves without changing the animation.
+      foreach (String path in m_jbaAppearanceIndex.AnimationAmxFiles
+        .Where(path => path.StartsWith(
+          folder,
+          StringComparison.OrdinalIgnoreCase))
+        .OrderBy(path => path.Length)
+        .ThenBy(path => path, StringComparer.OrdinalIgnoreCase)) {
+        AddCandidate(path);
+      }
+
+      foreach (String path in candidates) {
+        TorArchive.File file = m_currentAssets.FindFile(path);
+        if (file == null) continue;
+
+        try {
+          using Stream stream = file.OpenCopyInMemory();
+          using BinaryReader reader = new BinaryReader(stream);
+          if (AMXAnimationReader.TryApplyBoneNames(
+                reader,
+                clipName,
+                animation)) {
+            sourcePath = path;
+            return true;
+          }
+        }
+        catch (Exception ex) {
+          System.Diagnostics.Debug.WriteLine(
+            "JBA AMX mapping failed for " + clipName
+            + " via " + path + ": " + ex.Message
+          );
+        }
+      }
+
+      return false;
+    }
+
+    private JBARig FindJbaRig(
+      String directory,
+      String clipName,
+      out String sourcePath
+    ) {
+      sourcePath = null;
+      if (m_currentAssets == null
+          || m_jbaAppearanceIndex == null
+          || String.IsNullOrWhiteSpace(directory)) {
+        return null;
+      }
+
+      String folder = NormalizeJbaAssetPath(directory).TrimEnd('/') + "/";
+      String clipBase = Path.GetFileNameWithoutExtension(
+        clipName ?? String.Empty
+      ) ?? String.Empty;
+
+      var candidates = new List<String>();
+
+      void AddCandidate(String path) {
+        path = NormalizeJbaAssetPath(path);
+        if (String.IsNullOrWhiteSpace(path)) return;
+        if (!candidates.Contains(path, StringComparer.OrdinalIgnoreCase))
+          candidates.Add(path);
+      }
+
+      // Authoritative global.dep parents first.
+      foreach (String parent in GetJbaMphParents(directory, clipName))
+        AddCandidate(parent);
+
+      AddCandidate(folder + clipBase + ".mph");
+
+      foreach (String path in m_jbaAppearanceIndex.AnimationMphFiles
+        .Where(path =>
+          path.StartsWith(folder, StringComparison.OrdinalIgnoreCase)
+          && Path.GetFileNameWithoutExtension(path)
+            .EndsWith(clipBase, StringComparison.OrdinalIgnoreCase)
+        )
+        .OrderBy(path => path.Length)
+        .ThenBy(path => path, StringComparer.OrdinalIgnoreCase)) {
+        AddCandidate(path);
+      }
+
+      // Without global.dep a placeable's network often has no lexical relation
+      // to "open"/"close". Placeable folders are small, so this bounded sibling
+      // probe is safe and FindRigForClip accepts only a network that actually
+      // lists the requested clip.
+      Boolean placeable = folder.IndexOf(
+        "/anim/placeable/",
+        StringComparison.OrdinalIgnoreCase
+      ) >= 0;
+
+      if (placeable) {
+        foreach (String path in m_jbaAppearanceIndex.AnimationMphFiles
+          .Where(path => path.StartsWith(
+            folder,
+            StringComparison.OrdinalIgnoreCase))
+          .OrderBy(path => path.Length)
+          .ThenBy(path => path, StringComparer.OrdinalIgnoreCase)) {
+          AddCandidate(path);
+        }
+      }
+
+      AddCandidate(folder + "anim_library.mph");
+
+      foreach (String path in candidates) {
+        TorArchive.File file = m_currentAssets.FindFile(path);
+        if (file == null) continue;
+
+        try {
+          using Stream stream = file.OpenCopyInMemory();
+          using BinaryReader reader = new BinaryReader(stream);
+          JBARig rig = MPHAnimationReader.FindRigForClip(
+            reader,
+            clipName
+          );
+
+          if (rig == null
+              || rig.Bones == null
+              || rig.Bones.Count == 0
+              || rig.AnimToRig == null
+              || rig.AnimToRig.Length == 0) {
+            continue;
+          }
+
+          rig.Source = path;
+          sourcePath = path;
+          return rig;
+        }
+        catch (Exception ex) {
+          System.Diagnostics.Debug.WriteLine(
+            "JBA MPH mapping failed for " + clipName
+            + " via " + path + ": " + ex
+          );
+        }
+      }
+
+      return null;
+    }
+
     private void PreviewAssetJBA(String directory, String fileName) {
       try {
         if (m_inputStream == null) return;
@@ -1180,52 +1666,184 @@ namespace PugTools {
         using (BinaryReader br = new BinaryReader(m_inputStream, Encoding.UTF8, true))
           animation = JBAReader.Read(br);
 
-        JBARig rig = null;
-        String mphPath =
-          (directory.TrimEnd('/') + "/anim_library.mph").Replace("//", "/");
-        TorArchive.File mphFile = m_currentAssets.FindFile(mphPath);
+        // Build the named-file index before channel binding. Current 64-bit
+        // JBA files often omit bone names, while sibling *.mph.amx files carry
+        // the exact clip -> bone-list mapping.
+        if (m_jbaAppearanceIndex == null) {
+          IEnumerable<String> namedPaths = m_assetDict != null
+            ? m_assetDict.Keys
+            : Enumerable.Empty<String>();
+          m_jbaAppearanceIndex = JBAAppearance.BuildIndex(namedPaths);
+        }
 
-        if (mphFile != null) {
-          try {
-            using Stream mphStream = mphFile.OpenCopyInMemory();
-            using BinaryReader mphReader = new BinaryReader(mphStream);
-            rig = MPHAnimationReader.FindRigForClip(mphReader, fileName);
-          }
-          catch (Exception ex) {
-            System.Diagnostics.Debug.WriteLine(
-              "JBA MPH mapping failed for " + fileName + ": " + ex
-            );
+        String amxSource;
+        Boolean amxMapped = TryApplyJbaAmxMapping(
+          directory,
+          fileName,
+          animation,
+          out amxSource
+        );
+
+        // Resolve the exact parent network through global.dep first, then
+        // Jedipedia's same-folder fallbacks. Keep the rig even when AMX also
+        // supplied names: both now come from the same clip relationship, and
+        // the RigToAnimMap is the authoritative channel order.
+        String rigSource;
+        JBARig rig = FindJbaRig(
+          directory,
+          fileName,
+          out rigSource
+        );
+
+        // Morpheme files prefixed with ad_ are additive overlays, not complete
+        // poses. Jedipedia resolves them against a deterministic sibling idle
+        // in the same animation directory, falling back to the target GR2 bind
+        // pose when neither base exists. Treating an ad_ file as an absolute
+        // pose collapses most bones onto their parents (the "folded" model).
+        String clipFileName = Path.GetFileName(fileName) ?? fileName;
+        Boolean additive = clipFileName.StartsWith(
+          "ad_",
+          StringComparison.OrdinalIgnoreCase
+        );
+
+        JBAAnimation baseAnimation = null;
+        JBARig baseRig = null;
+        String additiveBaseName = null;
+        String additiveBaseRigSource = null;
+        String additiveBaseAmxSource = null;
+        Boolean additiveBaseAmxMapped = false;
+
+        if (additive) {
+          String[] baseCandidates = {
+            "ex_stand_idle_1.jba",
+            "ex_idle_1.jba"
+          };
+
+          foreach (String candidateName in baseCandidates) {
+            String candidatePath =
+              (directory.TrimEnd('/') + "/" + candidateName)
+              .Replace("//", "/");
+
+            TorArchive.File candidateFile =
+              m_currentAssets.FindFile(candidatePath);
+
+            if (candidateFile == null)
+              continue;
+
+            try {
+              using (Stream baseStream = candidateFile.OpenCopyInMemory())
+              using (BinaryReader baseReader = new BinaryReader(baseStream))
+                baseAnimation = JBAReader.Read(baseReader);
+
+              additiveBaseAmxMapped = TryApplyJbaAmxMapping(
+                directory,
+                candidateName,
+                baseAnimation,
+                out additiveBaseAmxSource
+              );
+
+              try {
+                baseRig = FindJbaRig(
+                  directory,
+                  candidateName,
+                  out additiveBaseRigSource
+                );
+              }
+              catch (Exception ex) {
+                System.Diagnostics.Debug.WriteLine(
+                  "JBA additive base MPH mapping failed for "
+                  + candidateName + ": " + ex
+                );
+              }
+
+              additiveBaseName = candidateName;
+              break;
+            }
+            catch (Exception ex) {
+              baseAnimation = null;
+              baseRig = null;
+              System.Diagnostics.Debug.WriteLine(
+                "JBA additive base load failed for "
+                + candidateName + ": " + ex
+              );
+            }
           }
         }
 
         String bodyType = JBAAppearance.BodyTypeFromAnimationDirectory(directory);
 
-        String skeletonPath = !String.IsNullOrWhiteSpace(bodyType)
-          ? "/resources/art/dynamic/spec/" + bodyType + "_skeleton.gr2"
-          : "/resources/art/dynamic/spec/bmnnew_skeleton.gr2";
+        // Prefer the authored body-type skeleton. Some MAG-driven placeables
+        // do not ship a separately named *_skeleton.gr2; only in that case use
+        // the skeleton embedded in the actual appearance model. This restores
+        // the previously visible placeable preview without ever falling back
+        // to an unrelated humanoid rig.
+        String skeletonPath = JBAAppearance.ResolveSkeletonPath(
+          m_currentAssets,
+          bodyType,
+          m_jbaAppearanceIndex,
+          out String skeletonInfo
+        );
 
-        TorArchive.File skeletonFile = m_currentAssets.FindFile(skeletonPath);
+        GR2 skeleton = null;
+        TorArchive.File skeletonFile = String.IsNullOrWhiteSpace(skeletonPath)
+          ? null
+          : m_currentAssets.FindFile(skeletonPath);
 
-        if (skeletonFile == null) {
-          skeletonPath = "/resources/art/dynamic/spec/bmnnew_skeleton.gr2";
-          skeletonFile = m_currentAssets.FindFile(skeletonPath);
+        if (skeletonFile != null) {
+          using Stream skeletonStream = skeletonFile.OpenCopyInMemory();
+          using BinaryReader skeletonReader = new BinaryReader(skeletonStream);
+          skeleton = new GR2(skeletonReader, skeletonPath);
         }
 
-        if (skeletonFile == null) {
+        // The game's default NPP appearance is the authoritative mapping from
+        // animation body type to AMI model/material slots. DOM is cached by
+        // DomHandler, so only the first JBA preview pays the initialization cost.
+        if (m_jbaDom == null) {
+          try {
+            m_jbaDom = DomHandler.Instance.GetCurrentDOM(m_currentAssets);
+          }
+          catch (Exception ex) {
+            System.Diagnostics.Debug.WriteLine(
+              "JBA automatic NPP appearance initialization failed: " + ex
+            );
+          }
+        }
+
+        String appearanceInfo;
+        List<JBAAppearancePart> appearanceParts = JBAAppearance.Resolve(
+          m_currentAssets,
+          m_jbaDom,
+          skeleton,
+          bodyType,
+          directory,
+          m_jbaAppearanceIndex,
+          out appearanceInfo
+        );
+
+        if (skeleton == null || skeleton.skeleton_bones.Count == 0) {
+          skeleton = JBAAppearance.LoadSkeletonFromAppearance(
+            m_currentAssets,
+            appearanceParts,
+            out String appearanceSkeletonModel
+          );
+
+          if (skeleton != null && skeleton.skeleton_bones.Count > 0) {
+            skeletonInfo = "appearance fallback: "
+              + Path.GetFileName(appearanceSkeletonModel ?? String.Empty);
+          }
+        }
+
+        if (skeleton == null || skeleton.skeleton_bones.Count == 0) {
           BeginInvoke(new Action(() => {
-            txtRawView.Text = $"JBA: {fileName}\r\nVersion: {animation.Version}\r\nLength: {animation.Length:0.###} s\r\nFPS: {animation.FPS:0.###}\r\nFrames: {animation.FrameCount}\r\nBones: {animation.BoneCount}\r\n\r\nKein kompatibles Skeleton gefunden.";
+            txtRawView.Text = $"JBA: {fileName}\r\nVersion: {animation.Version}\r\nLength: {animation.Length:0.###} s\r\nFPS: {animation.FPS:0.###}\r\nFrames: {animation.FrameCount}\r\nBones: {animation.BoneCount}\r\n\r\nKein Body-Type- oder Appearance-Skeleton gefunden: {bodyType}";
             txtRawView.Visible = true;
             renderPanel.Visible = false;
+            toolStripStatusLabel1.Text = "JBA | Skeleton fehlt: " + bodyType;
+            toolStripStatusLabel2.Text = String.Empty;
           }));
           return;
         }
 
-        GR2 skeleton;
-        using (Stream skeletonStream = skeletonFile.OpenCopyInMemory())
-        using (BinaryReader skeletonReader = new BinaryReader(skeletonStream))
-          skeleton = new GR2(skeletonReader, skeletonPath);
-
-        List<JBAAppearancePart> appearanceParts = JBAAppearance.GetDefault(bodyType);
         GR2 previewModel = JBAAppearance.LoadComposite(
           m_currentAssets,
           skeleton,
@@ -1234,7 +1852,13 @@ namespace PugTools {
         );
 
         m_panelRender.LoadModel(previewModel);
-        m_panelRender.LoadAnimation(animation, rig);
+        m_panelRender.LoadAnimation(
+          animation,
+          rig,
+          baseAnimation,
+          baseRig,
+          additive
+        );
         m_panelRender.SetAnimationLoop(true);
         m_render = new Thread(m_panelRender.StartRender) { IsBackground = true };
         m_render.Start();
@@ -1262,11 +1886,95 @@ namespace PugTools {
           toolStrip1Button3.ToolTipText = "Loop animation";
           toolStrip1Button3.Checked = true;
 
+          if (m_jbaSkeletonButton != null) {
+            m_jbaSkeletonButton.Checked = false;
+            m_jbaSkeletonButton.Visible = true;
+            m_jbaSkeletonButton.ToolTipText = "Show animation skeleton and bone names";
+          }
+          m_panelRender.SetShowSkeleton(false);
+
           toolStrip1ProgressBar1.Minimum = 0;
           toolStrip1ProgressBar1.Maximum = Math.Max(1, animation.FrameCount - 1);
           toolStrip1ProgressBar1.Value = 0;
 
-          toolStripStatusLabel2.Text = $"JBA v{animation.Version} | {animation.Length:0.###} s | {animation.FPS:0.##} FPS | {animation.FrameCount} Frames | {animation.BoneCount} Channels | Rig: {(rig != null ? rig.Bones.Count + " bones" : "fallback")}";
+          String additiveInfo = String.Empty;
+          if (additive) {
+            additiveInfo = " | Additive base: "
+              + (additiveBaseName ?? "GR2 bind pose");
+
+            if (baseAnimation != null) {
+              additiveInfo += " [Bound "
+                + m_panelRender.AnimationBaseBoundChannelCount
+                + "/" + baseAnimation.BoneCount + " channels -> "
+                + m_panelRender.AnimationBaseBoundSkeletonBoneCount
+                + " bones";
+
+              if (!String.IsNullOrWhiteSpace(additiveBaseRigSource))
+                additiveInfo += " via " + Path.GetFileName(additiveBaseRigSource);
+              else if (additiveBaseAmxMapped
+                       && !String.IsNullOrWhiteSpace(additiveBaseAmxSource))
+                additiveInfo += " via " + Path.GetFileName(additiveBaseAmxSource);
+
+              additiveInfo += "]";
+            }
+          }
+
+          Int32 namedChannels = animation.BoneNames
+            .Take(Math.Min(animation.BoneCount, animation.BoneNames.Count))
+            .Count(name => !String.IsNullOrWhiteSpace(name)
+              && !name.StartsWith("bone_", StringComparison.OrdinalIgnoreCase));
+
+          Int32 rigMappedChannels = rig?.AnimToRig == null
+            ? 0
+            : Math.Min(
+              animation.BoneCount,
+              rig.AnimToRig.Count(index => index >= 0)
+            );
+
+          String mappingInfo;
+          if (rig != null) {
+            mappingInfo = rigMappedChannels + "/" + animation.BoneCount
+              + " channels via "
+              + Path.GetFileName(rigSource ?? rig.Source ?? String.Empty);
+
+            if (amxMapped)
+              mappingInfo += " | AMX: "
+                + Path.GetFileName(amxSource ?? String.Empty);
+          }
+          else if (amxMapped) {
+            mappingInfo = namedChannels + "/" + animation.BoneCount
+              + " names via "
+              + Path.GetFileName(amxSource ?? String.Empty);
+          }
+          else {
+            mappingInfo = namedChannels + "/" + animation.BoneCount
+              + " embedded names";
+          }
+
+          List<String> depParents = GetJbaMphParents(directory, fileName);
+          Int32 depParentCount = depParents.Count;
+          String depInfo = depParentCount.ToString();
+          if (depParentCount > 0) {
+            depInfo += " [" + String.Join(
+              ", ",
+              depParents.Select(path => Path.GetFileName(path))
+            ) + "]";
+          }
+
+          String boundInfo =
+            m_panelRender.AnimationBoundChannelCount
+            + "/" + animation.BoneCount + " channels -> "
+            + m_panelRender.AnimationBoundSkeletonBoneCount
+            + "/" + m_panelRender.AnimationSkeletonBoneCount
+            + " skeleton bones";
+
+          toolStripStatusLabel1.Text = "JBA | Mapping: " + mappingInfo
+            + " | Bound: " + boundInfo
+            + " | DEP: " + depInfo
+            + " | Skeleton: " + skeletonInfo
+            + " | Appearance: " + appearanceInfo
+            + additiveInfo;
+          toolStripStatusLabel2.Text = $"v{animation.Version} | {animation.Length:0.###} s | {animation.FPS:0.##} FPS | {animation.FrameCount} Frames";
           UpdateJbaToolbar();
           m_jbaUiTimer?.Start();
         }));
@@ -1276,6 +1984,8 @@ namespace PugTools {
           txtRawView.Text = "JBA konnte nicht abgespielt werden:\r\n\r\n" + ex;
           txtRawView.Visible = true;
           renderPanel.Visible = false;
+          toolStripStatusLabel1.Text = "JBA Fehler: " + ex.Message;
+          toolStripStatusLabel2.Text = String.Empty;
         }));
       }
     }
@@ -1959,6 +2669,19 @@ namespace PugTools {
 
     #endregion Hash List Methods
 
+    private void JbaSkeletonButtonCheckedChanged(Object sender, EventArgs e) {
+      if (!m_jbaActive
+          || m_panelRender == null
+          || m_jbaSkeletonButton == null) {
+        return;
+      }
+
+      m_panelRender.SetShowSkeleton(m_jbaSkeletonButton.Checked);
+      m_jbaSkeletonButton.ToolTipText = m_jbaSkeletonButton.Checked
+        ? "Hide animation skeleton and bone names"
+        : "Show animation skeleton and bone names";
+    }
+
     private void JbaUiTimerTick(Object sender, EventArgs e) {
       if (!m_jbaActive || m_panelRender == null) {
         m_jbaUiTimer?.Stop();
@@ -2193,10 +2916,36 @@ namespace PugTools {
           "Path",
           info.Directory
         });
-        dt.Rows.Add(new String[] {
-          "State",
-          info.FileState.ToString()
-        });
+        if (m_compareFiles && asset.CompareState != BuildFileState.None) {
+          dt.Rows.Add(new String[] {
+            "State",
+            asset.CompareState.ToString()
+          });
+          dt.Rows.Add(new String[] {
+            "Build Source",
+            asset.CompareState == BuildFileState.Removed ? "Previous" : "Current"
+          });
+
+          if (asset.CompareState == BuildFileState.Changed && asset.PreviousHashInfo?.File != null) {
+            dt.Rows.Add(new String[] {
+              "Previous Archive",
+              asset.PreviousHashInfo.Source
+            });
+            dt.Rows.Add(new String[] {
+              "Previous Checksum",
+              $"{asset.PreviousHashInfo.File.FileInfo.Checksum:X8}"
+            });
+            dt.Rows.Add(new String[] {
+              "Previous Size",
+              asset.PreviousHashInfo.File.FileInfo.UncompressedSize.ToString()
+            });
+          }
+        } else {
+          dt.Rows.Add(new String[] {
+            "State",
+            info.FileState.ToString()
+          });
+        }
         dt.Rows.Add(new String[] {
           "Compressed Size",
           info.File.FileInfo.CompressedSize.ToString()
