@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.Data;
 using System.Diagnostics;
+using System.Drawing;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -72,6 +73,7 @@ namespace PugTools {
       if (extractLocation == null) throw new ArgumentNullException(nameof(extractLocation));
 
       InitializeComponent();
+      ConfigureParsedNodeGridReadability();
       InitializeNodeFilterTreeView();
       InitializeNodeTreeLiveFilter();
       InitializeNodePageTabs();
@@ -134,6 +136,17 @@ namespace PugTools {
       // The existing right-click “Go to Node” remains available; double-click is the fast path.
       treeViewGrid1.MouseDoubleClick += TreeViewGrid1MouseDoubleClickNavigate;
     }
+
+    // The central Name/Type/Value tree is the parsed node view. The old system-font size leaves
+    // dense ability records difficult to read on high-resolution displays; increase only this
+    // data view, not the navigation tree or compact command controls.
+    private void ConfigureParsedNodeGridReadability() {
+      if (treeViewGrid1 == null) return;
+      float pointSize = Math.Max(10.5f, treeViewGrid1.Font.Size + 1.5f);
+      treeViewGrid1.Font = new Font(treeViewGrid1.Font.FontFamily, pointSize, treeViewGrid1.Font.Style);
+      treeViewGrid1.RowHeight = Math.Max(24, treeViewGrid1.Font.Height + 7);
+    }
+
     private void NodeBrowserFormClosed(Object sender, FormClosedEventArgs e) {
       if (_nodePreviewRememberedTextHeight > 0) {
         Config.NodePreviewTextHeight = _nodePreviewRememberedTextHeight;
@@ -562,7 +575,7 @@ namespace PugTools {
 
       _fullNodeTree = TreeViewFast.Controls.TreeViewFast.PrepareItems(
         _assetDict.Values, getId, getParentId, getDisplayName, getImageIndex, compare,
-        () => _closing
+        () => _closing, GetNodeTreeForeColor
       );
     }
 
@@ -582,6 +595,12 @@ namespace PugTools {
       baseAbility = id.Substring(0, slash);
       parts = parsed;
       return true;
+    }
+
+    // Jedipedia treats these as generated ability variants rather than independently authored abilities.  Preserve
+    // their names and click behavior, but make the numeric suffix entries visually subordinate in every client.
+    private static Color? GetNodeTreeForeColor(NodeAsset asset) {
+      return TryGetNumericAbilityVariant(asset?.id, out _, out _) ? Color.FromArgb(138, 138, 138) : null;
     }
     private void BackgroundWorker3Completed(Object sender, RunWorkerCompletedEventArgs e) {
       if (_closing) return;
@@ -1245,7 +1264,7 @@ namespace PugTools {
         return String.Compare(x?.id, y?.id, StringComparison.Ordinal);
       }
       return TreeViewFast.Controls.TreeViewFast.PrepareItems(
-        items, getId, getParentId, getDisplayName, getImageIndex, compare, shouldCancel
+        items, getId, getParentId, getDisplayName, getImageIndex, compare, shouldCancel, GetNodeTreeForeColor
       );
     }
 

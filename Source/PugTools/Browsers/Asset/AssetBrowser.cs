@@ -113,6 +113,7 @@ namespace PugTools {
     private ToolStripButton m_jbaSkeletonButton;
     private ToolStripComboBox m_jbaSpeedCombo;
     private JBAAppearanceIndex m_jbaAppearanceIndex;
+    private readonly Object m_jbaAppearanceIndexSync = new Object();
     private DataObjectModel m_jbaDom;
     private readonly Object m_jbaDependencyLock = new Object();
     private Dictionary<String, List<String>> m_jbaMphParentsByJba;
@@ -2703,12 +2704,7 @@ namespace PugTools {
         // Build the named-file index before channel binding. Current 64-bit
         // JBA files often omit bone names, while sibling *.mph.amx files carry
         // the exact clip -> bone-list mapping.
-        if (m_jbaAppearanceIndex == null) {
-          IEnumerable<String> namedPaths = m_assetDict != null
-            ? m_assetDict.Keys
-            : Enumerable.Empty<String>();
-          m_jbaAppearanceIndex = JBAAppearance.BuildIndex(namedPaths);
-        }
+        EnsureJbaAppearanceIndex();
 
         String amxSource;
         Boolean amxMapped = TryApplyJbaAmxMapping(
@@ -4498,6 +4494,55 @@ namespace PugTools {
           if (persisted) m_foundFiles.Add(line);
         }
       }
+
+      // The UI tree is a snapshot. A hash import can name the GR2/MAT/MAG files
+      // needed by a JBA after that snapshot was built, so the next preview must
+      // re-index the live archive records rather than keep the stale tree index.
+      if (m_foundFiles.Count > 0) {
+        lock (m_jbaAppearanceIndexSync) m_jbaAppearanceIndex = null;
+      }
+    }
+
+    /// <summary>
+    /// JBA appearance discovery starts with the named UI tree but also visits
+    /// the loaded TOR records. HashDictionary resolves names lazily, therefore
+    /// assets learned by Find File Names may exist only on those records until
+    /// the Asset Browser is reopened.
+    /// </summary>
+    private void EnsureJbaAppearanceIndex() {
+      if (m_jbaAppearanceIndex != null) return;
+      lock (m_jbaAppearanceIndexSync) {
+        if (m_jbaAppearanceIndex != null) return;
+        m_jbaAppearanceIndex = JBAAppearance.BuildIndex(EnumerateJbaAppearancePaths());
+      }
+    }
+
+    private IEnumerable<String> EnumerateJbaAppearancePaths() {
+      var seen = new HashSet<String>(StringComparer.OrdinalIgnoreCase);
+      var paths = new List<String>();
+      if (m_assetDict != null) {
+        foreach (String path in m_assetDict.Keys)
+          if (!String.IsNullOrWhiteSpace(path) && seen.Add(path)) paths.Add(path);
+      }
+
+      foreach (Library library in m_currentAssets?.Libraries ?? Enumerable.Empty<Library>()) {
+        if (library == null) continue;
+        try {
+          library.Load();
+          foreach (Archive archive in library.Archives.Values) {
+            if (archive == null) continue;
+            foreach (TorArchive.File file in archive.EnumerateFiles()) {
+              HashFileInfo info = new HashFileInfo(file.FileInfo.PrimaryHash, file.FileInfo.SecondaryHash, file);
+              if (!info.IsNamed || String.IsNullOrWhiteSpace(info.Directory) || String.IsNullOrWhiteSpace(info.FileName)) continue;
+              String path = info.Directory.TrimEnd('/') + "/" + info.FileName;
+              if (seen.Add(path)) paths.Add(path);
+            }
+          }
+        } catch (Exception ex) {
+          Debug.WriteLine("JBA appearance archive enumeration failed: " + ex.Message);
+        }
+      }
+      return paths;
     }
 
     #endregion Hash List Methods

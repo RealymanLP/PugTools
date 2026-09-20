@@ -21,7 +21,7 @@ namespace GomLib.Models {
     [JsonIgnore]
     public string Description_ {
       get {
-        return Regex.Replace(Description, @"\r\n?|\n", "<br />");
+        return Regex.Replace(Description ?? string.Empty, @"\r\n?|\n", "<br />");
       }
     }
     public string Description { get; set; }
@@ -49,18 +49,27 @@ namespace GomLib.Models {
       return ParseDescription(this, desc);
     }
     public static string ParseDescription(Ability abl, string desc) {
-      if (abl.DescriptionTokens == null)
+      // Some older/Beta builds contain abilities without a localized description
+      // even though description tokens are present. Treat a missing description as
+      // an empty string instead of aborting the complete extraction.
+      if (string.IsNullOrEmpty(desc))
+        return desc ?? string.Empty;
+      if (abl?.DescriptionTokens == null)
         return desc;
 
       for (var i = 0; i < abl.DescriptionTokens.Count; i++) {
         var curToken = abl.DescriptionTokens.ElementAt(i);
         var id = curToken.Key;
+        var tokenData = curToken.Value;
+        if (tokenData == null)
+          continue;
+
         var value = "";
-        if (curToken.Value.ContainsKey("ablParsedDescriptionToken"))
-          value = curToken.Value["ablParsedDescriptionToken"].ToString();
+        if (tokenData.ContainsKey("ablParsedDescriptionToken") && tokenData["ablParsedDescriptionToken"] != null)
+          value = tokenData["ablParsedDescriptionToken"].ToString();
         var type = "";
-        if (curToken.Value.ContainsKey("ablDescriptionTokenType"))
-          type = curToken.Value["ablDescriptionTokenType"].ToString().Replace("ablDescriptionTokenType", "");
+        if (tokenData.ContainsKey("ablDescriptionTokenType") && tokenData["ablDescriptionTokenType"] != null)
+          type = tokenData["ablDescriptionTokenType"].ToString().Replace("ablDescriptionTokenType", "");
         var start = desc.IndexOf("<<" + id);
 
         if (start == -1) {
@@ -70,7 +79,10 @@ namespace GomLib.Models {
         //console.log("id" + id + ":" + retval);
         //console.log("Start Index: " + start);
 
-        var end = desc[start..].IndexOf(">>") + 2;
+        var endMarker = desc[start..].IndexOf(">>");
+        if (endMarker < 0)
+          continue; // malformed/incomplete token in old or Beta data
+        var end = endMarker + 2;
 
         //console.log("Length: " +length);
         var fullToken = desc.Substring(start, end);
@@ -588,7 +600,7 @@ namespace GomLib.Models {
                 new XElement("Base62Id", Base62Id),
                 new XElement("Name", Name),
                 new XElement("Description", ParseDescription(Description)),
-                new XElement("DBURL", "https://torcommunity.com/database/ability/" + Base62Id + "/" + System.Web.HttpUtility.UrlEncode(Name.ToLower())));
+                new XElement("DBURL", "https://torcommunity.com/database/ability/" + Base62Id + "/" + System.Web.HttpUtility.UrlEncode((Name ?? string.Empty).ToLowerInvariant())));
 
         if (verbose) {
           /*ability.Element("Name").RemoveAll(); //removes base text to replace with localized variants.

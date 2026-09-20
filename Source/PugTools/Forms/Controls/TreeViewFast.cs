@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Drawing;
 using System.Linq;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -40,7 +41,8 @@ namespace TreeViewFast.Controls {
       Func<T, String> getDisplayName,
       Func<T, Int32> getImageIndex = null,
       Comparison<T> comparison = null,
-      Func<Boolean> shouldCancel = null
+      Func<Boolean> shouldCancel = null,
+      Func<T, Color?> getForeColor = null
     ) {
       if (items == null) throw new ArgumentNullException(nameof(items));
       if (getId == null) throw new ArgumentNullException(nameof(getId));
@@ -75,6 +77,9 @@ namespace TreeViewFast.Controls {
           Text = getDisplayName(item),
           Tag = item
         };
+
+        Color? foreColor = getForeColor?.Invoke(item);
+        if (foreColor.HasValue) node.ForeColor = foreColor.Value;
 
         if (getImageIndex != null) {
           Int32 imageIndex = getImageIndex(item);
