@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -1029,7 +1029,10 @@ namespace PugTools {
             // Do the cheap raw-GOM classification before the semantic quest loader touches/unloads
             // the object.  This gives the quest extractor a schema-independent source of truth and
             // makes the diagnostics useful even if a future client field temporarily breaks parsing.
-            try { prevObject = PreviousDom.GetObject(curObject.Name); } catch { prevObject = null; }
+            // Raw comparison is intentionally schema-independent. Loading the previous node here
+            // would parse old/Beta binary data using the current schema and can produce EOF/layout
+            // errors even though the node itself is perfectly usable for a metadata comparison.
+            prevObject = PreviousDom.GetObjectNoLoad(curObject.Name);
             if (gomPrefix == "qst.") {
               if (prevObject == null) {
                 rawQuestNew++;
@@ -1280,26 +1283,16 @@ namespace PugTools {
         foreach (GomObject curObject in currentObjects) {
           ProgressUpdate(i, count);
 
-          GomObject prevObject = null;
-          try {
-            prevObject = PreviousDom.GetObject(curObject.Name);
-          }
-          catch (Exception ex) {
-            // A malformed/unsupported legacy object must not terminate the
-            // whole extraction thread. Treat it as new and keep processing.
-            Debug.WriteLine(
-              $"Unable to load previous GOM object '{curObject.Name}': {ex}");
-            AddToList1(
-              $"Warning: unable to compare '{curObject.Name}': {ex.Message}"
-            );
-          }
+          // Raw GOM comparison only needs the node metadata (name, class, data length, checksum).
+          // Do not fully Load() the previous object here: that parses its payload with the current
+          // build's schema and can legitimately fail for older/Beta layouts (for example
+          // "Unable to read beyond the end").  GetObjectNoLoad keeps this comparison schema-neutral.
+          GomObject prevObject = PreviousDom.GetObjectNoLoad(curObject.Name);
 
           if (prevObject != null) {
             if (!prevObject.Equals(curObject)) {
               chaObjects.Add(prevObject, curObject);
             }
-
-            prevObject.Unload();
           } else {
             newObjects.Add(curObject);
           }
@@ -1397,10 +1390,34 @@ namespace PugTools {
           foreach (var objList in ObjectLists) {
             if (objList.Key == "Changed") {
               foreach (var changedPair in chaObjects) {
-                XElement oldElement = changedPair.Key.Print();
-                changedPair.Key.Unload();
-                XElement newElement = changedPair.Value.Print();
-                changedPair.Value.Unload();
+                XElement oldElement = null;
+                XElement newElement = null;
+                try {
+                  oldElement = changedPair.Key.Print();
+                } catch (Exception ex) {
+                  AddToList2($"GOM export fallback (previous): {changedPair.Key.Name} - {ex.GetType().Name}: {ex.Message}");
+                  oldElement = new XElement(
+                    "GOM_Item",
+                    new XAttribute("Id", changedPair.Key.Id),
+                    new XAttribute("Name", changedPair.Key.Name ?? String.Empty),
+                    new XAttribute("Status", "PreviousSchemaIncompatible")
+                  );
+                } finally {
+                  changedPair.Key.Unload();
+                }
+                try {
+                  newElement = changedPair.Value.Print();
+                } catch (Exception ex) {
+                  AddToList2($"GOM export fallback (current): {changedPair.Value.Name} - {ex.GetType().Name}: {ex.Message}");
+                  newElement = new XElement(
+                    "GOM_Item",
+                    new XAttribute("Id", changedPair.Value.Id),
+                    new XAttribute("Name", changedPair.Value.Name ?? String.Empty),
+                    new XAttribute("Status", "CurrentSchemaIncompatible")
+                  );
+                } finally {
+                  changedPair.Value.Unload();
+                }
 
                 newElement = CompareElements(oldElement, newElement);
                 oldElement = null;

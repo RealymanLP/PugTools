@@ -2,6 +2,7 @@
 using System.Collections;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -14,6 +15,7 @@ using FileFormats;
 using GomLib;
 using GomLib.Models;
 using SlimDX;
+using Matrix = SlimDX.Matrix;
 
 using TorFile = TorArchive.File;
 
@@ -39,9 +41,129 @@ namespace PugTools {
     private Boolean _nodePreviewUpdatingIppSetCheck;
     private Boolean _nodePreviewApplyingLayout;
     private Int32 _nodePreviewRememberedModelHeight = -1;
+    private Int32 _nodePreviewRememberedMapHeight = -1;
+    private Boolean _nodeMapPagePreviewActive;
+    private Boolean _nodeMapPagePreviewHeightUserSet;
     private Int32 _nodePreviewRememberedTextHeight = -1;
     private const String NodePreviewModelPanelName = "nodePreviewModelPanel";
     private const String NodePreviewBodyType = "bmn";
+
+    private sealed class NodeMapZoomPictureBox : PictureBox {
+      private Single _zoom = 1f;
+      private PointF _pan = PointF.Empty;
+      private Point _dragStart;
+      private PointF _panStart;
+      private Boolean _dragging;
+
+      public NodeMapZoomPictureBox() {
+        DoubleBuffered = true;
+        SizeMode = PictureBoxSizeMode.Normal;
+        Cursor = Cursors.Hand;
+        TabStop = true;
+      }
+
+      protected override void OnMouseWheel(MouseEventArgs e) {
+        if (Image == null) { base.OnMouseWheel(e); return; }
+        Single oldZoom = _zoom;
+        Single factor = e.Delta > 0 ? 1.20f : 1f / 1.20f;
+        _zoom = Math.Max(0.10f, Math.Min(8.0f, _zoom * factor));
+        if (Math.Abs(_zoom - oldZoom) > 0.001f) {
+          // Keep the image point underneath the cursor stable while zooming.
+          PointF imagePoint = new PointF(
+            (e.X - _pan.X) / oldZoom,
+            (e.Y - _pan.Y) / oldZoom);
+          _pan = new PointF(
+            e.X - imagePoint.X * _zoom,
+            e.Y - imagePoint.Y * _zoom);
+          Invalidate();
+        }
+        base.OnMouseWheel(e);
+      }
+
+      protected override void OnMouseDown(MouseEventArgs e) {
+        if (e.Button == MouseButtons.Left && Image != null) {
+          Focus();
+          _dragging = true;
+          _dragStart = e.Location;
+          _panStart = _pan;
+          Cursor = Cursors.SizeAll;
+          Capture = true;
+        }
+        base.OnMouseDown(e);
+      }
+
+      protected override void OnMouseMove(MouseEventArgs e) {
+        if (_dragging) {
+          _pan = new PointF(
+            _panStart.X + e.X - _dragStart.X,
+            _panStart.Y + e.Y - _dragStart.Y);
+          Invalidate();
+        }
+        base.OnMouseMove(e);
+      }
+
+      protected override void OnMouseUp(MouseEventArgs e) {
+        if (e.Button == MouseButtons.Left && _dragging) {
+          _dragging = false;
+          Capture = false;
+          Cursor = Cursors.Hand;
+        }
+        base.OnMouseUp(e);
+      }
+
+      protected override void OnDoubleClick(EventArgs e) {
+        ResetView();
+        base.OnDoubleClick(e);
+      }
+
+      protected override void OnPaint(PaintEventArgs e) {
+        if (Image == null) {
+          base.OnPaint(e);
+          return;
+        }
+
+        e.Graphics.Clear(Color.Black);
+        e.Graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+        e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        e.Graphics.CompositingQuality = CompositingQuality.HighQuality;
+
+        RectangleF destination = new RectangleF(
+          _pan.X, _pan.Y,
+          Image.Width * _zoom,
+          Image.Height * _zoom);
+        e.Graphics.DrawImage(Image, destination);
+      }
+
+      public void SetImage(Image image, Boolean keepView) {
+        Boolean hadImage = Image != null;
+        Image = image;
+        if (!keepView || !hadImage) FitView();
+        else Invalidate();
+      }
+
+      public void ResetView() {
+        FitView();
+      }
+
+      private void FitView() {
+        if (Image == null || ClientSize.Width <= 0 || ClientSize.Height <= 0) {
+          _zoom = 1f;
+          _pan = PointF.Empty;
+          Invalidate();
+          return;
+        }
+
+        Single zx = (Single)ClientSize.Width / Math.Max(1, Image.Width);
+        Single zy = (Single)ClientSize.Height / Math.Max(1, Image.Height);
+        _zoom = Math.Max(0.05f, Math.Min(1.0f, Math.Min(zx, zy)));
+        Single drawWidth = Image.Width * _zoom;
+        Single drawHeight = Image.Height * _zoom;
+        _pan = new PointF(
+          (ClientSize.Width - drawWidth) * 0.5f,
+          (ClientSize.Height - drawHeight) * 0.5f);
+        Invalidate();
+      }
+    }
 
     private sealed class PreviewField {
       public String Label { get; init; }
@@ -193,7 +315,13 @@ namespace PugTools {
         // changes (initial sizing/window constraints) must not overwrite the remembered values.
         if (_nodePreviewApplyingLayout || _nodePreviewSplit.Panel1Collapsed) return;
         if (_nodePreviewContentSplit != null && !_nodePreviewContentSplit.Panel2Collapsed) {
-          _nodePreviewRememberedModelHeight = _nodePreviewSplit.SplitterDistance;
+          if (_nodeMapPagePreviewActive) {
+            if (_nodePreviewSplit.SplitterDistance >= 260) {
+              _nodePreviewRememberedMapHeight = _nodePreviewSplit.SplitterDistance;
+              _nodeMapPagePreviewHeightUserSet = true;
+            }
+          } else
+            _nodePreviewRememberedModelHeight = _nodePreviewSplit.SplitterDistance;
         } else {
           _nodePreviewRememberedTextHeight = _nodePreviewSplit.SplitterDistance;
           Config.NodePreviewTextHeight = _nodePreviewRememberedTextHeight;
@@ -235,6 +363,14 @@ namespace PugTools {
 
       Int32 desiredPreviewHeight;
       if (hasModel) {
+        if (_nodeMapPagePreviewActive) {
+          // Map previews get a useful initial viewport. A tiny remembered value can be produced
+          // while WinForms is still laying out the controls; do not preserve that transient value.
+          if (_nodeMapPagePreviewHeightUserSet && _nodePreviewRememberedMapHeight >= 260)
+            desiredPreviewHeight = _nodePreviewRememberedMapHeight;
+          else
+            desiredPreviewHeight = Math.Max(520, _nodePreviewSplit.Height * 82 / 100);
+        } else {
         // Model nodes intentionally open almost like a dedicated model browser.  Keep just a small
         // raw-value strip visible below, matching the large viewport used in the Model Browser.
         // Once the user drags the outer splitter, that exact height is reused for every later
@@ -243,6 +379,7 @@ namespace PugTools {
           desiredPreviewHeight = _nodePreviewRememberedModelHeight;
         } else {
           desiredPreviewHeight = Math.Max(560, _nodePreviewSplit.Height * 90 / 100);
+        }
         }
       } else if (hasTextBody) {
         desiredPreviewHeight = _nodePreviewRememberedTextHeight > 0

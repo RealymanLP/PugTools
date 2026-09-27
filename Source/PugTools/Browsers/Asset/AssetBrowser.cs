@@ -3962,14 +3962,16 @@ namespace PugTools {
 
     #region Hash List Methods
     private void ParseFiles(String extension, DataObjectModel dom) {
-      List<String> assetDictKeys =
-        m_assetDict.Keys.Where(d => d.Contains("." + extension.ToLower())).ToList();
+      List<String> assetDictKeys = extension == "TEXTSPECS"
+        ? m_assetDict.Keys.Where(d => d.EndsWith(".mag", StringComparison.OrdinalIgnoreCase)
+                                   || d.EndsWith(".dyc", StringComparison.OrdinalIgnoreCase)).ToList()
+        : m_assetDict.Keys.Where(d => d.Contains("." + extension.ToLower())).ToList();
       List<TreeListItem> matches = new List<TreeListItem>();
 
       m_filesSearched = 0;
 
       foreach (String assetKey in assetDictKeys) {
-        if (assetKey.Split('.').Last().ToUpper() != extension) {
+        if (extension != "TEXTSPECS" && assetKey.Split('.').Last().ToUpper() != extension) {
           continue;
         }
 
@@ -4072,6 +4074,19 @@ namespace PugTools {
 
           m_namesFound = dat_reader.FileNames.Count;
           dat_reader.WriteFile();
+          break;
+
+        case "TEXTSPECS":
+          Format_TEXTSPECS textSpecsReader = new Format_TEXTSPECS(m_extractPath, extension);
+          foreach (TreeListItem asset in matches) {
+            m_filesSearched++;
+            using Stream assetStream = asset.HashInfo.File.OpenCopyInMemory();
+            textSpecsReader.Parse(
+              assetStream, asset.HashInfo.Directory + "/" + asset.HashInfo.FileName
+            );
+          }
+          m_namesFound = textSpecsReader.FileNames.Count;
+          textSpecsReader.WriteFile();
           break;
 
         case "CNV":
@@ -4456,7 +4471,10 @@ namespace PugTools {
         testLines.Add(resolved);
       }
 
-      if (currentUnnamedFiles.Count == 0) return;
+      if (currentUnnamedFiles.Count == 0) {
+        WriteFilenameFinderAudit(currentUnnamedFiles, new Dictionary<UInt64, String>());
+        return;
+      }
 
       // Locale variants are deliberately generated only here, after every parser/heuristic has
       // produced its structural candidates. A de-de/fr-fr filename is therefore persisted only
@@ -4501,6 +4519,60 @@ namespace PugTools {
       if (m_foundFiles.Count > 0) {
         lock (m_jbaAppearanceIndexSync) m_jbaAppearanceIndex = null;
       }
+
+      // Keep a compact, stable rest list beside the parser output.  This turns
+      // successive runs against beta/live clients into a useful dataset: a
+      // signature is a filename-independent identity, so a previously unknown
+      // row disappearing from the report means it was genuinely resolved, not
+      // merely renamed or moved to a different TOR.
+      WriteFilenameFinderAudit(
+        currentUnnamedFiles,
+        m_hashData.Dictionary.FindKnownFileNames(currentUnnamedHashes)
+      );
+    }
+
+    private void WriteFilenameFinderAudit(
+      IDictionary<UInt64, List<HashFileInfo>> originalUnknownFiles,
+      IDictionary<UInt64, String> resolvedNames
+    ) {
+      try {
+        String directory = Path.Combine(m_extractPath ?? String.Empty, "File_Names");
+        if (String.IsNullOrWhiteSpace(directory)) return;
+        Directory.CreateDirectory(directory);
+        String path = Path.Combine(directory, "filename_finder_unresolved.csv");
+
+        using var output = new StreamWriter(path, false, Encoding.UTF8);
+        output.WriteLine("primary_hash,secondary_hash,extension,archive,status,resolved_name");
+        if (originalUnknownFiles == null) return;
+
+        foreach (KeyValuePair<UInt64, List<HashFileInfo>> pair in originalUnknownFiles.OrderBy(x => x.Key)) {
+          UInt32 primary = unchecked((UInt32)(pair.Key >> 32));
+          UInt32 secondary = unchecked((UInt32)pair.Key);
+          HashFileInfo sample = pair.Value?.FirstOrDefault(x => x?.File?.FileInfo != null);
+          String extension = sample?.Extension ?? String.Empty;
+          String archive = sample?.File?.Archive?.StrippedFileName ?? String.Empty;
+          String name = null;
+          Boolean resolved = resolvedNames != null
+            && resolvedNames.TryGetValue(pair.Key, out name)
+            && !String.IsNullOrWhiteSpace(name);
+          output.WriteLine(String.Join(",", new[] {
+            primary.ToString("X8", CultureInfo.InvariantCulture),
+            secondary.ToString("X8", CultureInfo.InvariantCulture),
+            CsvEscape(extension),
+            CsvEscape(archive),
+            resolved ? "resolved" : "unresolved",
+            CsvEscape(resolved ? name : String.Empty)
+          }));
+        }
+      }
+      catch (Exception ex) {
+        Debug.WriteLine("Filename finder audit write failed: " + ex.Message);
+      }
+    }
+
+    private static String CsvEscape(String value) {
+      String text = value ?? String.Empty;
+      return '"' + text.Replace("\"", "\"\"") + '"';
     }
 
     /// <summary>

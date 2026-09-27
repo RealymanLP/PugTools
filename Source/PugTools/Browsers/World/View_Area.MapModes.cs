@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using FileFormats;
@@ -45,6 +45,29 @@ namespace PugTools {
     public bool InteractiveMapTravelMode => IsTaxiRouteMapActive || IsQuickTravelMapActive;
 
     private AreaMapPage InteractiveMapSelectedPage => InteractiveMapIsWorldScope ? interactiveMapWorldPage : interactiveMapAreaPage;
+
+    // Lightweight map-page information exposed to WorldBrowser so the UI can present the authored SWTOR
+    // world.areas.<areaId>.mapdata hierarchy without exposing the renderer's internal AreaMapPage type.
+    internal sealed class InteractiveMapPageInfo {
+      public long SId { get; set; }
+      public long ParentId { get; set; }
+      public long Guid { get; set; }
+      public string MapName { get; set; }
+      public string DisplayName { get; set; }
+      public bool HasImage { get; set; }
+    }
+
+    public List<InteractiveMapPageInfo> GetInteractiveMapPageInfos() {
+      var pages = area?.MapPages?.Where(InteractiveMapPageHasBounds)
+        .Select(p => new InteractiveMapPageInfo {
+          SId = p.SId, ParentId = p.ParentId, Guid = p.Guid, MapName = p.MapName,
+          DisplayName = p.DisplayName, HasImage = p.HasImage
+        }).ToList();
+      return pages ?? new List<InteractiveMapPageInfo>();
+    }
+
+    public long InteractiveMapSelectedPageSId => InteractiveMapSelectedPage?.SId ?? 0L;
+    public long InteractiveMapSelectedPageGuid => InteractiveMapSelectedPage?.Guid ?? 0L;
 
     private static bool InteractiveMapPageHasBounds(AreaMapPage page) {
       if (page == null) return false;
@@ -308,6 +331,31 @@ namespace PugTools {
       }
       UpdateMapCamera();
       InvalidateTemporalHistory();
+    }
+
+    public bool SelectInteractiveMapPage(long pageSId) {
+      if (!mapOpen) return false;
+      List<AreaMapPage> pages = area?.MapPages?.Where(InteractiveMapPageHasBounds).ToList();
+      if (pages == null || pages.Count == 0) return false;
+      AreaMapPage target = pages.FirstOrDefault(p => p.SId == pageSId);
+      if (target == null && pageSId != 0) target = pages.FirstOrDefault(p => p.Guid == pageSId);
+      if (target == null) return false;
+
+      AreaMapPage root = ResolveLinkedMapRoot(target, 0L) ?? ResolveInteractiveWorldPage();
+      bool isRoot = target.ParentId == 0 || ReferenceEquals(target, root);
+      interactiveMapWorldPage = root;
+      interactiveMapAreaPage = isRoot ? null : target;
+      interactiveMapWorldScope = isRoot;
+      ApplyInteractiveMapScopeExtents(true);
+      NotifyInteractiveMapModeChanged();
+      return true;
+    }
+
+    public bool SelectInteractiveMapPageByGuid(long pageGuid) {
+      if (!mapOpen || pageGuid == 0) return false;
+      AreaMapPage target = area?.MapPages?.FirstOrDefault(p => p.Guid == pageGuid && InteractiveMapPageHasBounds(p));
+      if (target == null) return false;
+      return SelectInteractiveMapPage(target.SId != 0 ? target.SId : target.Guid);
     }
 
     public void SetInteractiveMapWorldScope(bool world) {

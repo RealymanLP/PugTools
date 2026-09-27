@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Linq;
@@ -13,6 +13,8 @@ namespace PugTools {
     private Button worldMapScopeButton;
     private Button worldMapSourceButton;
     private Button worldMapCloseButton;
+    private ComboBox worldMapPageCombo;
+    private bool updatingWorldMapPageCombo;
     private ulong pendingMapLinkAreaId;
     private long pendingMapLinkMapNameSId;
     private long pendingMapLinkSubmapNameSId;
@@ -21,7 +23,7 @@ namespace PugTools {
     private void EnsureWorldMapModeControls() {
       if (worldMapModePanel != null || splitContainer3?.Panel1 == null) return;
       worldMapModePanel = new Panel {
-        Size = new Size(538, 38),
+        Size = new Size(760, 72),
         BackColor = Color.FromArgb(238, 12, 26, 32),
         Anchor = AnchorStyles.Top | AnchorStyles.Right,
         Padding = new Padding(6, 4, 6, 4),
@@ -73,6 +75,26 @@ namespace PugTools {
       worldMapCloseButton.FlatAppearance.BorderColor = Color.FromArgb(76, 145, 168);
       worldMapCloseButton.FlatAppearance.MouseOverBackColor = Color.FromArgb(36, 69, 82);
       worldMapCloseButton.FlatAppearance.MouseDownBackColor = Color.FromArgb(45, 83, 98);
+      worldMapPageCombo = new ComboBox {
+        Location = new Point(8, 38),
+        Size = new Size(744, 28),
+        DropDownStyle = ComboBoxStyle.DropDownList,
+        FlatStyle = FlatStyle.Flat,
+        BackColor = Color.FromArgb(8, 17, 22),
+        ForeColor = Color.FromArgb(221, 241, 247),
+        IntegralHeight = false,
+        DropDownHeight = 420,
+        TabStop = false
+      };
+      worldMapPageCombo.SelectedIndexChanged += (_, __) => {
+        if (updatingWorldMapPageCombo || panelRender == null || !panelRender.IsFullMapOpen) return;
+        if (worldMapPageCombo.SelectedItem is WorldMapPageChoice choice) {
+          bool changed = choice.SId != 0
+            ? panelRender.SelectInteractiveMapPage(choice.SId)
+            : panelRender.SelectInteractiveMapPageByGuid(choice.Guid);
+          if (changed) ActivateWorldRenderInput();
+        }
+      };
       worldMapCloseButton.Click += (_, __) => { panelRender?.CloseInteractiveMap(); ActivateWorldRenderInput(); };
       worldMapScopeButton.Click += (_, __) => {
         if (panelRender == null || !panelRender.IsFullMapOpen) return;
@@ -92,6 +114,7 @@ namespace PugTools {
       worldMapModePanel.Controls.Add(worldMapScopeButton);
       worldMapModePanel.Controls.Add(worldMapSourceButton);
       worldMapModePanel.Controls.Add(worldMapCloseButton);
+      worldMapModePanel.Controls.Add(worldMapPageCombo);
       splitContainer3.Panel1.Controls.Add(worldMapModePanel);
       LayoutWorldMapModeControls();
       worldMapModePanel.BringToFront();
@@ -102,6 +125,77 @@ namespace PugTools {
       int top = (worldToolbar?.Visible == true ? worldToolbar.Bottom : 0) + 7;
       worldMapModePanel.Left = Math.Max(4, splitContainer3.Panel1.ClientSize.Width - worldMapModePanel.Width - 9);
       worldMapModePanel.Top = Math.Max(4, top);
+    }
+
+    private sealed class WorldMapPageChoice {
+      public long SId { get; set; }
+      public long Guid { get; set; }
+      public long ParentId { get; set; }
+      public string Text { get; set; }
+      public override string ToString() => Text ?? String.Empty;
+    }
+
+    private static string WorldMapPageDisplayName(View_AREA.InteractiveMapPageInfo page) {
+      if (page == null) return String.Empty;
+      if (!String.IsNullOrWhiteSpace(page.DisplayName) && !String.Equals(page.DisplayName, page.MapName, StringComparison.OrdinalIgnoreCase))
+        return page.MapName + "  —  " + page.DisplayName;
+      return page.MapName ?? String.Empty;
+    }
+
+    private void RebuildWorldMapPageCombo() {
+      if (worldMapPageCombo == null || panelRender == null) return;
+      List<View_AREA.InteractiveMapPageInfo> pages = panelRender.GetInteractiveMapPageInfos();
+      long selected = panelRender.InteractiveMapSelectedPageSId;
+      long selectedGuid = panelRender.InteractiveMapSelectedPageGuid;
+      updatingWorldMapPageCombo = true;
+      try {
+        worldMapPageCombo.BeginUpdate();
+        worldMapPageCombo.Items.Clear();
+        if (pages.Count == 0) {
+          worldMapPageCombo.Enabled = false;
+          return;
+        }
+
+        var byParent = pages.GroupBy(p => p.ParentId).ToDictionary(g => g.Key, g => g
+          .OrderByDescending(x => x.HasImage).ThenBy(x => x.MapName ?? String.Empty, StringComparer.OrdinalIgnoreCase).ToList());
+        var visited = new HashSet<long>();
+        Action<long,int> addChildren = null;
+        addChildren = (parentId, depth) => {
+          if (!byParent.TryGetValue(parentId, out List<View_AREA.InteractiveMapPageInfo> children)) return;
+          foreach (View_AREA.InteractiveMapPageInfo page in children) {
+            long key = page.SId != 0 ? page.SId : page.Guid;
+            if (!visited.Add(key)) continue;
+            string prefix = depth == 0 ? String.Empty : new string(' ', Math.Min(12, depth * 2)) + "└─ ";
+            worldMapPageCombo.Items.Add(new WorldMapPageChoice { SId = page.SId, Guid = page.Guid, ParentId = page.ParentId, Text = prefix + WorldMapPageDisplayName(page) });
+            addChildren(page.SId != 0 ? page.SId : page.Guid, depth + 1);
+          }
+        };
+
+        // Root pages first, followed by any orphaned pages (old/Beta data can contain incomplete parent links).
+        addChildren(0L, 0);
+        foreach (View_AREA.InteractiveMapPageInfo page in pages.OrderBy(x => x.MapName ?? String.Empty, StringComparer.OrdinalIgnoreCase)) {
+          long key = page.SId != 0 ? page.SId : page.Guid;
+          if (visited.Contains(key)) continue;
+          string text = "└─ " + WorldMapPageDisplayName(page);
+          worldMapPageCombo.Items.Add(new WorldMapPageChoice { SId = page.SId, Guid = page.Guid, ParentId = page.ParentId, Text = text });
+          visited.Add(key);
+          addChildren(page.SId != 0 ? page.SId : page.Guid, 1);
+        }
+
+        int selectedIndex = -1;
+        for (int i = 0; i < worldMapPageCombo.Items.Count; i++) {
+          if (worldMapPageCombo.Items[i] is WorldMapPageChoice choice &&
+              ((selected != 0 && choice.SId == selected) || (selected == 0 && selectedGuid != 0 && choice.Guid == selectedGuid))) {
+            selectedIndex = i; break;
+          }
+        }
+        if (selectedIndex >= 0) worldMapPageCombo.SelectedIndex = selectedIndex;
+        else if (worldMapPageCombo.Items.Count > 0) worldMapPageCombo.SelectedIndex = 0;
+        worldMapPageCombo.Enabled = worldMapPageCombo.Items.Count > 0 && !panelRender.InteractiveMapTravelMode;
+      } finally {
+        worldMapPageCombo.EndUpdate();
+        updatingWorldMapPageCombo = false;
+      }
     }
 
     internal void RefreshWorldMapModeControls() {
@@ -116,6 +210,7 @@ namespace PugTools {
       worldMapModePanel.Visible = active;
       if (!active) return;
       LayoutWorldMapModeControls();
+      RebuildWorldMapPageCombo();
 
       bool travel = panelRender.InteractiveMapTravelMode;
       bool world = panelRender.InteractiveMapIsWorldScope;

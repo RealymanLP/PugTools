@@ -775,10 +775,18 @@ namespace PugTools {
     public void SetSettings(WorldRenderSettings settingsValue) { lock(settingsLock) settings=settingsValue?.Clone()??new WorldRenderSettings(); temporalHistoryResetRequested=true; }
     private WorldRenderSettings SettingsSnapshot(){lock(settingsLock)return settings.Clone();}
 
+    private static readonly Object WorldEffectInitLock = new Object();
+
     public override bool Init() {
       if(!base.Init())return false;
       RenderStates.InitAll(Device);
-      fx=new WorldEffect(Device,"Shaders\\World.fx");
+      // Use an absolute application path and serialize FX compilation. Multiple open World/Node/Asset browsers
+      // can initialize D3D11 at the same time; the old relative path plus concurrent shader compilation could
+      // intermittently make World.fx appear missing even though the map renderer itself was still usable.
+      String worldFxPath = Path.Combine(AppContext.BaseDirectory, "Shaders", "World.fx");
+      lock(WorldEffectInitLock) {
+        fx=new WorldEffect(Device, worldFxPath);
+      }
       var signature=fx.Lit.GetPassByIndex(0).Description.Signature;
       inputLayout=new InputLayout(Device,signature,InputLayoutDescriptions.PosNormalTexTan);
       var skinnedSignature=fx.SkinnedLit.GetPassByIndex(0).Description.Signature;

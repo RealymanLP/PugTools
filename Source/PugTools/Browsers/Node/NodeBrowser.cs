@@ -80,6 +80,7 @@ namespace PugTools {
       InitializeNodePreviewUi();
       InitializeNodeExportMenu();
       InitializeNodeReaderFeatures();
+      InitializeNodeMapPageUi();
       Config.Load();
 
       _assetsLocation = assetLocation;
@@ -158,6 +159,7 @@ namespace PugTools {
       _nodeTreeFilterCancellation = null;
       Hide();
       DisposeNodePreview();
+      DisposeNodeMapPageUi();
 
       if (_nodeFilterTree != null) {
         try { _nodeFilterTree.Dispose(); } catch { }
@@ -305,6 +307,7 @@ namespace PugTools {
                   if (obj.Name.StartsWith(n.Key)) parent = n.Value;
           }
 
+          display = GetWorldAreaNodeDisplayName(node.Key, display);
           NodeAsset asset = new NodeAsset(node.Key, parent, display, obj);
 
           _assetDict.Add(node.Key, asset);
@@ -333,12 +336,37 @@ namespace PugTools {
           if (String.IsNullOrEmpty(parentDir)) parentDir = "/";
 
           String display = temp.Last();
+          display = GetWorldAreaNodeDisplayName(dir, display);
           NodeAsset asset = new NodeAsset(dir, parentDir, display, null);
 
           if (!_assetDict.ContainsKey(dir)) _assetDict.Add(dir, asset);
         }
       }
     }
+    private static readonly Dictionary<UInt64, String> WorldAreaInternalNames = BuildWorldAreaInternalNames();
+
+    private static Dictionary<UInt64, String> BuildWorldAreaInternalNames() {
+      var result = new Dictionary<UInt64, String>();
+      try {
+        foreach (WorldAreaCatalogEntry entry in WorldAreaCatalog.Entries) {
+          if (entry != null && !String.IsNullOrWhiteSpace(entry.InternalName)) result[entry.Id] = entry.InternalName.Trim();
+        }
+        foreach (KeyValuePair<UInt64, WorldAreaOverride> pair in WorldAreaNameOverrides.LoadEntries()) {
+          if (pair.Value != null && !String.IsNullOrWhiteSpace(pair.Value.InternalName)) result[pair.Key] = pair.Value.InternalName.Trim();
+        }
+      } catch { }
+      return result;
+    }
+
+    private static String GetWorldAreaNodeDisplayName(String id, String fallback) {
+      if (String.IsNullOrWhiteSpace(id) || !id.StartsWith("world.areas.", StringComparison.OrdinalIgnoreCase)) return fallback;
+      String[] parts = id.Split('.');
+      if (parts.Length != 3 || !UInt64.TryParse(parts[2], out UInt64 areaId)) return fallback;
+      return WorldAreaInternalNames.TryGetValue(areaId, out String internalName) && !String.IsNullOrWhiteSpace(internalName)
+        ? fallback + "  " + internalName.Trim()
+        : fallback;
+    }
+
     private void BuildCompareNodeTree() {
       _assetDict = new Dictionary<String, NodeAsset>();
 
@@ -1669,6 +1697,8 @@ namespace PugTools {
 
         treeViewGrid1.TopItemIndex = 0;
       }
+
+      RefreshNodeMapPageUi(asset);
 
       StatusLabel1Text(
         asset.compareState != BuildFileState.None

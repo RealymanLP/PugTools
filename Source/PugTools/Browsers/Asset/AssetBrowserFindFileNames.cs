@@ -31,6 +31,12 @@ namespace PugTools {
       if (chkSDEF.Checked) fileTypes.Add("SDEF");
       if (chkSTB.Checked) fileTypes.Add("STB");
       if (chkXML.Checked) fileTypes.Add("XML");
+      // MAG/DYC files are text specifications rather than a normal asset family.
+      // They are inexpensive to parse and, especially in the beta clients, carry
+      // authoritative model, skeleton and animation paths that no other finder
+      // source sees.  Keep the pass enabled whenever the filename finder runs;
+      // each result is still accepted only after PH+SH validation.
+      fileTypes.Add("TEXTSPECS");
       return fileTypes;
     }
 
