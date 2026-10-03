@@ -1,9 +1,11 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Linq;
 using System.Reflection;
+using System.IO;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Windows.Forms;
 
@@ -21,12 +23,14 @@ namespace PugTools {
     private readonly Action<String> _navigate;
     private readonly Action<MapNote> _openWorldMapNote;
     private readonly Action<String> _openModelPreview;
+    private readonly Action<String> _openResource;
     private readonly Func<String, Bitmap> _graphIconLoader;
     private readonly Func<Bitmap> _rootIconProvider;
     private readonly TreeView _tree;
     private readonly Font _linkFont;
     private readonly ListView _details;
     private readonly TabControl _tabs;
+    private readonly TreeView _referencesTree;
     private readonly GameplayRelationshipGraphControl _graph;
     private readonly ToolStripLabel _status;
     private readonly ToolStripTextBox _filter;
@@ -48,11 +52,12 @@ namespace PugTools {
     }
 
     internal NodeGameplayExplorer(DataObjectModel dom, GomObject gom, Action<String> navigate, Action<MapNote> openWorldMapNote,
-                                  Action<String> openModelPreview, Func<String, Bitmap> graphIconLoader, Func<Bitmap> rootIconProvider) {
+                                  Action<String> openModelPreview, Action<String> openResource, Func<String, Bitmap> graphIconLoader, Func<Bitmap> rootIconProvider) {
       _dom = dom ?? throw new ArgumentNullException(nameof(dom));
       _navigate = navigate;
       _openWorldMapNote = openWorldMapNote;
       _openModelPreview = openModelPreview;
+      _openResource = openResource;
       _graphIconLoader = graphIconLoader;
       _rootIconProvider = rootIconProvider;
       Text = "Gameplay Explorer — " + (gom?.Name ?? "Node");
@@ -122,9 +127,31 @@ namespace PugTools {
       _graph = new GameplayRelationshipGraphControl { Dock = DockStyle.Fill, NavigateRequested = _navigate, IconLoader = _graphIconLoader };
       _graph.WorldMapNoteRequested = OpenWorldMapNoteFqn;
       _graph.ModelPreviewRequested = delegate (String fqn) { _openModelPreview?.Invoke(fqn); };
+      _graph.ResourceRequested = delegate (String path) { _openResource?.Invoke(path); };
       TabPage graphPage = new TabPage("Relationship graph");
       graphPage.Controls.Add(_graph);
+
+      _referencesTree = new TreeView {
+        Dock = DockStyle.Fill,
+        HideSelection = false,
+        FullRowSelect = true
+      };
+      _referencesTree.NodeMouseDoubleClick += delegate (Object sender, TreeNodeMouseClickEventArgs e) {
+        if (e.Node?.Tag is ExplorerEntry entry && !String.IsNullOrWhiteSpace(entry.TargetFqn))
+          _navigate?.Invoke(entry.TargetFqn);
+      };
+      _referencesTree.KeyDown += delegate (Object sender, KeyEventArgs e) {
+        if (e.KeyCode == Keys.Enter && _referencesTree.SelectedNode?.Tag is ExplorerEntry entry
+            && !String.IsNullOrWhiteSpace(entry.TargetFqn)) {
+          _navigate?.Invoke(entry.TargetFqn);
+          e.SuppressKeyPress = true;
+        }
+      };
+      TabPage referencesPage = new TabPage("References");
+      referencesPage.Controls.Add(_referencesTree);
+
       _tabs.TabPages.Add(treePage);
+      _tabs.TabPages.Add(referencesPage);
       _tabs.TabPages.Add(graphPage);
 
       Panel hero = new Panel { Dock = DockStyle.Top, Height = 92, Padding = new Padding(8, 7, 8, 7) };
@@ -273,7 +300,9 @@ namespace PugTools {
             Detail("Top-level fields", gom.Data.Dictionary.Count.ToString(), "Depth", "5 (bounded)"));
           AddGomDataMembers(raw, gom.Data, 0, 5);
         }
+        BuildReferences(gom);
         BuildGameplayGraph(gom, model);
+        BuildResourceGraph(gom);
         // Jedipedia opens on its parsed details. Keep the relationship graph one click away but
         // make the detailed structured view the default for every supported node.
         _tabs.SelectedIndex = 0;
@@ -284,6 +313,93 @@ namespace PugTools {
       } finally {
         _tree.EndUpdate();
       }
+    }
+
+    private void BuildReferences(GomObject gom) {
+      if (_referencesTree == null) return;
+      _referencesTree.BeginUpdate();
+      try {
+        _referencesTree.Nodes.Clear();
+        if (gom == null) return;
+
+        TreeNode outgoing = new TreeNode("Outgoing references");
+        TreeNode incoming = new TreeNode("Referenced by");
+        TreeNode prototype = new TreeNode("Prototype / table references");
+        _referencesTree.Nodes.Add(outgoing);
+        _referencesTree.Nodes.Add(incoming);
+        _referencesTree.Nodes.Add(prototype);
+
+        Int32 outgoingCount = 0;
+        if (gom.References != null) {
+          foreach (KeyValuePair<String, SortedSet<UInt64>> link in gom.References.OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase)) {
+            TreeNode typeNode = new TreeNode(link.Key + " (" + (link.Value?.Count ?? 0).ToString() + ")");
+            foreach (UInt64 id in link.Value ?? new SortedSet<UInt64>()) {
+              String fqn = ResolveFqn(id);
+              ExplorerEntry entry = MakeReferenceEntry(fqn, id, "Outgoing", link.Key);
+              String label = fqn ?? ("0x" + id.ToString("X16"));
+              TreeNode child = new TreeNode(label) { Tag = entry, ToolTipText = link.Key + " → " + label };
+              if (!String.IsNullOrWhiteSpace(fqn)) child.NodeFont = _linkFont;
+              typeNode.Nodes.Add(child);
+              outgoingCount++;
+            }
+            if (typeNode.Nodes.Count > 0) outgoing.Nodes.Add(typeNode);
+          }
+        }
+
+        Int32 incomingCount = 0;
+        if (gom.FullReferences != null) {
+          foreach (KeyValuePair<UInt64, String> link in gom.FullReferences.OrderBy(x => x.Value, StringComparer.OrdinalIgnoreCase)) {
+            ExplorerEntry entry = MakeReferenceEntry(link.Value, link.Key, "Incoming", "Referenced by");
+            String label = link.Value ?? ("0x" + link.Key.ToString("X16"));
+            TreeNode child = new TreeNode(label) { Tag = entry, ToolTipText = "Referenced by " + label };
+            if (!String.IsNullOrWhiteSpace(link.Value)) child.NodeFont = _linkFont;
+            incoming.Nodes.Add(child);
+            incomingCount++;
+          }
+        }
+
+        Int32 prototypeCount = 0;
+        if (gom.ProtoReferences != null) {
+          foreach (KeyValuePair<UInt64, Dictionary<String, SortedSet<UInt64>>> proto in gom.ProtoReferences.OrderBy(x => x.Key)) {
+            String protoFqn = ResolveFqn(proto.Key);
+            TreeNode protoNode = new TreeNode("Instance " + proto.Key.ToString() + (String.IsNullOrWhiteSpace(protoFqn) ? String.Empty : " — " + protoFqn));
+            foreach (KeyValuePair<String, SortedSet<UInt64>> link in proto.Value.OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase)) {
+              TreeNode typeNode = new TreeNode(link.Key + " (" + (link.Value?.Count ?? 0).ToString() + ")");
+              foreach (UInt64 id in link.Value ?? new SortedSet<UInt64>()) {
+                String fqn = ResolveFqn(id);
+                ExplorerEntry entry = MakeReferenceEntry(fqn, id, "Prototype", link.Key);
+                TreeNode child = new TreeNode(fqn ?? ("0x" + id.ToString("X16"))) { Tag = entry, ToolTipText = link.Key };
+                if (!String.IsNullOrWhiteSpace(fqn)) child.NodeFont = _linkFont;
+                typeNode.Nodes.Add(child);
+                prototypeCount++;
+              }
+              if (typeNode.Nodes.Count > 0) protoNode.Nodes.Add(typeNode);
+            }
+            if (protoNode.Nodes.Count > 0) prototype.Nodes.Add(protoNode);
+          }
+        }
+
+        outgoing.Text = "Outgoing references (" + outgoingCount.ToString() + ")";
+        incoming.Text = "Referenced by (" + incomingCount.ToString() + ")";
+        prototype.Text = "Prototype / table references (" + prototypeCount.ToString() + ")";
+
+        if (outgoing.Nodes.Count == 0) outgoing.Nodes.Add(new TreeNode("No indexed outgoing references."));
+        if (incoming.Nodes.Count == 0) incoming.Nodes.Add(new TreeNode("No indexed incoming references."));
+        if (prototype.Nodes.Count == 0) prototype.Nodes.Add(new TreeNode("No prototype/table references."));
+        outgoing.Expand();
+        incoming.Expand();
+      } finally {
+        _referencesTree.EndUpdate();
+      }
+    }
+
+    private ExplorerEntry MakeReferenceEntry(String fqn, UInt64 id, String direction, String relation) {
+      ExplorerEntry entry = new ExplorerEntry { TargetFqn = fqn, TargetId = id };
+      entry.Details.Add(new KeyValuePair<String, String>("Direction", direction));
+      entry.Details.Add(new KeyValuePair<String, String>("Relation", relation));
+      entry.Details.Add(new KeyValuePair<String, String>("Node ID", id.ToString()));
+      entry.Details.Add(new KeyValuePair<String, String>("FQN", fqn));
+      return entry;
     }
 
     private Boolean BuildJedipediaPrototype(TreeNode root, GomObject gom) {
@@ -1110,6 +1226,61 @@ namespace PugTools {
       AddFqn(root, "Conversation", placeable.ConversationFqn);
     }
 
+
+    private void BuildResourceGraph(GomObject gom) {
+      if (gom?.Data == null) return;
+      HashSet<String> paths = new HashSet<String>(StringComparer.OrdinalIgnoreCase);
+      HashSet<Object> seen = new HashSet<Object>(ReferenceEqualityComparer.Instance);
+      CollectResourcePaths(gom.Data, paths, seen, 0, 5);
+      Int32 index = 0;
+      foreach (String path in paths.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).Take(120)) {
+        String ext = Path.GetExtension(path)?.TrimStart('.').ToUpperInvariant();
+        String id = "resource:" + path.ToLowerInvariant();
+        _graph.AddNode(id, ext.Length == 0 ? "Asset" : ext, Path.GetFileName(path),
+          path, null, 0, 1, null, null, path);
+        _graph.AddEdge("root", id, "resource");
+        index++;
+      }
+    }
+
+    private static void CollectResourcePaths(Object value, ISet<String> output, ISet<Object> seen, Int32 depth, Int32 maxDepth) {
+      if (value == null || depth > maxDepth || output.Count >= 120) return;
+      if (value is String text) {
+        if (BrowserNavigation.TryExtractResourcePath(text, out String path) && IsInterestingResourcePath(path)) output.Add(path);
+        return;
+      }
+      if (value.GetType().IsPrimitive || value is Decimal || value is DateTime || value is TimeSpan || value is Enum) return;
+      if (!value.GetType().IsValueType && !seen.Add(value)) return;
+      if (value is IDictionary dictionary) {
+        foreach (DictionaryEntry entry in dictionary) {
+          CollectResourcePaths(entry.Key, output, seen, depth + 1, maxDepth);
+          CollectResourcePaths(entry.Value, output, seen, depth + 1, maxDepth);
+          if (output.Count >= 120) break;
+        }
+        return;
+      }
+      if (value is IEnumerable enumerable) {
+        foreach (Object item in enumerable) {
+          CollectResourcePaths(item, output, seen, depth + 1, maxDepth);
+          if (output.Count >= 120) break;
+        }
+        return;
+      }
+      foreach (PropertyInfo property in value.GetType().GetProperties(BindingFlags.Instance | BindingFlags.Public)) {
+        if (!property.CanRead || property.GetIndexParameters().Length != 0) continue;
+        Object child = null;
+        try { child = property.GetValue(value, null); } catch { }
+        CollectResourcePaths(child, output, seen, depth + 1, maxDepth);
+        if (output.Count >= 120) break;
+      }
+    }
+
+    private static Boolean IsInterestingResourcePath(String path) {
+      String ext = Path.GetExtension(path);
+      if (String.IsNullOrWhiteSpace(ext)) return false;
+      return new[] { ".gr2", ".mat", ".dds", ".tex", ".jba", ".mph", ".mag", ".spt", ".dyn", ".prt", ".fxspec", ".bnk", ".wem", ".epp", ".lod", ".clo", ".dyc", ".gfx", ".swf" }
+        .Contains(ext, StringComparer.OrdinalIgnoreCase);
+    }
 
     private void BuildGameplayGraph(GomObject gom, GameObject model) {
       _graph.BeginGraph(gom?.Name ?? "Gameplay");

@@ -1033,16 +1033,22 @@ namespace PugTools {
             // would parse old/Beta binary data using the current schema and can produce EOF/layout
             // errors even though the node itself is perfectly usable for a metadata comparison.
             prevObject = PreviousDom.GetObjectNoLoad(curObject.Name);
-            if (gomPrefix == "qst.") {
-              if (prevObject == null) {
-                rawQuestNew++;
-              } else {
-                rawQuestCompared++;
+            if (gomPrefix == "qst." || gomPrefix == "ach.") {
+              if (prevObject != null) {
                 try {
-                  rawChanged = !prevObject.Equals(curObject);
-                  if (rawChanged) rawQuestChanged++;
+                  // GomObject.Equals() intentionally compares only node metadata. That is not
+                  // sufficient for a patch comparison: two nodes can keep the same name, class,
+                  // size and checksum while their decoded fields changed (especially when the
+                  // checksum is unavailable/zero). Compare the schema-independent printed raw
+                  // object as well. This prevents real achievement/quest changes from becoming
+                  // a false "0 changed" result.
+                  rawChanged = !XNode.DeepEquals(prevObject.Print(), curObject.Print());
+                  if (gomPrefix == "qst.") {
+                    rawQuestCompared++;
+                    if (rawChanged) rawQuestChanged++;
+                  }
                 } catch (Exception ex) {
-                  Debug.WriteLine($"Raw quest comparison failed for {curObject.Name}: {ex.Message}");
+                  Debug.WriteLine($"Raw {gomPrefix} comparison failed for {curObject.Name}: {ex.GetType().Name}: {ex.Message}");
                 }
               }
             }
@@ -1065,7 +1071,7 @@ namespace PugTools {
                   AddToList2(String.Join("", "Changed: ", curItm.Fqn));
                   chaItems[prevItm] = curItm;
                 }
-              } else if (rawChanged) {
+              } else if (rawChanged && (gomPrefix == "qst." || gomPrefix == "ach.")) {
                 // We still know from the raw GOM that the quest changed. Keep the current parsed
                 // side instead of dropping the quest merely because the old build's semantic model
                 // could not be reconstructed.
@@ -1203,7 +1209,11 @@ namespace PugTools {
 
           } else {
             if ((itmList.Key == "New" || itmList.Key == "Full") && gomPrefix == "ach.") {
+              // This file is a diagnostic for achievements without a usable achId; these are
+              // not necessarily parser failures. Keep the legacy filename for compatibility,
+              // but write a precise reason and also maintain a clearly named diagnostic file.
               WriteFile("", "brokenAchieves.txt", false);
+              WriteFile("", "incompleteAchieves.txt", false);
             }
 
             foreach (GameObject itm in itmList.Value) {
@@ -1213,14 +1223,14 @@ namespace PugTools {
 
               if ((itmList.Key == "New" || itmList.Key == "Full") && gomPrefix == "ach.") {
                 if (((Achievement)itm).AchId == 0) {
-                  WriteFile(
+                  String diagnostic =
                     itm.Fqn
                       + " : "
                       + ((Achievement)itm).Name
-                      + Environment.NewLine,
-                    "brokenAchieves.txt",
-                    true
-                  );
+                      + " | reason=missing-or-zero-achId"
+                      + Environment.NewLine;
+                  WriteFile(diagnostic, "brokenAchieves.txt", true);
+                  WriteFile(diagnostic, "incompleteAchieves.txt", true);
                 }
               }
 

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Drawing;
@@ -54,12 +54,24 @@ namespace PugTools {
       private Point _dragStart;
       private PointF _panStart;
       private Boolean _dragging;
+      private Boolean _showFow;
+      private Int32 _fowColumns;
+      private Int32 _fowRows;
+      private Single _fowStartX;
+      private Single _fowStartZ;
+      private Single _fowRadius;
+      private List<Int64> _fowGroups = new List<Int64>();
+      private Boolean _hasCoordinateFrame;
+      private Single _coordMinX, _coordMinZ, _coordMaxX, _coordMaxZ;
+      private readonly ToolTip _fowToolTip;
+      private Int32 _lastFowTooltipIndex = -1;
 
       public NodeMapZoomPictureBox() {
         DoubleBuffered = true;
         SizeMode = PictureBoxSizeMode.Normal;
         Cursor = Cursors.Hand;
         TabStop = true;
+        _fowToolTip = new ToolTip { InitialDelay = 250, ReshowDelay = 50, AutoPopDelay = 8000, ShowAlways = false };
       }
 
       protected override void OnMouseWheel(MouseEventArgs e) {
@@ -97,9 +109,19 @@ namespace PugTools {
           _pan = new PointF(
             _panStart.X + e.X - _dragStart.X,
             _panStart.Y + e.Y - _dragStart.Y);
+          _fowToolTip.Hide(this);
+          _lastFowTooltipIndex = -1;
           Invalidate();
+        } else {
+          UpdateFowTooltip(e.Location);
         }
         base.OnMouseMove(e);
+      }
+
+      protected override void OnMouseLeave(EventArgs e) {
+        _fowToolTip.Hide(this);
+        _lastFowTooltipIndex = -1;
+        base.OnMouseLeave(e);
       }
 
       protected override void OnMouseUp(MouseEventArgs e) {
@@ -114,6 +136,13 @@ namespace PugTools {
       protected override void OnDoubleClick(EventArgs e) {
         ResetView();
         base.OnDoubleClick(e);
+      }
+
+      protected override void Dispose(Boolean disposing) {
+        if (disposing) {
+          try { _fowToolTip?.Dispose(); } catch { }
+        }
+        base.Dispose(disposing);
       }
 
       protected override void OnPaint(PaintEventArgs e) {
@@ -132,6 +161,201 @@ namespace PugTools {
           Image.Width * _zoom,
           Image.Height * _zoom);
         e.Graphics.DrawImage(Image, destination);
+        if (_hasCoordinateFrame) DrawCoordinateGrid(e.Graphics);
+        if (_showFow) DrawFowOverlay(e.Graphics);
+      }
+
+      public void SetFow(Boolean show, Int32 columns, Int32 rows, Single startX, Single startZ, Single radius, List<Int64> groups) {
+        _showFow = show;
+        _fowColumns = Math.Max(0, columns);
+        _fowRows = Math.Max(0, rows);
+        _fowStartX = startX;
+        _fowStartZ = startZ;
+        _fowRadius = radius;
+        _fowGroups = groups ?? new List<Int64>();
+        Invalidate();
+      }
+
+      public void SetFowOverlay(Boolean show) {
+        _showFow = show;
+        Invalidate();
+      }
+
+      public void SetCoordinateFrame(Single minX, Single minZ, Single maxX, Single maxZ) {
+        _hasCoordinateFrame = maxX > minX && maxZ > minZ;
+        _coordMinX = minX; _coordMinZ = minZ; _coordMaxX = maxX; _coordMaxZ = maxZ;
+        Invalidate();
+      }
+
+      private void DrawCoordinateGrid(Graphics g) {
+        if (Image == null || !_hasCoordinateFrame) return;
+        Single dx = _coordMaxX - _coordMinX;
+        Single dz = _coordMaxZ - _coordMinZ;
+        if (dx <= 0f || dz <= 0f) return;
+        using Pen grid = new Pen(Color.FromArgb(85, 255, 255, 255), Math.Max(1f, _zoom));
+        using Brush textBrush = new SolidBrush(Color.FromArgb(210, 255, 255, 255));
+        using Brush bgBrush = new SolidBrush(Color.FromArgb(145, 0, 0, 0));
+        using Font font = new Font(FontFamily.GenericSansSerif, 8f);
+        for (Int32 i = 1; i < 4; i++) {
+          Single px = Image.Width * i / 4f;
+          Single pz = Image.Height * i / 4f;
+          g.DrawLine(grid, _pan.X + px * _zoom, _pan.Y, _pan.X + px * _zoom, _pan.Y + Image.Height * _zoom);
+          g.DrawLine(grid, _pan.X, _pan.Y + pz * _zoom, _pan.X + Image.Width * _zoom, _pan.Y + pz * _zoom);
+          Single wx = _coordMinX + dx * i / 4f;
+          Single wz = _coordMaxZ - dz * i / 4f;
+          DrawCoordinateLabel(g, wx.ToString("0"), new PointF(_pan.X + px * _zoom + 3f, _pan.Y + 3f), font, textBrush, bgBrush);
+          DrawCoordinateLabel(g, wz.ToString("0"), new PointF(_pan.X + 3f, _pan.Y + pz * _zoom + 3f), font, textBrush, bgBrush);
+        }
+        DrawCoordinateLabel(g, String.Format("X {0:0} … {1:0}   Z {2:0} … {3:0}", _coordMinX, _coordMaxX, _coordMinZ, _coordMaxZ), new PointF(_pan.X + 6f, _pan.Y + Image.Height * _zoom - 18f), font, textBrush, bgBrush);
+      }
+
+      private static void DrawCoordinateLabel(Graphics g, String text, PointF point, Font font, Brush textBrush, Brush bgBrush) {
+        Size size = TextRenderer.MeasureText(text, font);
+        Rectangle rect = new Rectangle((Int32)point.X - 2, (Int32)point.Y - 1, size.Width + 4, size.Height + 2);
+        g.FillRectangle(bgBrush, rect);
+        TextRenderer.DrawText(g, text, font, rect, Color.White, TextFormatFlags.NoPadding);
+      }
+
+      private void UpdateFowTooltip(Point location) {
+        if (!_showFow || Image == null || _fowColumns <= 0 || _fowRows <= 0 || _fowGroups.Count == 0) {
+          _fowToolTip.Hide(this);
+          _lastFowTooltipIndex = -1;
+          return;
+        }
+
+        if (!TryGetFowCell(location, out Int32 row, out Int32 col, out Int32 index, out Int64 group)) {
+          _fowToolTip.Hide(this);
+          _lastFowTooltipIndex = -1;
+          return;
+        }
+
+        if (index == _lastFowTooltipIndex) return;
+        _lastFowTooltipIndex = index;
+
+        Single radius = _fowRadius > 0.001f ? _fowRadius : 1f;
+        Single x = _fowStartX + col * 1.5f * radius;
+        Single z = _fowStartZ + row * (Single)Math.Sqrt(3.0) * radius + (col % 2 == 1 ? (Single)Math.Sqrt(3.0) * radius * 0.5f : 0f);
+        String state = group == 0 ? "unexplored / group 0" : "group " + group.ToString();
+        String text = String.Format("FoW cell {0},{1}\n{2}\nX {3:0.##}  Z {4:0.##}", row, col, state, x, z);
+        _fowToolTip.Show(text, this, Math.Min(ClientSize.Width - 1, Math.Max(0, location.X + 14)), Math.Min(ClientSize.Height - 1, Math.Max(0, location.Y + 14)));
+      }
+
+      private Boolean TryGetFowCell(Point location, out Int32 row, out Int32 col, out Int32 index, out Int64 group) {
+        row = col = index = 0;
+        group = 0;
+        if (Image == null || _fowColumns <= 0 || _fowRows <= 0 || _fowGroups.Count == 0) return false;
+
+        Single radius = _fowRadius > 0.001f ? _fowRadius : 1f;
+        Single sqrt3 = (Single)Math.Sqrt(3.0);
+        Single stepX = 1.5f * radius;
+        Single stepZ = sqrt3 * radius;
+        Single spanX = Math.Max(stepX, (_fowColumns - 1) * stepX + 2f * radius);
+        Single spanZ = Math.Max(stepZ, (_fowRows - 1) * stepZ + sqrt3 * radius);
+        Single scale = Math.Min(Image.Width / spanX, Image.Height / spanZ);
+        if (scale <= 0f || Single.IsNaN(scale) || Single.IsInfinity(scale)) return false;
+        Single ox = (Image.Width - spanX * scale) * 0.5f;
+        Single oy = (Image.Height - spanZ * scale) * 0.5f;
+        Single imageX = (location.X - _pan.X) / Math.Max(0.0001f, _zoom);
+        Single imageY = (location.Y - _pan.Y) / Math.Max(0.0001f, _zoom);
+        Single localX = (imageX - ox) / scale;
+        Single localY = (imageY - oy) / scale;
+        if (localX < 0f || localY < 0f || localX > spanX || localY > spanZ) return false;
+
+        // Probe the nearest few cells rather than relying on a rectangular approximation;
+        // this correctly handles the staggered pointy-hex layout.
+        Int32 centerCol = (Int32)Math.Floor((localX - radius) / Math.Max(0.0001f, stepX));
+        Int32 centerRow = (Int32)Math.Floor(localY / Math.Max(0.0001f, stepZ));
+        Single bestDistance = Single.MaxValue;
+        Int32 bestRow = -1, bestCol = -1;
+        for (Int32 rr = Math.Max(0, centerRow - 2); rr <= Math.Min(_fowRows - 1, centerRow + 2); rr++) {
+          for (Int32 cc = Math.Max(0, centerCol - 2); cc <= Math.Min(_fowColumns - 1, centerCol + 2); cc++) {
+            Single cx = cc * stepX + radius;
+            Single cy = rr * stepZ + (cc % 2 == 1 ? stepZ * 0.5f : 0f) + sqrt3 * radius * 0.5f;
+            Single dx = localX - cx;
+            Single dy = localY - cy;
+            Single dist = dx * dx + dy * dy;
+            if (dist < bestDistance) { bestDistance = dist; bestRow = rr; bestCol = cc; }
+          }
+        }
+        if (bestRow < 0 || bestCol < 0) return false;
+
+        // Reject points outside the selected hexagon.
+        Single bx = bestCol * stepX + radius;
+        Single by = bestRow * stepZ + (bestCol % 2 == 1 ? stepZ * 0.5f : 0f) + sqrt3 * radius * 0.5f;
+        Single dxn = Math.Abs(localX - bx) / Math.Max(0.0001f, radius);
+        Single dyn = Math.Abs(localY - by) / Math.Max(0.0001f, radius);
+        if (dxn > 1f || dyn > sqrt3 * 0.5f + 0.05f) return false;
+
+        row = bestRow;
+        col = bestCol;
+        index = row * _fowColumns + col;
+        if (index < 0 || index >= _fowGroups.Count) return false;
+        group = _fowGroups[index];
+        return true;
+      }
+
+      private void DrawFowOverlay(Graphics g) {
+        if (Image == null || _fowColumns <= 0 || _fowRows <= 0 || _fowGroups.Count == 0) return;
+        // SWTOR stores the FoW as a pointy hex grid. Use the authored start position/radius
+        // whenever available; if a legacy/Beta build omitted them, map the grid to the image.
+        Single radius = _fowRadius > 0.001f ? _fowRadius : 1f;
+        Single sqrt3 = (Single)Math.Sqrt(3.0);
+        Single minX = 0f, maxX = 1f, minZ = 0f, maxZ = 1f;
+        // The preview image itself is the only stable coordinate frame available here.
+        // Use the authored grid proportions; this keeps the overlay useful even when exact map
+        // bounds are not serialized in an old build.
+        Single stepX = 1.5f * radius;
+        Single stepZ = sqrt3 * radius;
+        Single spanX = Math.Max(stepX, (_fowColumns - 1) * stepX + 2f * radius);
+        Single spanZ = Math.Max(stepZ, (_fowRows - 1) * stepZ + sqrt3 * radius);
+        Single scale = Math.Min(Image.Width / spanX, Image.Height / spanZ);
+        if (scale <= 0f || Single.IsNaN(scale) || Single.IsInfinity(scale)) return;
+        Single ox = (Image.Width - spanX * scale) * 0.5f;
+        Single oy = (Image.Height - spanZ * scale) * 0.5f;
+
+        using Pen outline = new Pen(Color.FromArgb(180, 255, 255, 255), Math.Max(1f, _zoom));
+        using Brush unexplored = new SolidBrush(Color.FromArgb(38, 0, 0, 0));
+        using Brush explored = new SolidBrush(Color.FromArgb(18, 255, 255, 255));
+        for (Int32 row = 0; row < _fowRows; row++) {
+          for (Int32 col = 0; col < _fowColumns; col++) {
+            Int32 index = row * _fowColumns + col;
+            if (index >= _fowGroups.Count) return;
+            Int64 group = _fowGroups[index];
+            Single cx = ox + (col * stepX + radius) * scale;
+            Single cy = oy + (row * stepZ + (col % 2 == 1 ? stepZ * 0.5f : 0f) + sqrt3 * radius * 0.5f) * scale;
+            Single rr = radius * scale;
+            PointF[] hex = new PointF[6];
+            for (Int32 i = 0; i < 6; i++) {
+              Double angle = (Math.PI / 180.0) * (30.0 + i * 60.0);
+              hex[i] = new PointF(cx + (Single)Math.Cos(angle) * rr, cy + (Single)Math.Sin(angle) * rr);
+            }
+            if (group == 0) {
+              g.FillPolygon(unexplored, hex);
+            } else {
+              Int32 hueSeed = unchecked((Int32)(group ^ (group >> 32)));
+              Single hue = Math.Abs(hueSeed % 360);
+              using (Brush groupBrush = new SolidBrush(ColorFromHsv(hue, 0.55f, 0.95f))) {
+                g.FillPolygon(groupBrush, hex);
+              }
+            }
+            g.DrawPolygon(outline, hex);
+          }
+        }
+      }
+
+      private static Color ColorFromHsv(Single hue, Single saturation, Single value) {
+        Single h = (hue % 360f + 360f) % 360f / 60f;
+        Single c = value * saturation;
+        Single x = c * (1f - Math.Abs((h % 2f) - 1f));
+        Single m = value - c;
+        Single r, g, b;
+        if (h < 1f) { r = c; g = x; b = 0f; }
+        else if (h < 2f) { r = x; g = c; b = 0f; }
+        else if (h < 3f) { r = 0f; g = c; b = x; }
+        else if (h < 4f) { r = 0f; g = x; b = c; }
+        else if (h < 5f) { r = x; g = 0f; b = c; }
+        else { r = c; g = 0f; b = x; }
+        return Color.FromArgb(70, (Int32)((r + m) * 255f), (Int32)((g + m) * 255f), (Int32)((b + m) * 255f));
       }
 
       public void SetImage(Image image, Boolean keepView) {
@@ -500,6 +724,7 @@ namespace PugTools {
       } catch { }
       _nodeGameplayExplorer = new NodeGameplayExplorer(
         _currentDom, asset.Obj, delegate (String fqn) { NavigateToNodeName(fqn); }, OpenGameplayWorldMapNote, OpenGameplayModelPreview,
+        delegate (String path) { BrowserNavigation.OpenAsset(this, _assetsLocation, _assetsUsePts, path); },
         TryLoadGameplayGraphIcon,
         delegate { return _nodePreviewIcon?.Image is Bitmap bitmap ? new Bitmap(bitmap) : null; });
       _nodeGameplayExplorer.FormClosed += delegate { _nodeGameplayExplorer = null; };
@@ -698,6 +923,52 @@ namespace PugTools {
             AddSemanticField(result, "Conversation", item.ConversationFqn, 62, false);
             AddSemanticField(result, "Imperial appearance", item.AppearanceImperial ?? item.ImperialAppearanceTag, 63, false);
             AddSemanticField(result, "Republic appearance", item.AppearanceRepublic ?? item.RepublicAppearanceTag, 64, false);
+            break;
+
+          case NpcAppearance npcAppearance:
+            AddSemanticField(result, "Appearance type", npcAppearance.NppType, 40, false);
+            AddSemanticField(result, "Body type", npcAppearance.BodyType, 41, false);
+            AddSemanticField(result, "Sound package", npcAppearance.SoundPackage, 42, false);
+            AddSemanticField(result, "Armor soundset", npcAppearance.ArmorSoundsetOverride, 43, false);
+            if (npcAppearance.AppearanceSlotMap != null && npcAppearance.AppearanceSlotMap.Count > 0) {
+              List<String> slotLines = new List<String>();
+              foreach (KeyValuePair<String, List<AppSlot>> slotGroup in npcAppearance.AppearanceSlotMap.OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase)) {
+                if (slotGroup.Value == null || slotGroup.Value.Count == 0) continue;
+                List<String> variants = new List<String>();
+                foreach (AppSlot slot in slotGroup.Value.Take(12)) {
+                  if (slot == null) continue;
+                  String modelPath = slot.Model;
+                  if (!String.IsNullOrWhiteSpace(modelPath)) modelPath = modelPath.Replace('\\', '/');
+                  String text = String.IsNullOrWhiteSpace(slot.Type) ? "slot" : slot.Type;
+                  if (!String.IsNullOrWhiteSpace(modelPath)) text += " → " + modelPath;
+                                    variants.Add(text);
+                }
+                if (slotGroup.Value.Count > 12) variants.Add("… " + (slotGroup.Value.Count - 12) + " more");
+                slotLines.Add(slotGroup.Key + ": " + String.Join(" | ", variants));
+              }
+              AddSemanticField(result, "Appearance slots", String.Join(Environment.NewLine, slotLines), 25, false);
+            }
+            if (npcAppearance.VocalSoundsetOverride != null && npcAppearance.VocalSoundsetOverride.Count > 0) {
+              String vocals = String.Join(Environment.NewLine, npcAppearance.VocalSoundsetOverride.Take(24)
+                .Select(x => x.Key + " → " + x.Value));
+              AddSemanticField(result, "Vocal soundsets", vocals, 26, false);
+            }
+            break;
+
+          case ItemAppearance itemAppearance:
+            AddSemanticField(result, "Color scheme", itemAppearance.ColorScheme, 40);
+            AddSemanticField(result, "Voice-over override", itemAppearance.VOSoundTypeOverride, 41, false);
+            if (itemAppearance.IPP != null) {
+              AddSemanticField(result, "Body type", itemAppearance.IPP.BodyType, 42, false);
+              AddSemanticField(result, "Slot", itemAppearance.IPP.Type, 43, false);
+              AddSemanticField(result, "Model", itemAppearance.IPP.Model, 44, false);
+              if (itemAppearance.IPP.AttachedModels != null && itemAppearance.IPP.AttachedModels.Count > 0)
+                AddSemanticField(result, "Attached models", String.Join(Environment.NewLine, itemAppearance.IPP.AttachedModels.Take(32)), 25, false);
+              try {
+                HashSet<String> fx = itemAppearance.GetAttachedFX();
+                if (fx.Count > 0) AddSemanticField(result, "Attachment bones", String.Join(", ", fx.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).Take(64)), 26, false);
+              } catch { }
+            }
             break;
 
           case Npc npc:

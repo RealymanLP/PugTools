@@ -213,6 +213,26 @@ namespace PugTools {
     /// Tests a first-seen label using Jedipedia's version-filter behavior. Missing history is a
     /// non-match whenever a version term is present; text-only searches never call this method.
     /// </summary>
+    internal Boolean Matches(
+      String candidate1, String candidate2, String candidate3, String candidate4, String candidate5,
+      String candidate6, String candidate7
+    ) {
+      if (ShowUnnamedOnly) return false;
+      for (Int32 i = 0; i < RequiredTerms.Count; i++) {
+        String term = RequiredTerms[i];
+        if (!Contains(candidate1, term) && !Contains(candidate2, term) && !Contains(candidate3, term)
+            && !Contains(candidate4, term) && !Contains(candidate5, term) && !Contains(candidate6, term)
+            && !Contains(candidate7, term)) return false;
+      }
+      for (Int32 i = 0; i < BlockedTerms.Count; i++) {
+        String term = BlockedTerms[i];
+        if (Contains(candidate1, term) || Contains(candidate2, term) || Contains(candidate3, term)
+            || Contains(candidate4, term) || Contains(candidate5, term) || Contains(candidate6, term)
+            || Contains(candidate7, term)) return false;
+      }
+      return true;
+    }
+
     internal Boolean MatchesVersion(String firstSeen) {
       if (!HasVersionTerms) return true;
       if (!TryParseFirstSeen(firstSeen, out VersionKey key)) return false;

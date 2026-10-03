@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Drawing;
@@ -21,6 +21,22 @@ namespace PugTools {
       public String ImagePath { get; set; }
       public Boolean HasImage { get; set; }
       public String DisplayText { get; set; }
+      public Single MinX { get; set; }
+      public Single MinY { get; set; }
+      public Single MinZ { get; set; }
+      public Single MaxX { get; set; }
+      public Single MaxY { get; set; }
+      public Single MaxZ { get; set; }
+      public Single MiniMinX { get; set; }
+      public Single MiniMinZ { get; set; }
+      public Single MiniMaxX { get; set; }
+      public Single MiniMaxZ { get; set; }
+      public Boolean IsHeroic { get; set; }
+      public Boolean MountAllowed { get; set; }
+      public String ExplorationType { get; set; }
+      public Int32 MiniMapColumns { get; set; }
+      public Int32 MiniMapRows { get; set; }
+      public Boolean HasMiniMap { get; set; }
 
       public override String ToString() {
         return String.IsNullOrWhiteSpace(DisplayText) ? (MapName ?? "(unnamed map)") : DisplayText;
@@ -34,17 +50,25 @@ namespace PugTools {
     private List<NodeMapPageChoice> _nodeMapPageChoices = new List<NodeMapPageChoice>();
     private NodeMapZoomPictureBox _nodeMapPagePreview;
     private Label _nodeMapPagePreviewLabel;
+    private Label _nodeMapPageInfoLabel;
+    private CheckBox _nodeMapPageMiniMapCheck;
 
     private void InitializeNodeMapPageUi() {
       if (_nodeMapPagePanel != null || splitContainer3?.Panel1 == null) return;
 
       _nodeMapPagePanel = new Panel {
         Dock = DockStyle.Top,
-        Height = 36,
+        Height = 62,
         Padding = new Padding(8, 4, 8, 4),
         Visible = false,
         BackColor = SystemColors.Control
       };
+
+      // Keep the map selector controls in their own top row. Docking the Tiles checkbox
+      // directly into the 62px parent made it consume the full height and overlap the
+      // ComboBox/"Map page:" row on some DPI/font combinations.
+      Panel selectorRow = new Panel { Dock = DockStyle.Top, Height = 28 };
+      _nodeMapPagePanel.Controls.Add(selectorRow);
 
       _nodeMapPageLabel = new Label {
         AutoSize = false,
@@ -53,7 +77,18 @@ namespace PugTools {
         Text = "Map page:",
         TextAlign = ContentAlignment.MiddleLeft
       };
-      _nodeMapPagePanel.Controls.Add(_nodeMapPageLabel);
+      selectorRow.Controls.Add(_nodeMapPageLabel);
+
+      _nodeMapPageMiniMapCheck = new CheckBox {
+        AutoSize = false,
+        Width = 64,
+        Dock = DockStyle.Right,
+        Text = "Tiles",
+        TextAlign = ContentAlignment.MiddleCenter,
+        Checked = false
+      };
+      _nodeMapPageMiniMapCheck.CheckedChanged += NodeMapPageMiniMapCheckChanged;
+      selectorRow.Controls.Add(_nodeMapPageMiniMapCheck);
 
       _nodeMapPageCombo = new ComboBox {
         Dock = DockStyle.Fill,
@@ -63,7 +98,17 @@ namespace PugTools {
         FormattingEnabled = true
       };
       _nodeMapPageCombo.SelectedIndexChanged += NodeMapPageComboSelectedIndexChanged;
-      _nodeMapPagePanel.Controls.Add(_nodeMapPageCombo);
+      selectorRow.Controls.Add(_nodeMapPageCombo);
+
+      _nodeMapPageInfoLabel = new Label {
+        Dock = DockStyle.Bottom,
+        Height = 22,
+        AutoEllipsis = true,
+        TextAlign = ContentAlignment.MiddleLeft,
+        ForeColor = SystemColors.GrayText,
+        Text = String.Empty
+      };
+      _nodeMapPagePanel.Controls.Add(_nodeMapPageInfoLabel);
 
       splitContainer3.Panel1.Controls.Add(_nodeMapPagePanel);
       _nodeMapPagePanel.BringToFront();
@@ -90,6 +135,7 @@ namespace PugTools {
     private void DisposeNodeMapPageUi() {
       try {
         if (_nodeMapPageCombo != null) _nodeMapPageCombo.SelectedIndexChanged -= NodeMapPageComboSelectedIndexChanged;
+        if (_nodeMapPageMiniMapCheck != null) _nodeMapPageMiniMapCheck.CheckedChanged -= NodeMapPageMiniMapCheckChanged;
         _nodeMapPageCombo?.Dispose();
         _nodeMapPagePanel?.Dispose();
       } catch { }
@@ -101,6 +147,8 @@ namespace PugTools {
       _nodeMapPageCombo = null;
       _nodeMapPagePanel = null;
       _nodeMapPageLabel = null;
+      _nodeMapPageInfoLabel = null;
+      _nodeMapPageMiniMapCheck = null;
       _nodeMapPageChoices = new List<NodeMapPageChoice>();
     }
 
@@ -143,6 +191,50 @@ namespace PugTools {
       return item.value.ToString() ?? String.Empty;
     }
 
+    private static Boolean NodeMapPageBool(NodeListItem item) {
+      if (item?.value == null) return false;
+      try { return Convert.ToBoolean(item.value, System.Globalization.CultureInfo.InvariantCulture); } catch { return false; }
+    }
+
+    private static Single[] NodeMapPageVector(NodeListItem item) {
+      Single[] result = new Single[] { 0f, 0f, 0f };
+      if (item?.value is IEnumerable values) {
+        Int32 index = 0;
+        foreach (Object value in values) {
+          if (index >= 3) break;
+          try { result[index] = Convert.ToSingle(value, System.Globalization.CultureInfo.InvariantCulture); } catch { }
+          index++;
+        }
+      }
+      return result;
+    }
+
+    private void FindNodeMapPageMiniMapCounts(String mapName, UInt64 areaId, out Int32 columns, out Int32 rows) {
+      columns = 0;
+      rows = 0;
+      if (_currentAssets == null || String.IsNullOrWhiteSpace(mapName) || areaId == 0) return;
+      const Int32 maxParts = 99;
+      const Int32 trailingMisses = 8;
+      Int32 rowMisses = 0;
+      for (Int32 row = 0; row < maxParts && rowMisses < trailingMisses; row++) {
+        Boolean found = false;
+        for (Int32 col = 0; col < maxParts; col++) {
+          String path = String.Format("/resources/world/areas/{0}/minimaps/{1}_{2:00}_{3:00}_r.dds", areaId, mapName, col, row);
+          try { using TorFile file = _currentAssets.FindFile(path); if (file != null) { found = true; break; } } catch { }
+        }
+        if (found) { rows = row + 1; rowMisses = 0; } else rowMisses++;
+      }
+      Int32 colMisses = 0;
+      for (Int32 col = 0; col < maxParts && colMisses < trailingMisses; col++) {
+        Boolean found = false;
+        for (Int32 row = 0; row < Math.Max(rows, 1); row++) {
+          String path = String.Format("/resources/world/areas/{0}/minimaps/{1}_{2:00}_{3:00}_r.dds", areaId, mapName, col, row);
+          try { using TorFile file = _currentAssets.FindFile(path); if (file != null) { found = true; break; } } catch { }
+        }
+        if (found) { columns = col + 1; colMisses = 0; } else colMisses++;
+      }
+    }
+
     private List<NodeMapPageChoice> BuildNodeMapPageChoices() {
       List<NodeMapPageChoice> result = new List<NodeMapPageChoice>();
       if (_rootList == null) return result;
@@ -163,7 +255,20 @@ namespace PugTools {
         NodeListItem mapSid = FindNodeField(rawPage, "mapNameSId", "4611686141823655043");
         NodeListItem parentSid = FindNodeField(rawPage, "mapParentNameSId", "4611686141823655046");
         NodeListItem guid = FindNodeField(rawPage, "mapPageGUID", "4611686020668180062");
-        String imagePath = ResolveNodeMapPageImagePath(ExtractNodeMapAreaId(), name, out Boolean hasImage);
+        NodeListItem minCoord = FindNodeField(rawPage, "mapPageMinCoord");
+        NodeListItem maxCoord = FindNodeField(rawPage, "mapPageMaxCoord");
+        NodeListItem miniMinCoord = FindNodeField(rawPage, "mapPageMiniMinCoord");
+        NodeListItem miniMaxCoord = FindNodeField(rawPage, "mapPageMiniMaxCoord");
+        NodeListItem heroic = FindNodeField(rawPage, "mapIsHeroic");
+        NodeListItem mount = FindNodeField(rawPage, "mapMountAllowed");
+        NodeListItem exploration = FindNodeField(rawPage, "mapExplorationType");
+        Single[] min = NodeMapPageVector(minCoord);
+        Single[] max = NodeMapPageVector(maxCoord);
+        Single[] miniMin = NodeMapPageVector(miniMinCoord);
+        Single[] miniMax = NodeMapPageVector(miniMaxCoord);
+        UInt64 areaId = ExtractNodeMapAreaId();
+        String imagePath = ResolveNodeMapPageImagePath(areaId, name, out Boolean hasImage);
+        FindNodeMapPageMiniMapCounts(name, areaId, out Int32 miniColumns, out Int32 miniRows);
 
         result.Add(new NodeMapPageChoice {
           Index = index,
@@ -174,7 +279,17 @@ namespace PugTools {
           Guid = NodeMapPageInt64(guid),
           Item = rawPage,
           ImagePath = imagePath,
-          HasImage = hasImage
+          HasImage = hasImage,
+          MinX = min[0], MinY = min[1], MinZ = min[2],
+          MaxX = max[0], MaxY = max[1], MaxZ = max[2],
+          MiniMinX = miniMin[0], MiniMinZ = miniMin[2],
+          MiniMaxX = miniMax[0], MiniMaxZ = miniMax[2],
+          IsHeroic = NodeMapPageBool(heroic),
+          MountAllowed = NodeMapPageBool(mount),
+          ExplorationType = NodeMapPageString(exploration),
+          MiniMapColumns = miniColumns,
+          MiniMapRows = miniRows,
+          HasMiniMap = miniColumns > 0 && miniRows > 0
         });
         index++;
       }
@@ -186,7 +301,13 @@ namespace PugTools {
       try {
         var strings = _currentDom?.StringTable?.Find("str.sys.worldmap");
         String localized = strings?.GetText(guid, "MapPage." + mapName);
-        return String.IsNullOrWhiteSpace(localized) ? String.Empty : localized.Trim();
+        if (!String.IsNullOrWhiteSpace(localized)) return localized.Trim();
+
+        // A German STB can legitimately have no translation for a newly added map page.
+        // Match the rest of PugTools/Jedipedia behavior and fall back to English rather
+        // than leaving the selector with only the internal name.
+        String english = strings?.GetText(guid, "MapPage." + mapName, "enMale");
+        return String.IsNullOrWhiteSpace(english) ? String.Empty : english.Trim();
       } catch { return String.Empty; }
     }
 
@@ -206,6 +327,8 @@ namespace PugTools {
           if (selected != null) {
             Int32 comboIndex = _nodeMapPageCombo.Items.IndexOf(selected);
             if (comboIndex >= 0) _nodeMapPageCombo.SelectedIndex = comboIndex;
+            UpdateNodeMapPageInfo(selected);
+            if (_nodeMapPageMiniMapCheck != null) _nodeMapPageMiniMapCheck.Checked = false;
             ShowNodeMapPagePreview(selected);
           }
         } else {
@@ -312,6 +435,15 @@ namespace PugTools {
       _nodeMapPagePreviewLabel.Text = choice.HasImage ? "Loading map image..." : "No map image available for this map page";
       _nodeMapPagePreviewLabel.Visible = true;
       _nodeMapPagePreview.Visible = false;
+      if (_nodeMapPageMiniMapCheck?.Checked == true) {
+        if (ShowNodeMapPageMiniMap(choice)) {
+          _nodeMapPagePreview.Visible = true;
+          _nodeMapPagePreviewLabel.Visible = false;
+        } else {
+          _nodeMapPagePreviewLabel.Text = "Minimap tiles could not be loaded";
+        }
+        return;
+      }
       if (!choice.HasImage || _currentAssets == null || String.IsNullOrWhiteSpace(choice.ImagePath)) return;
       try {
         using TorFile file = _currentAssets.FindFile(choice.ImagePath);
@@ -335,9 +467,94 @@ namespace PugTools {
       }
     }
 
+    private void UpdateNodeMapPageInfo(NodeMapPageChoice choice) {
+      if (_nodeMapPageInfoLabel == null) return;
+      if (choice == null) { _nodeMapPageInfoLabel.Text = String.Empty; return; }
+      String image = choice.HasImage ? "image: yes" : "image: no";
+      String flags = (choice.IsHeroic ? "Heroic" : "Normal") + ", " + (choice.MountAllowed ? "mount" : "no mount");
+      String exploration = String.IsNullOrWhiteSpace(choice.ExplorationType) ? String.Empty : " | exploration: " + choice.ExplorationType;
+      String mini = choice.HasMiniMap ? String.Format(" | minimap: {0}x{1}", choice.MiniMapColumns, choice.MiniMapRows) : " | minimap: none";
+      if (_nodeMapPageMiniMapCheck != null) _nodeMapPageMiniMapCheck.Enabled = choice.HasMiniMap;
+      _nodeMapPageInfoLabel.Text = String.Format(
+        "SId {0} | GUID {1} | Parent {2} | Bounds ({3:0.##},{4:0.##},{5:0.##}) → ({6:0.##},{7:0.##},{8:0.##}) | {9}{10} | {11}",
+        choice.SId, choice.Guid, choice.ParentId,
+        choice.MinX, choice.MinY, choice.MinZ, choice.MaxX, choice.MaxY, choice.MaxZ,
+        flags, exploration, image + mini
+      );
+    }
+
+    private Bitmap LoadNodeMapPageTile(String path) {
+      if (_currentAssets == null) return null;
+      try {
+        using TorFile file = _currentAssets.FindFile(path);
+        if (file == null) return null;
+        using Stream input = file.OpenCopyInMemory();
+        lock (NodePreviewDevIlLock) {
+          DevIL.ImageImporter importer = new DevIL.ImageImporter();
+          DevIL.Image image = importer.LoadImageFromStream(DevIL.ImageType.Dds, input);
+          using MemoryStream output = new MemoryStream();
+          DevIL.ImageExporter exporter = new DevIL.ImageExporter();
+          exporter.SaveImageToStream(image, DevIL.ImageType.Png, output);
+          output.Position = 0;
+          using Bitmap decoded = new Bitmap(output);
+          return new Bitmap(decoded);
+        }
+      } catch { return null; }
+    }
+
+    private Boolean ShowNodeMapPageMiniMap(NodeMapPageChoice choice) {
+      if (choice == null || !choice.HasMiniMap || _currentAssets == null) return false;
+      Int32 columns = Math.Min(99, Math.Max(1, choice.MiniMapColumns));
+      Int32 rows = Math.Min(99, Math.Max(1, choice.MiniMapRows));
+      Bitmap first = null;
+      for (Int32 row = 0; row < rows && first == null; row++)
+        for (Int32 col = 0; col < columns && first == null; col++)
+          first = LoadNodeMapPageTile(String.Format("/resources/world/areas/{0}/minimaps/{1}_{2:00}_{3:00}_r.dds", ExtractNodeMapAreaId(), choice.MapName, col, row));
+      if (first == null) return false;
+
+      Int32 tileWidth = first.Width;
+      Int32 tileHeight = first.Height;
+      const Int32 maxDimension = 8192;
+      Single scale = Math.Min(1f, Math.Min((Single)maxDimension / Math.Max(1, columns * tileWidth), (Single)maxDimension / Math.Max(1, rows * tileHeight)));
+      Int32 cellWidth = Math.Max(1, (Int32)Math.Round(tileWidth * scale));
+      Int32 cellHeight = Math.Max(1, (Int32)Math.Round(tileHeight * scale));
+      Bitmap mosaic = new Bitmap(Math.Max(1, columns * cellWidth), Math.Max(1, rows * cellHeight), System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+      using (Graphics g = Graphics.FromImage(mosaic)) {
+        g.Clear(Color.FromArgb(28, 28, 28));
+        g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+        g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+        for (Int32 row = 0; row < rows; row++) {
+          for (Int32 col = 0; col < columns; col++) {
+            String path = String.Format("/resources/world/areas/{0}/minimaps/{1}_{2:00}_{3:00}_r.dds", ExtractNodeMapAreaId(), choice.MapName, col, row);
+            using Bitmap tile = LoadNodeMapPageTile(path);
+            Rectangle target = new Rectangle(col * cellWidth, row * cellHeight, cellWidth, cellHeight);
+            if (tile != null) g.DrawImage(tile, target);
+            else {
+              using Pen pen = new Pen(Color.FromArgb(70, 180, 180, 180));
+              g.DrawRectangle(pen, target);
+              using Font font = new Font(FontFamily.GenericSansSerif, Math.Max(7f, Math.Min(14f, cellWidth / 8f)));
+              TextRenderer.DrawText(g, "?", font, target, Color.DimGray, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+            }
+          }
+        }
+      }
+      try { first.Dispose(); } catch { }
+      DisposeNodeMapPagePreviewImage();
+      _nodeMapPagePreview.SetCoordinateFrame(choice.MiniMinX, choice.MiniMinZ, choice.MiniMaxX, choice.MiniMaxZ);
+      _nodeMapPagePreview.SetImage(mosaic, true);
+      _nodeMapPagePreviewLabel.Text = String.Format("Minimap tiles: {0} x {1}", columns, rows);
+      return true;
+    }
+
+    private void NodeMapPageMiniMapCheckChanged(Object sender, EventArgs e) {
+      if (_nodeMapPageUpdating || _nodeMapPageCombo?.SelectedItem is not NodeMapPageChoice choice) return;
+      try { ShowNodeMapPagePreview(choice); } catch { }
+    }
+
     private void NodeMapPageComboSelectedIndexChanged(Object sender, EventArgs e) {
       if (_nodeMapPageUpdating || _nodeMapPageCombo?.SelectedItem is not NodeMapPageChoice choice) return;
       try {
+        UpdateNodeMapPageInfo(choice);
         ShowNodeMapPagePreview(choice);
         if (choice.Item != null) {
           treeViewGrid1.SelectObject(choice.Item, true);

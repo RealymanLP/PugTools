@@ -300,6 +300,8 @@ namespace PugTools {
       new WorldAreaCatalogEntry(4611686045100172279UL,"Inaccessible areas","Removed areas","kgt_newintel","Knight: Ord Mantell Station",7,5,7),
       new WorldAreaCatalogEntry(4611686050277772102UL,"Inaccessible areas","Removed areas","kgt_impss","Knight: Imperial Space Station",7,5,8),
       new WorldAreaCatalogEntry(4611686055156531852UL,"Inaccessible areas","Removed areas","imp_ship_pvp","PvP: Imperial Ship",7,5,9),
+      new WorldAreaCatalogEntry(4611686320204664000UL,"Unassigned","Jedipedia","enigma_hub","Enigma Hub",99,99,0),
+      new WorldAreaCatalogEntry(4611690227550610000UL,"Unassigned","Jedipedia","odessen_jadus","Odessen Jadus",99,99,1),
     };
   }
 }

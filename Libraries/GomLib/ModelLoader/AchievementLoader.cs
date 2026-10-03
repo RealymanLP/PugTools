@@ -83,6 +83,7 @@ namespace GomLib.ModelLoader {
       Achievement ach = obj as Achievement;
 
       if (CategoryMap.Count == 0) {
+        try {
         AchievementCategory rootCat = _dom.AchievementCategoryLoader.Load(0);
 
         if (rootCat != null) {
@@ -130,6 +131,10 @@ namespace GomLib.ModelLoader {
             }
           }
         }
+        } catch {
+          // Category metadata is auxiliary. A broken/missing category table must not invalidate
+          // the achievement itself.
+        }
       }
 
       CategoryMap.TryGetValue(gom.Id, out AchievementCatData blah);
@@ -163,14 +168,16 @@ namespace GomLib.ModelLoader {
 
       if (gom.Data.ContainsKey("achRewardId")) {
         ach.RewardsId = gom.Data.Get<Int64>("achRewardId");
-        GomObject rewardsTable = _dom.GetObject("achRewardsTable_Prototype");
-        // Fix this to be a reference to somehwere so we don't have to load it each time to read
-        // one value.
-        Dictionary<Object, Object> rewardsLookupList =
-          rewardsTable.Data.Get<Dictionary<Object, Object>>("achRewardsData");
+        GomObject rewardsTable = _dom.GetObjectNoLoad("achRewardsTable_Prototype");
+        Dictionary<Object, Object> rewardsLookupList = null;
+        if (rewardsTable?.Data != null)
+          rewardsLookupList = rewardsTable.Data.ValueOrDefault<Dictionary<Object, Object>>("achRewardsData", null);
 
-        if (rewardsLookupList.TryGetValue(ach.RewardsId, out Object rawRewardsObj)) {
+        if (rewardsLookupList != null && rewardsLookupList.TryGetValue(ach.RewardsId, out Object rawRewardsObj)) {
           GomObjectData rawRewards = rawRewardsObj as GomObjectData;
+          if (rawRewards == null) {
+            rawRewardsObj = null;
+          } else {
           ach.Rewards = new Rewards();
 
           var achievementPoints = rawRewards.ValueOrDefault<Int64>("achRewardPoints", 0);
@@ -182,8 +189,9 @@ namespace GomLib.ModelLoader {
           ach.Rewards.LocalizedLegacyTitle = new Dictionary<String, String>();
           if (legacyTitleField != 0) {
             ach.Rewards.LocalizedLegacyTitle = LegacyTitleLookup(legacyTitleField);
-            if (ach.Rewards.LocalizedLegacyTitle != null)
-              ach.Rewards.LegacyTitle = ach.Rewards.LocalizedLegacyTitle[GomLib.StringTable.SelectedLocalization];
+            if (ach.Rewards.LocalizedLegacyTitle != null &&
+                ach.Rewards.LocalizedLegacyTitle.TryGetValue(GomLib.StringTable.SelectedLocalization, out String legacyTitle))
+              ach.Rewards.LegacyTitle = legacyTitle;
           }
 
 
@@ -216,12 +224,13 @@ namespace GomLib.ModelLoader {
           }*/
 
           // TODO: This is not working, no items are being read.
-          List<Object> itemRew = rawRewards.Get<List<Object>>("achRewardItems");
+          List<Object> itemRew = rawRewards.ValueOrDefault<List<Object>>("achRewardItems", null);
           ach.Rewards.ItemRewardList = new Dictionary<UInt64, Int64>();
 
-          foreach (var gomDat in itemRew) {
-            Int64 quant = ((GomObjectData)gomDat).Get<Int64>("achRewardItemQty");
-            UInt64 itemId = ((GomObjectData)gomDat).Get<UInt64>("achRewardItemId");
+          foreach (var gomDat in itemRew ?? new List<Object>()) {
+            if (!(gomDat is GomObjectData itemData)) continue;
+            Int64 quant = itemData.ValueOrDefault<Int64>("achRewardItemQty", 0);
+            UInt64 itemId = itemData.ValueOrDefault<UInt64>("achRewardItemId", 0);
             GomObject rew = _dom.GetObject(itemId);
 
             /*if (rew.Name.Contains("itm.stronghold.") && !rew.Name.Contains(".trophy.") && !rew.Name.Contains("datacron_master_display")) //obsolete debugging code
@@ -231,32 +240,48 @@ namespace GomLib.ModelLoader {
 
             ach.Rewards.ItemRewardList.Add(itemId, quant);
           }
+          }
         }
 
-        rewardsTable.Unload();
+        if (rewardsTable != null) rewardsTable.Unload();
       }
 
       Dictionary<Object, Object> textLookup =
-        gom.Data.Get<Dictionary<Object, Object>>("locTextRetrieverMap");
+        gom.Data.ValueOrDefault<Dictionary<Object, Object>>("locTextRetrieverMap", null);
+      if (textLookup == null) textLookup = new Dictionary<Object, Object>();
 
-      // Load Achievement Name
-      GomObjectData nameLookupData = (GomObjectData)textLookup[NameLookupKey];
-      ach.NameId = nameLookupData.Get<Int64>("strLocalizedTextRetrieverStringID");
-      ach.LocalizedName = _dom.StringTable.TryGetLocalizedStrings(ach.Fqn, nameLookupData);
-      Normalize.Dictionary(ach.LocalizedName, ach.Fqn);
-      ach.Name = _dom.StringTable.TryGetString(ach.Fqn, nameLookupData);
+      // Achievement text fields have changed between client builds.  Missing retrievers should
+      // not invalidate the entire achievement; keep the object and expose whatever text exists.
+      if (textLookup.TryGetValue(NameLookupKey, out Object rawName) && rawName is GomObjectData nameLookupData) {
+        ach.NameId = nameLookupData.ValueOrDefault<Int64>("strLocalizedTextRetrieverStringID", 0);
+        ach.LocalizedName = _dom.StringTable.TryGetLocalizedStrings(ach.Fqn, nameLookupData);
+        Normalize.Dictionary(ach.LocalizedName, ach.Fqn);
+        ach.Name = _dom.StringTable.TryGetString(ach.Fqn, nameLookupData);
+      } else {
+        ach.NameId = 0;
+        ach.LocalizedName = new Dictionary<String, String>();
+        ach.Name = ach.Fqn;
+      }
 
-      // Load Achievement Description
-      GomObjectData descLookupData = (GomObjectData)textLookup[DescLookupKey];
-      ach.DescriptionId = descLookupData.Get<Int64>("strLocalizedTextRetrieverStringID");
-      ach.LocalizedDescription = _dom.StringTable.TryGetLocalizedStrings(ach.Fqn, descLookupData);
-      ach.Description = _dom.StringTable.TryGetString(ach.Fqn, descLookupData);
+      if (textLookup.TryGetValue(DescLookupKey, out Object rawDesc) && rawDesc is GomObjectData descLookupData) {
+        ach.DescriptionId = descLookupData.ValueOrDefault<Int64>("strLocalizedTextRetrieverStringID", 0);
+        ach.LocalizedDescription = _dom.StringTable.TryGetLocalizedStrings(ach.Fqn, descLookupData);
+        ach.Description = _dom.StringTable.TryGetString(ach.Fqn, descLookupData);
+      } else {
+        ach.DescriptionId = 0;
+        ach.LocalizedDescription = new Dictionary<String, String>();
+        ach.Description = "";
+      }
 
-      GomObjectData nonSpoilerData = (GomObjectData)textLookup[UnknownLookupKey];
-      ach.NonSpoilerId = nonSpoilerData.Get<Int64>("strLocalizedTextRetrieverStringID");
-      ach.LocalizedNonSpoilerDesc =
-        _dom.StringTable.TryGetLocalizedStrings(ach.Fqn, nonSpoilerData);
-      ach.NonSpoilerDesc = _dom.StringTable.TryGetString(ach.Fqn, nonSpoilerData);
+      if (textLookup.TryGetValue(UnknownLookupKey, out Object rawNonSpoiler) && rawNonSpoiler is GomObjectData nonSpoilerData) {
+        ach.NonSpoilerId = nonSpoilerData.ValueOrDefault<Int64>("strLocalizedTextRetrieverStringID", 0);
+        ach.LocalizedNonSpoilerDesc = _dom.StringTable.TryGetLocalizedStrings(ach.Fqn, nonSpoilerData);
+        ach.NonSpoilerDesc = _dom.StringTable.TryGetString(ach.Fqn, nonSpoilerData);
+      } else {
+        ach.NonSpoilerId = 0;
+        ach.LocalizedNonSpoilerDesc = new Dictionary<String, String>();
+        ach.NonSpoilerDesc = "";
+      }
       ach.Id = gom.Id; // (UInt64)(ach.NameId >> 32);
 
       // Conditions
@@ -298,15 +323,18 @@ namespace GomLib.ModelLoader {
 
       // Initialize the Tasks
       Dictionary<Object, Object> tasksLookup =
-        gom.Data.Get<Dictionary<Object, Object>>("achTasks"); //add a task loader
+        gom.Data.ValueOrDefault<Dictionary<Object, Object>>("achTasks", null);
       ach.Tasks = new List<AchTask>();
+      if (tasksLookup == null) tasksLookup = new Dictionary<Object, Object>();
 
       foreach (Object task in tasksLookup.Keys) {
         GomObjectData taskLookupData = (GomObjectData)tasksLookup[task];
         Dictionary<Object, Object> subtasks =
-          taskLookupData.Get<Dictionary<Object, Object>>("achTaskSubtasks");
+          taskLookupData.ValueOrDefault<Dictionary<Object, Object>>("achTaskSubtasks", null)
+          ?? new Dictionary<Object, Object>();
         Dictionary<Object, Object> events =
-          taskLookupData.Get<Dictionary<Object, Object>>("achTaskEvents");
+          taskLookupData.ValueOrDefault<Dictionary<Object, Object>>("achTaskEvents", null)
+          ?? new Dictionary<Object, Object>();
 
         String taskName = "";
         Dictionary<String, String> localizedTaskName = new Dictionary<String, String>();
@@ -324,16 +352,16 @@ namespace GomLib.ModelLoader {
         if (subtasks.Count == 0) {
           AchTask tmpTask = new AchTask {
             Index = (Int64)task,
-            Count = taskLookupData.Get<Int64>("achTaskTotal"),
+            Count = taskLookupData.ValueOrDefault<Int64>("achTaskTotal", 1),
             Events = new List<AchEvent>()
           };
 
           foreach (var curEvent in events) {
             AchEvent tmpEvent = new AchEvent {
-              Id = (UInt64)(Int64)curEvent.Key
+              Id = Convert.ToUInt64(Convert.ToInt64(curEvent.Key))
             };
             tmpEvent.CheckNodeRef(_dom);
-            tmpEvent.Value = (Int64)curEvent.Value;
+            tmpEvent.Value = Convert.ToInt64(curEvent.Value);
             tmpTask.Events.Add(tmpEvent);
           }
           tmpTask.Name = taskName;
@@ -351,20 +379,20 @@ namespace GomLib.ModelLoader {
         else {
           foreach (var curSubtask in subtasks) {
             AchTask tmpTask = new AchTask {
-              Index = (Int64)task,
-              Index2 = (Int64)curSubtask.Value,
+              Index = Convert.ToInt64(task),
+              Index2 = Convert.ToInt64(curSubtask.Value),
               Count = 1L,
-              Id = (UInt64)(Int64)curSubtask.Key,
+              Id = Convert.ToUInt64(Convert.ToInt64(curSubtask.Key)),
               Events = new List<AchEvent>()
             };
             AchEvent tmpEvent = new AchEvent {
-              Id = (UInt64)(Int64)curSubtask.Key
+              Id = Convert.ToUInt64(Convert.ToInt64(curSubtask.Key))
             };
             tmpEvent.CheckNodeRef(_dom);
 
             foreach (var curEvent in events) {
               if (curEvent.Key == curSubtask.Key) {
-                tmpEvent.Value = (Int64)curEvent.Value;
+                tmpEvent.Value = Convert.ToInt64(curEvent.Value);
                 break;
               }
             }

@@ -34,6 +34,7 @@ namespace PugTools {
     private Boolean m_dragging;
     private Point m_lastMouse;
     private Boolean m_checkerboard = true;
+    private String m_infoText = String.Empty;
 
     private CubeMapPixels m_cubeMap;
     private Bitmap m_cubeFrame;
@@ -58,6 +59,16 @@ namespace PugTools {
     }
 
     internal Boolean IsCubeMap => m_cubeMap != null;
+
+    internal String InfoText {
+      get => m_infoText;
+      set {
+        value ??= String.Empty;
+        if (String.Equals(m_infoText, value, StringComparison.Ordinal)) return;
+        m_infoText = value;
+        Invalidate();
+      }
+    }
 
     internal Boolean Checkerboard {
       get => m_checkerboard;
@@ -185,6 +196,7 @@ namespace PugTools {
           using Brush brush = new SolidBrush(DrawingColor.Gainsboro);
           e.Graphics.DrawString("Rendering cubemap ...", Font, brush, ClientRectangle, fmt);
         }
+        DrawInfoOverlay(e.Graphics);
         return;
       }
 
@@ -197,6 +209,18 @@ namespace PugTools {
         ? InterpolationMode.NearestNeighbor
         : InterpolationMode.HighQualityBicubic;
       e.Graphics.DrawImage(m_image, destination);
+      DrawInfoOverlay(e.Graphics);
+    }
+
+    private void DrawInfoOverlay(Graphics g) {
+      if (String.IsNullOrWhiteSpace(m_infoText)) return;
+      using Font font = new Font(Font, FontStyle.Regular);
+      SizeF measured = g.MeasureString(m_infoText, font, Math.Max(100, ClientSize.Width - 24));
+      RectangleF box = new RectangleF(8, 8, Math.Min(ClientSize.Width - 16, measured.Width + 16), measured.Height + 10);
+      using Brush background = new SolidBrush(DrawingColor.FromArgb(190, 0, 0, 0));
+      using Brush foreground = new SolidBrush(DrawingColor.White);
+      g.FillRectangle(background, box);
+      g.DrawString(m_infoText, font, foreground, new RectangleF(box.X + 8, box.Y + 5, box.Width - 16, box.Height - 10));
     }
 
     protected override void OnMouseEnter(EventArgs e) {

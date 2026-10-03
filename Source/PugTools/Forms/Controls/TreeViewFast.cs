@@ -33,6 +33,22 @@ namespace TreeViewFast.Controls {
       }
     }
 
+    /// <summary>
+    /// Releases only the native Win32 TreeView handle. The managed TreeNode graph is intentionally
+    /// left intact so it can become garbage-collectible without forcing WinForms to synchronously
+    /// walk a potentially huge tree during Form.Dispose(). Call this only after the control has been
+    /// detached from its parent and will never be used again.
+    /// </summary>
+    internal void ReleaseNativeHandleForDeferredCleanup() {
+      try {
+        _treeNodes = new Dictionary<String, TreeNode>();
+      } catch { }
+
+      try {
+        if (IsHandleCreated) DestroyHandle();
+      } catch { }
+    }
+
     #region  Methods
     internal static PreparedTree PrepareItems<T>(
       IEnumerable<T> items,

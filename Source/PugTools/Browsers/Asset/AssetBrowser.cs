@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -266,12 +266,10 @@ namespace PugTools {
         });
       }
 
-      if (m_assetFilterTree != null) {
-        try { m_assetFilterTree.Dispose(); } catch { }
-        m_assetFilterTree = null;
-      }
-
-      // Form.Dispose() owns the main tree. Avoid explicitly traversing it a second time here.
+      // Both large navigation trees were detached and had their native handles released in
+      // FormClosing. Do not Dispose() them here: WinForms would synchronously walk the entire
+      // managed TreeNode graph again. The detached controls can be reclaimed by GC later.
+      m_assetFilterTree = null;
       treeViewFast1 = null;
 
       try { StopSgtPreview(true); } catch { }
@@ -334,17 +332,46 @@ namespace PugTools {
     }
 
     private void AssetBrowserFormClosing(Object sender, FormClosingEventArgs e) {
-      m_closing = true;
+      // A fully populated Asset Browser can own hundreds of thousands of managed TreeNode
+      // objects. Closing a WinForms Form normally disposes the complete control hierarchy and
+      // can make the UI thread/GC walk that graph for a very long time, starving the whole PC.
+      // Keep the browser alive and hide it for normal user closes. BrowserNavigation already
+      // reuses hidden browser instances. The form will still be disposed normally when the
+      // application itself exits (CloseReason.ApplicationExitCall).
+      if (e.CloseReason == CloseReason.UserClosing || e.CloseReason == CloseReason.None) {
+        e.Cancel = true;
+        Hide();
+        return;
+      }
 
-      // Stop high-frequency/background work before controls and D3D handles
-      // are destroyed. Tree preparation and live filtering both observe these
-      // cancellation signals and can now terminate during a large sort/build.
+      m_closing = true;
       try { m_assetTreeFilterCancellation?.Cancel(); } catch { }
       try { m_assetTreeFilterTimer?.Stop(); } catch { }
+      try { if (backgroundWorker1.IsBusy) backgroundWorker1.CancelAsync(); } catch { }
+      try { if (backgroundWorker2.IsBusy) backgroundWorker2.CancelAsync(); } catch { }
+      try { if (backgroundWorker3.IsBusy) backgroundWorker3.CancelAsync(); } catch { }
       try { m_panelRender?.StopRender(); } catch { }
+      DetachAssetTreesForClose();
+      try { if (m_audioPlaying) m_waveOut?.Stop(); } catch { }
+    }
+
+    private void DetachAssetTreesForClose() {
+      TreeViewFast.Controls.TreeViewFast fullTree = treeViewFast1;
+      TreeViewFast.Controls.TreeViewFast filterTree = m_assetFilterTree;
+
+      treeViewFast1 = null;
+      m_assetFilterTree = null;
+
+      DetachAndReleaseTree(fullTree);
+      DetachAndReleaseTree(filterTree);
+    }
+
+    private static void DetachAndReleaseTree(TreeViewFast.Controls.TreeViewFast tree) {
+      if (tree == null) return;
       try {
-        if (m_audioPlaying) m_waveOut?.Stop();
+        if (tree.Parent != null) tree.Parent.Controls.Remove(tree);
       } catch { }
+      try { tree.ReleaseNativeHandleForDeferredCleanup(); } catch { }
     }
 
     private void AssetBrowserFormResize(Object sender, EventArgs e) {
@@ -2309,9 +2336,99 @@ namespace PugTools {
       m_rootList = View_JedipediaFormats.Parse(m_inputStream, extension, fileName);
     }
 
+    private String ReadDdsHeaderInfo(Stream source) {
+      if (source == null || !source.CanRead || source.Length < 128) return "DDS header unavailable";
+      try {
+        source.Position = 0;
+        using BinaryReader br = new BinaryReader(source, Encoding.ASCII, true);
+        if (br.ReadUInt32() != 0x20534444u) return "Not a DDS file"; // "DDS "
+        UInt32 size = br.ReadUInt32();
+        UInt32 flags = br.ReadUInt32();
+        UInt32 height = br.ReadUInt32();
+        UInt32 width = br.ReadUInt32();
+        UInt32 pitchOrLinear = br.ReadUInt32();
+        UInt32 depth = br.ReadUInt32();
+        UInt32 mipCount = br.ReadUInt32();
+        for (Int32 i = 0; i < 11; i++) br.ReadUInt32();
+
+        UInt32 pfSize = br.ReadUInt32();
+        UInt32 pfFlags = br.ReadUInt32();
+        UInt32 pfFourCC = br.ReadUInt32();
+        UInt32 pfRgbBitCount = br.ReadUInt32();
+        UInt32 pfR = br.ReadUInt32();
+        UInt32 pfG = br.ReadUInt32();
+        UInt32 pfB = br.ReadUInt32();
+        UInt32 pfA = br.ReadUInt32();
+        UInt32 caps = br.ReadUInt32();
+        UInt32 caps2 = br.ReadUInt32();
+        br.ReadUInt32(); br.ReadUInt32(); br.ReadUInt32();
+
+        String format = DecodeDdsFormat(pfFlags, pfFourCC, pfRgbBitCount, pfR, pfG, pfB, pfA);
+        String dimension = width + " × " + height;
+        if ((caps2 & 0x00200000u) != 0) dimension += " × " + Math.Max(1u, depth) + " (volume)";
+        String kind = (caps2 & 0x0000FE00u) != 0 ? "Cubemap" : "2D texture";
+        if ((caps2 & 0x00200000u) != 0) kind = "Volume texture";
+        String mips = Math.Max(1u, mipCount).ToString(CultureInfo.InvariantCulture);
+        StringBuilder info = new StringBuilder();
+        info.Append(dimension).Append("  •  ").Append(format).Append("  •  ").Append(kind).Append("\n");
+        info.Append("Mipmaps: ").Append(mips);
+        if ((flags & 0x00000008u) != 0) info.Append("  •  pitch/linear: ").Append(pitchOrLinear.ToString("N0", CultureInfo.InvariantCulture));
+        if (pfFourCC != 0) info.Append("  •  FourCC: ").Append(FourCc(pfFourCC));
+        if (size != 124 || pfSize != 32) info.Append("  •  non-standard header size");
+        return info.ToString();
+      } catch (Exception ex) {
+        return "DDS header parse failed: " + ex.Message;
+      } finally {
+        try { source.Position = 0; } catch { }
+      }
+    }
+
+    private static String DecodeDdsFormat(UInt32 flags, UInt32 fourCC, UInt32 bits, UInt32 r, UInt32 g, UInt32 b, UInt32 a) {
+      if ((flags & 0x00000004u) != 0) {
+        String cc = FourCc(fourCC);
+        switch (cc) {
+          case "DXT1": return "BC1 / DXT1";
+          case "DXT2": return "BC2 / DXT2";
+          case "DXT3": return "BC2 / DXT3";
+          case "DXT4": return "BC3 / DXT4";
+          case "DXT5": return "BC3 / DXT5";
+          case "ATI1": return "BC4 / ATI1";
+          case "ATI2": return "BC5 / ATI2";
+          case "BC4U": return "BC4";
+          case "BC4S": return "BC4 signed";
+          case "BC5U": return "BC5";
+          case "BC5S": return "BC5 signed";
+          case "DX10": return "DX10 extended format";
+          default: return cc + " compressed";
+        }
+      }
+      if ((flags & 0x00000040u) != 0) {
+        if (bits == 32 && r == 0x00FF0000u && g == 0x0000FF00u && b == 0x000000FFu && a == 0xFF000000u) return "RGBA8 / BGRA byte order";
+        if (bits == 32 && r == 0x000000FFu && g == 0x0000FF00u && b == 0x00FF0000u && a == 0xFF000000u) return "RGBA8";
+        if (bits == 24 && r == 0x00FF0000u && g == 0x0000FF00u && b == 0x000000FFu) return "RGB8";
+        if (bits == 16 && r == 0xF800u && g == 0x07E0u && b == 0x001Fu) return "RGB565";
+        if (bits == 16 && r == 0x7C00u && g == 0x03E0u && b == 0x001Fu && a == 0x8000u) return "ARGB1555";
+        if (bits == 16 && r == 0x0F00u && g == 0x00F0u && b == 0x000Fu && a == 0xF000u) return "ARGB4444";
+        return bits + "-bit uncompressed RGB(A)";
+      }
+      if ((flags & 0x00020000u) != 0) return "Luminance";
+      if ((flags & 0x00040000u) != 0) return "Alpha";
+      return "Unknown DDS format";
+    }
+
+    private static String FourCc(UInt32 value) {
+      Byte[] bytes = BitConverter.GetBytes(value);
+      String s = Encoding.ASCII.GetString(bytes);
+      return s.TrimEnd('\0', ' ');
+    }
+
     private void PreviewAssetDDS() {
       try {
         if (m_inputStream == null) return;
+        m_inputStream.Position = 0;
+
+        String ddsInfo = ReadDdsHeaderInfo(m_inputStream);
+        m_ddsPreview.Invoke(new Action(() => m_ddsPreview.InfoText = ddsInfo));
         m_inputStream.Position = 0;
 
         using ImageImporter imp = new ImageImporter();
@@ -5257,7 +5374,7 @@ namespace PugTools {
 
       String ext = Path.GetExtension(value);
       if (!String.IsNullOrWhiteSpace(ext)) yield break;
-      foreach (String suffix in new[] { ".gr2", ".dds", ".tex", ".mat", ".fxspec", ".prt", ".jba", ".mph", ".mag", ".spt", ".stg", ".dyn", ".xml" })
+      foreach (String suffix in new[] { ".gr2", ".dds", ".tex", ".mat", ".fxspec", ".prt", ".jba", ".mph", ".mag", ".spt", ".stg", ".dyn", ".xml", ".bnk", ".wem", ".lod", ".clo", ".dyc", ".epp", ".gfx", ".swf", ".amx", ".bkt", ".dat", ".not", ".stb", ".tbl", ".lst", ".manifest" })
         yield return value + suffix;
     }
 

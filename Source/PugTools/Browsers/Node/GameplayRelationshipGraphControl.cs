@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -30,6 +30,7 @@ namespace PugTools {
     private readonly ToolStripButton _copyDot;
     private readonly ToolStripButton _world;
     private readonly ToolStripButton _model;
+    private readonly ToolStripButton _resource;
     private readonly ToolStripLabel _stats;
     private readonly ToolStripLabel _selection;
     private readonly Panel _canvas;
@@ -58,6 +59,7 @@ namespace PugTools {
     public Action<String> NavigateRequested { get; set; }
     public Action<String> WorldMapNoteRequested { get; set; }
     public Action<String> ModelPreviewRequested { get; set; }
+    public Action<String> ResourceRequested { get; set; }
     public Func<String, Bitmap> IconLoader { get; set; }
 
     internal sealed class GraphNode {
@@ -69,6 +71,7 @@ namespace PugTools {
       public UInt64 TargetId;
       public String WorldMapNoteFqn;
       public String ModelPreviewFqn;
+      public String ResourcePath;
       public Int32 Column;
       public Int32 Order;
       public RectangleF Bounds;
@@ -95,6 +98,8 @@ namespace PugTools {
       _world.Click += delegate { if (!String.IsNullOrWhiteSpace(_selected?.WorldMapNoteFqn)) WorldMapNoteRequested?.Invoke(_selected.WorldMapNoteFqn); };
       _model = new ToolStripButton("3D / Model") { Enabled = false, ToolTipText = "Open the selected appearance/item in Model Browser" };
       _model.Click += delegate { if (!String.IsNullOrWhiteSpace(_selected?.ModelPreviewFqn)) ModelPreviewRequested?.Invoke(_selected.ModelPreviewFqn); };
+      _resource = new ToolStripButton("Asset") { Enabled = false, ToolTipText = "Open the selected SWTOR resource in Asset Browser" };
+      _resource.Click += delegate { if (!String.IsNullOrWhiteSpace(_selected?.ResourcePath)) ResourceRequested?.Invoke(_selected.ResourcePath); };
       _stats = new ToolStripLabel("No graph");
       _selection = new ToolStripLabel();
       _tools.Items.Add(_fit);
@@ -102,6 +107,7 @@ namespace PugTools {
       _tools.Items.Add(_copyDot);
       _tools.Items.Add(_world);
       _tools.Items.Add(_model);
+      _tools.Items.Add(_resource);
       _tools.Items.Add(new ToolStripSeparator());
       _tools.Items.Add(_stats);
       _tools.Items.Add(new ToolStripSeparator());
@@ -155,11 +161,12 @@ namespace PugTools {
       _selection.Text = String.Empty;
       _world.Enabled = false;
       _model.Enabled = false;
+      _resource.Enabled = false;
       _stats.Text = "Building graph…";
       _canvas.Invalidate();
     }
 
-    public String AddNode(String id, String kind, String title, String detail, String targetFqn, UInt64 targetId, Int32 column, String worldMapNoteFqn = null, String modelPreviewFqn = null) {
+    public String AddNode(String id, String kind, String title, String detail, String targetFqn, UInt64 targetId, Int32 column, String worldMapNoteFqn = null, String modelPreviewFqn = null, String resourcePath = null) {
       if (String.IsNullOrWhiteSpace(id)) id = "node:" + (_nodes.Count + _omittedNodes).ToString(CultureInfo.InvariantCulture);
       if (String.IsNullOrWhiteSpace(modelPreviewFqn) && IsModelPreviewTarget(targetFqn)) modelPreviewFqn = targetFqn;
       if (_nodeById.TryGetValue(id, out GraphNode existing)) return existing.Id;
@@ -173,6 +180,7 @@ namespace PugTools {
         TargetId = targetId,
         WorldMapNoteFqn = worldMapNoteFqn,
         ModelPreviewFqn = modelPreviewFqn,
+        ResourcePath = resourcePath,
         Column = Math.Max(0, column),
         Order = _nodes.Count
       };
@@ -338,10 +346,12 @@ namespace PugTools {
         _selected = hit;
         _world.Enabled = !String.IsNullOrWhiteSpace(hit.WorldMapNoteFqn) && WorldMapNoteRequested != null;
         _model.Enabled = !String.IsNullOrWhiteSpace(hit.ModelPreviewFqn) && ModelPreviewRequested != null;
+        _resource.Enabled = !String.IsNullOrWhiteSpace(hit.ResourcePath) && ResourceRequested != null;
         _selection.Text = (hit.Kind ?? "Node") + ": " + (hit.Title ?? hit.Id)
           + (!String.IsNullOrWhiteSpace(hit.TargetFqn) ? "  [double-click to open]" : String.Empty)
           + (!String.IsNullOrWhiteSpace(hit.WorldMapNoteFqn) ? "  [World available]" : String.Empty)
-          + (!String.IsNullOrWhiteSpace(hit.ModelPreviewFqn) ? "  [3D available]" : String.Empty);
+          + (!String.IsNullOrWhiteSpace(hit.ModelPreviewFqn) ? "  [3D available]" : String.Empty)
+          + (!String.IsNullOrWhiteSpace(hit.ResourcePath) ? "  [Asset available]" : String.Empty);
         _canvas.Invalidate();
         return;
       }
@@ -370,7 +380,8 @@ namespace PugTools {
     private void CanvasMouseDoubleClick(Object sender, MouseEventArgs e) {
       GraphNode hit = HitTest(e.Location);
       if (hit == null) return;
-      if (!String.IsNullOrWhiteSpace(hit.TargetFqn)) NavigateRequested?.Invoke(hit.TargetFqn);
+      if (!String.IsNullOrWhiteSpace(hit.ResourcePath)) ResourceRequested?.Invoke(hit.ResourcePath);
+      else if (!String.IsNullOrWhiteSpace(hit.TargetFqn)) NavigateRequested?.Invoke(hit.TargetFqn);
       else if (!String.IsNullOrWhiteSpace(hit.WorldMapNoteFqn)) WorldMapNoteRequested?.Invoke(hit.WorldMapNoteFqn);
     }
 

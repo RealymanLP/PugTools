@@ -195,6 +195,31 @@ namespace GomLib.ModelLoader {
           page.ExplorationId = long.Parse(mapPage.ValueOrDefault<object>("mapExplorationId", 0).ToString());
           page.MapFowRadius = mapPage.ValueOrDefault("mapFowRadius", 0f);
 
+          // FoW grid metadata is absent on some older/Beta map pages, so all
+          // reads are optional and simply keep the default values when missing.
+          page.FowColumnCount = mapPage.ValueOrDefault("mapFowColumnCount", 0);
+          page.FowRowCount = mapPage.ValueOrDefault("mapFowRowCount", 0);
+          page.FowExplorePctOfRadius = mapPage.ValueOrDefault("mapFowExplorePctOfRadius", 0f);
+
+          List<float> fowStartPos = mapPage.ValueOrDefault<List<float>>("mapFowStartPos", null);
+          if (fowStartPos != null) {
+            if (fowStartPos.Count > 0) page.FowStartX = fowStartPos[0];
+            if (fowStartPos.Count > 1) page.FowStartY = fowStartPos[1];
+            if (fowStartPos.Count > 2) page.FowStartZ = fowStartPos[2];
+          }
+
+          List<object> fowHexGroupIds = mapPage.ValueOrDefault<List<object>>("mapFowHexGroupIds", null);
+          if (fowHexGroupIds != null) {
+            page.FowHexGroupIds = fowHexGroupIds
+              .Select(x => {
+                try { return Convert.ToInt64(x); }
+                catch { return 0L; }
+              })
+              .ToList();
+          } else {
+            page.FowHexGroupIds = new List<long>();
+          }
+
           pageLookup[page.SId] = page;
           area.MapPages.Add(page);
         }

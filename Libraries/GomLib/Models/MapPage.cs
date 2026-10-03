@@ -52,6 +52,17 @@ namespace GomLib.Models {
     public long ExplorationId { get; set; }
     public float MapFowRadius { get; internal set; }
 
+    // FoW grid metadata. These properties intentionally mirror the names used
+    // by the Node Browser so older/newer builds can expose the data without
+    // requiring the UI to depend on a separate DTO.
+    public int FowColumnCount { get; internal set; }
+    public int FowRowCount { get; internal set; }
+    public float FowExplorePctOfRadius { get; internal set; }
+    public float FowStartX { get; internal set; }
+    public float FowStartY { get; internal set; }
+    public float FowStartZ { get; internal set; }
+    public List<long> FowHexGroupIds { get; internal set; }
+
     public int MiniMapColumnCount {
       get {
         if (_MiniMapColumCount != -1) {
@@ -87,7 +98,7 @@ namespace GomLib.Models {
       bool foundAllRows = false;
       while (!foundAllRows) {
         string miniMapPartPath = string.Format(miniMapBasePath, Area.AreaId, MapName,
-                    rows.ToString("00"), "00");
+                    "00", rows.ToString("00"));
 
         if (Area.Dom.Assets.HasFile(miniMapPartPath)) {
           //Found map tile. Increment counter.
@@ -102,7 +113,7 @@ namespace GomLib.Models {
       bool foundAllColumns = false;
       while (!foundAllColumns) {
         string miniMapPartPath = string.Format(miniMapBasePath, Area.AreaId, MapName,
-                    "00", columns.ToString("00"));
+                    columns.ToString("00"), "00");
 
         if (Area.Dom.Assets.HasFile(miniMapPartPath)) {
           //Found map tile. Increment counter.

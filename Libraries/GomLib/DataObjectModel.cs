@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -25,6 +25,7 @@ namespace GomLib {
       m_namedMap = new Dictionary<String, HashSet<String>>();
       m_prototypeLoader = new DomTypeLoaders.FileInstanceLoader();
       m_storedIdMap = new Dictionary<UInt64, String>();
+      m_storedAliasesMap = new Dictionary<UInt64, List<String>>();
       m_storedNameMap = new Dictionary<String, UInt64>();
       m_typeLoaderMap = new Dictionary<Int32, DomTypeLoaders.IDomTypeLoader>();
       m_unnamedMap = new Dictionary<String, HashSet<UInt64>>();
@@ -50,6 +51,7 @@ namespace GomLib {
     private readonly Dictionary<String, HashSet<String>> m_namedMap;
     private DomTypeLoaders.FileInstanceLoader m_prototypeLoader;
     private Dictionary<UInt64, String> m_storedIdMap;
+    private Dictionary<UInt64, List<String>> m_storedAliasesMap;
     private Dictionary<String, UInt64> m_storedNameMap;
     private Dictionary<Int32, DomTypeLoaders.IDomTypeLoader> m_typeLoaderMap;
     private Dictionary<String, HashSet<UInt64>> m_unnamedMap;
@@ -79,6 +81,8 @@ namespace GomLib {
         DomTypeMap = null;
         m_storedNameMap.Clear();
         m_storedNameMap = null;
+        m_storedAliasesMap?.Clear();
+        m_storedAliasesMap = null;
         m_unnamedMap.Clear();
         m_unnamedMap = null;
         m_bucketFiles.Clear();
@@ -321,6 +325,24 @@ namespace GomLib {
       }
 
       return null;
+    }
+
+    /// <summary>
+    /// Returns the canonical stored GOM type name followed by any explicitly
+    /// declared historical aliases. Aliases are read from the optional
+    /// <c>alias</c> attribute in gom_type_names.xml and are never inferred.
+    /// </summary>
+    public IReadOnlyList<String> GetStoredTypeNames(UInt64 id) {
+      var result = new List<String>();
+      if (m_storedIdMap.TryGetValue(id, out String canonical) && !String.IsNullOrWhiteSpace(canonical))
+        result.Add(canonical);
+      if (m_storedAliasesMap.TryGetValue(id, out List<String> aliases)) {
+        foreach (String alias in aliases ?? new List<String>()) {
+          if (!String.IsNullOrWhiteSpace(alias) && !result.Contains(alias, StringComparer.OrdinalIgnoreCase))
+            result.Add(alias);
+        }
+      }
+      return result;
     }
 
     private void InitializeModelLoaders() {
@@ -667,6 +689,25 @@ namespace GomLib {
 
           String name = node.Value;
 
+          // Optional explicit historical aliases. These are deliberately data-driven:
+          // do not infer renames from similar-looking type names.
+          if (node.MoveToAttribute("alias", "")) {
+            String rawAliases = node.Value;
+            if (!String.IsNullOrWhiteSpace(rawAliases)) {
+              if (!m_storedAliasesMap.TryGetValue(id, out List<String> aliases)) {
+                aliases = new List<String>();
+                m_storedAliasesMap[id] = aliases;
+              }
+              foreach (String alias in rawAliases.Split(new[] { ',', ';', '|' }, StringSplitOptions.RemoveEmptyEntries)) {
+                String clean = alias.Trim();
+                if (!String.IsNullOrWhiteSpace(clean) && !aliases.Contains(clean, StringComparer.OrdinalIgnoreCase)) {
+                  aliases.Add(clean);
+                  if (!m_storedNameMap.ContainsKey(clean)) m_storedNameMap.Add(clean, id);
+                }
+              }
+            }
+          }
+
           // gom_type_names can legitimately contain the same display name for
           // different GOM type IDs (for example GUIAnimation is both an
           // association and a class). Keep the first name -> id mapping so
@@ -864,6 +905,7 @@ namespace GomLib {
       m_bucketFiles = new List<String>();
       m_prototypeLoader = new DomTypeLoaders.FileInstanceLoader();
       m_storedIdMap = new Dictionary<UInt64, String>();
+      m_storedAliasesMap = new Dictionary<UInt64, List<String>>();
       m_storedNameMap = new Dictionary<String, UInt64>();
       m_typeLoaderMap = new Dictionary<Int32, DomTypeLoaders.IDomTypeLoader>();
 

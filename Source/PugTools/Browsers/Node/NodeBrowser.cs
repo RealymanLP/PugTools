@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -26,6 +26,8 @@ namespace PugTools {
     private readonly String _previousAssetsLocation;
     private readonly Boolean _previousAssetsUsePts;
     private readonly Boolean _compareNodes;
+    private readonly Dictionary<UInt64, String> _worldAreaMapNames = new Dictionary<UInt64, String>();
+    private readonly Dictionary<UInt64, String> _worldAreaInternalNames = new Dictionary<UInt64, String>();
     private Boolean _buildCsv;
     private Boolean _closing;
     private Boolean _collapsed;
@@ -161,12 +163,10 @@ namespace PugTools {
       DisposeNodePreview();
       DisposeNodeMapPageUi();
 
-      if (_nodeFilterTree != null) {
-        try { _nodeFilterTree.Dispose(); } catch { }
-        _nodeFilterTree = null;
-      }
-
-      // Designer-owned TreeViews/Grid are disposed once by Form.Dispose(); avoid a second deep subtree walk here.
+      // The large navigation trees were detached and had their native handles released in
+      // FormClosing. Do not Dispose() them here: WinForms would synchronously walk the entire
+      // managed TreeNode graph again. The detached controls can be reclaimed by GC later.
+      _nodeFilterTree = null;
       treeViewFast1 = null;
       treeViewGrid1 = null;
       dataGridView1 = null;
@@ -191,11 +191,45 @@ namespace PugTools {
       _fieldDiffForm = null;
     }
     private void NodeBrowserFormClosing(Object sender, FormClosingEventArgs e) {
+      // A fully populated Node Browser can own a very large managed TreeNode graph. Letting
+      // WinForms synchronously dispose that graph on the UI thread can freeze the main window
+      // and make the entire machine lag. For a normal user close, hide/reuse the browser instead.
+      // BrowserNavigation already finds hidden instances. Real application shutdown is still
+      // allowed to dispose the form through the normal path.
+      if (e.CloseReason == CloseReason.UserClosing || e.CloseReason == CloseReason.None) {
+        e.Cancel = true;
+        Hide();
+        return;
+      }
+
       _closing = true;
       try { _nodeTreeFilterCancellation?.Cancel(); } catch { }
       try { _nodeTreeFilterTimer?.Stop(); } catch { }
+      try { if (backgroundWorker1.IsBusy) backgroundWorker1.CancelAsync(); } catch { }
+      try { if (backgroundWorker2.IsBusy) backgroundWorker2.CancelAsync(); } catch { }
+      try { if (backgroundWorker3.IsBusy) backgroundWorker3.CancelAsync(); } catch { }
       try { _nodePreviewRenderer?.StopRender(); } catch { }
+      DetachNodeTreesForClose();
     }
+    private void DetachNodeTreesForClose() {
+      TreeViewFast.Controls.TreeViewFast fullTree = treeViewFast1;
+      TreeViewFast.Controls.TreeViewFast filterTree = _nodeFilterTree;
+
+      treeViewFast1 = null;
+      _nodeFilterTree = null;
+
+      DetachAndReleaseTree(fullTree);
+      DetachAndReleaseTree(filterTree);
+    }
+
+    private static void DetachAndReleaseTree(TreeViewFast.Controls.TreeViewFast tree) {
+      if (tree == null) return;
+      try {
+        if (tree.Parent != null) tree.Parent.Controls.Remove(tree);
+      } catch { }
+      try { tree.ReleaseNativeHandleForDeferredCleanup(); } catch { }
+    }
+
     private void NodeBrowserFormResize(Object sender, EventArgs e) {
       Int32 tabHeight = _nodePageTabs?.Height ?? 0;
       var treeSize =
@@ -214,6 +248,7 @@ namespace PugTools {
       _currentAssets = AssetHandler.Instance.GetCurrentAssets(_assetsLocation, _assetsUsePts);
       LocalizationResolver.Apply(_currentAssets, Config.Language);
       _currentDom = DomHandler.Instance.GetCurrentDOM(_currentAssets);
+      BuildWorldAreaDisplayIndex();
 
       if (_compareNodes) {
         _previousAssets =
@@ -242,6 +277,8 @@ namespace PugTools {
       };
 
       _currentDom.NodeLookup.TryGetValue(typeof(GomObject), out _nodeDict);
+      // The world-area index needs the actual NodeLookup as an additional fallback for newly installed areas.
+      BuildWorldAreaDisplayIndex();
       if (_compareNodes && _previousDom != null)
         _previousDom.NodeLookup.TryGetValue(typeof(GomObject), out _previousNodeDict);
 
@@ -343,7 +380,137 @@ namespace PugTools {
         }
       }
     }
-    private static readonly Dictionary<UInt64, String> WorldAreaInternalNames = BuildWorldAreaInternalNames();
+    private static readonly Dictionary<UInt64, String> WorldAreaCatalogInternalNames = BuildWorldAreaInternalNames();
+    private static readonly Dictionary<UInt64, String> WorldAreaCatalogDisplayNames = BuildWorldAreaDisplayNames();
+
+    private void BuildWorldAreaDisplayIndex() {
+      _worldAreaMapNames.Clear();
+      _worldAreaInternalNames.Clear();
+
+      // WorldAreaNames.xml is the same runtime source used by Asset Browser. Load it directly
+      // into the instance dictionaries before optional GOM/area.dat discovery so the Node Browser
+      // cannot lose the names merely because a catalog or mapareasdata entry is absent.
+      try {
+        foreach (KeyValuePair<UInt64, WorldAreaOverride> pair in WorldAreaNameOverrides.LoadEntries()) {
+          if (pair.Value == null) continue;
+          if (!String.IsNullOrWhiteSpace(pair.Value.Name)) _worldAreaMapNames[pair.Key] = pair.Value.Name.Trim();
+          if (!String.IsNullOrWhiteSpace(pair.Value.InternalName)) _worldAreaInternalNames[pair.Key] = pair.Value.InternalName.Trim();
+        }
+      } catch { }
+
+      try {
+        foreach (KeyValuePair<UInt64, String> pair in WorldAreaCatalogInternalNames)
+          _worldAreaInternalNames[pair.Key] = pair.Value;
+      } catch { }
+
+      try {
+        foreach (KeyValuePair<UInt64, WorldAreaOverride> pair in WorldAreaNameOverrides.LoadEntries()) {
+          if (pair.Value == null) continue;
+          if (!String.IsNullOrWhiteSpace(pair.Value.InternalName)) _worldAreaInternalNames[pair.Key] = pair.Value.InternalName.Trim();
+          if (!String.IsNullOrWhiteSpace(pair.Value.Name)) _worldAreaMapNames[pair.Key] = pair.Value.Name.Trim();
+        }
+      } catch { }
+
+      // mapareasdata is the authoritative in-client world-name table when available. It also covers
+      // newly added world IDs that have not reached the bundled Jedipedia catalog yet.
+      try {
+        GomObject mapAreasNode = _currentDom?.GetObject("mapareasdata");
+        List<Object> rows = mapAreasNode?.Data?.ValueOrDefault<List<Object>>("utlDatatableRows", null);
+        StringTable strTable = _currentDom?.StringTable?.Find("str.sys.worldmap");
+        if (rows != null) {
+          foreach (Object rawRow in rows) {
+            List<Object> row = WorldAreaListEntries(rawRow);
+            if (row.Count == 0 && rawRow is List<Object> directRow) row = directRow;
+            if (row.Count < 1) continue;
+            UInt64 areaId = WorldAreaUInt64(row[0]);
+            if (areaId == 0) continue;
+            if (row.Count > 1) {
+              Int64 nameId = WorldAreaInt64(row[1]);
+              if (nameId != 0) {
+                try {
+                  String localized = strTable?.GetText(nameId, String.Empty);
+                  if (!String.IsNullOrWhiteSpace(localized)) _worldAreaMapNames[areaId] = localized.Trim();
+                  else {
+                    String english = strTable?.GetText(nameId, String.Empty, "enMale");
+                    if (!String.IsNullOrWhiteSpace(english)) _worldAreaMapNames[areaId] = english.Trim();
+                  }
+                } catch { }
+              }
+            }
+          }
+        }
+      } catch { }
+
+      // area.dat contains the authored internal area name. This is an important fallback for new areas
+      // that exist in the installed client before either mapareasdata or Jedipedia knows about them.
+      try {
+        if (_currentAssets != null) {
+          foreach (String nodeId in _nodeDict?.Keys ?? Enumerable.Empty<String>()) {
+            if (!TryGetWorldAreaId(nodeId, out UInt64 areaId)) continue;
+            if (_worldAreaInternalNames.ContainsKey(areaId)) continue;
+            File areaFile = _currentAssets.FindFile("/resources/world/areas/" + areaId + "/area.dat");
+            if (areaFile == null) areaFile = _currentAssets.FindFile("/resources/world/livecontent/systemgenerated/" + areaId + "/area.dat");
+            String internalName = WorldBrowser.ReadAreaInternalName(areaFile);
+            if (!String.IsNullOrWhiteSpace(internalName)) _worldAreaInternalNames[areaId] = internalName.Trim();
+          }
+        }
+      } catch { }
+    }
+
+    private static Boolean TryGetWorldAreaId(String id, out UInt64 areaId) {
+      areaId = 0;
+      if (String.IsNullOrWhiteSpace(id) || !id.StartsWith("world.areas.", StringComparison.OrdinalIgnoreCase)) return false;
+      String[] parts = id.Split('.');
+      return parts.Length == 3 && UInt64.TryParse(parts[2], out areaId);
+    }
+
+    private static List<Object> WorldAreaListEntries(Object value) {
+      var result = new List<Object>();
+      if (value == null || value is String) return result;
+      if (value is GomObjectData gom) {
+        var entries = new List<(Int32 Order, Object Value)>();
+        Int32 fallback = 0;
+        foreach (KeyValuePair<String, Object> entry in gom.Dictionary) {
+          if (String.Equals(entry.Key, "_count", StringComparison.OrdinalIgnoreCase)) continue;
+          Int32 order = Int32.TryParse(entry.Key, out Int32 parsed) ? parsed : Int32.MaxValue - 100000 + fallback++;
+          entries.Add((order, entry.Value));
+        }
+        result.AddRange(entries.OrderBy(x => x.Order).Select(x => x.Value));
+        return result;
+      }
+      if (value is IDictionary dictionary) {
+        var entries = new List<(Int32 Order, Object Value)>();
+        Int32 fallback = 0;
+        foreach (DictionaryEntry entry in dictionary) {
+          String key = entry.Key?.ToString();
+          if (String.Equals(key, "_count", StringComparison.OrdinalIgnoreCase)) continue;
+          Int32 order = Int32.TryParse(key, out Int32 parsed) ? parsed : Int32.MaxValue - 100000 + fallback++;
+          entries.Add((order, entry.Value));
+        }
+        result.AddRange(entries.OrderBy(x => x.Order).Select(x => x.Value));
+        return result;
+      }
+      if (value is IEnumerable enumerable) {
+        foreach (Object entry in enumerable) result.Add(entry);
+      }
+      return result;
+    }
+
+    private static UInt64 WorldAreaUInt64(Object value) {
+      try {
+        if (value is UInt64 u) return u;
+        if (value is Int64 i) return unchecked((UInt64)i);
+        return Convert.ToUInt64(value, System.Globalization.CultureInfo.InvariantCulture);
+      } catch { return 0; }
+    }
+
+    private static Int64 WorldAreaInt64(Object value) {
+      try {
+        if (value is Int64 i) return i;
+        if (value is UInt64 u) return unchecked((Int64)u);
+        return Convert.ToInt64(value, System.Globalization.CultureInfo.InvariantCulture);
+      } catch { return 0; }
+    }
 
     private static Dictionary<UInt64, String> BuildWorldAreaInternalNames() {
       var result = new Dictionary<UInt64, String>();
@@ -358,13 +525,53 @@ namespace PugTools {
       return result;
     }
 
-    private static String GetWorldAreaNodeDisplayName(String id, String fallback) {
+    private static Dictionary<UInt64, String> BuildWorldAreaDisplayNames() {
+      var result = new Dictionary<UInt64, String>();
+      try {
+        foreach (WorldAreaCatalogEntry entry in WorldAreaCatalog.Entries) {
+          if (entry == null) continue;
+          if (!String.IsNullOrWhiteSpace(entry.Comment)) result[entry.Id] = entry.Comment.Trim();
+          else if (!String.IsNullOrWhiteSpace(entry.InternalName)) result[entry.Id] = entry.InternalName.Trim();
+        }
+        foreach (KeyValuePair<UInt64, WorldAreaOverride> pair in WorldAreaNameOverrides.LoadEntries()) {
+          if (pair.Value != null && !String.IsNullOrWhiteSpace(pair.Value.Name)) result[pair.Key] = pair.Value.Name.Trim();
+        }
+      } catch { }
+      return result;
+    }
+
+    private static Boolean TryGetWorldAreaCatalogInfo(String id, out WorldAreaCatalogEntry entry) {
+      entry = null;
+      if (String.IsNullOrWhiteSpace(id) || !id.StartsWith("world.areas.", StringComparison.OrdinalIgnoreCase)) return false;
+      String[] parts = id.Split('.');
+      if (parts.Length != 3 || !UInt64.TryParse(parts[2], out UInt64 areaId)) return false;
+      entry = WorldAreaCatalog.Entries.FirstOrDefault(x => x != null && x.Id == areaId);
+      if (entry != null) return true;
+      try {
+        if (WorldAreaNameOverrides.LoadEntries().TryGetValue(areaId, out WorldAreaOverride overrideEntry) && overrideEntry != null) {
+          entry = new WorldAreaCatalogEntry(areaId, WorldAreaNameOverrides.UnassignedCategory, String.Empty,
+            overrideEntry.InternalName, overrideEntry.Name, 99, 99, 0);
+          return true;
+        }
+      } catch { }
+      return false;
+    }
+
+    private String GetWorldAreaNodeDisplayName(String id, String fallback) {
       if (String.IsNullOrWhiteSpace(id) || !id.StartsWith("world.areas.", StringComparison.OrdinalIgnoreCase)) return fallback;
       String[] parts = id.Split('.');
       if (parts.Length != 3 || !UInt64.TryParse(parts[2], out UInt64 areaId)) return fallback;
-      return WorldAreaInternalNames.TryGetValue(areaId, out String internalName) && !String.IsNullOrWhiteSpace(internalName)
-        ? fallback + "  " + internalName.Trim()
-        : fallback;
+
+      // Use the same source order as Asset Browser: user/runtime XML first, then the bundled
+      // catalog, then the installed area's authored internal name. The XML normally contains
+      // internalName rather than a translated name, so an empty 'name' must not hide it.
+      if (_worldAreaMapNames.TryGetValue(areaId, out String mapName) && !String.IsNullOrWhiteSpace(mapName))
+        return fallback + "  " + mapName.Trim();
+      if (_worldAreaInternalNames.TryGetValue(areaId, out String internalName) && !String.IsNullOrWhiteSpace(internalName))
+        return fallback + "  " + internalName.Trim();
+      if (WorldAreaCatalogDisplayNames.TryGetValue(areaId, out String catalogName) && !String.IsNullOrWhiteSpace(catalogName))
+        return fallback + "  " + catalogName.Trim();
+      return fallback;
     }
 
     private void BuildCompareNodeTree() {
@@ -557,16 +764,24 @@ namespace PugTools {
       // Only the final attachment to WinForms happens in BackgroundWorker3Completed.
       var searchEntries = new List<NodeSearchEntry>(_assetDict.Count);
       foreach (NodeAsset item in _assetDict.Values) {
-        GomObject obj = item?.Obj;
-        if (obj == null) continue;
+        if (item == null) continue;
+        GomObject obj = item.Obj;
 
+        String worldName = String.Empty;
+        String worldComment = String.Empty;
+        if (TryGetWorldAreaCatalogInfo(item.id, out WorldAreaCatalogEntry worldEntry)) {
+          worldName = worldEntry.InternalName;
+          worldComment = worldEntry.Comment;
+        }
         searchEntries.Add(new NodeSearchEntry(
           item.id,
           item.displayName,
-          obj.Name,
-          obj.Id.ToString(),
-          obj.DomClass?.Id.ToString(),
-          obj.NumGlommed
+          obj?.Name,
+          obj?.Id.ToString(),
+          obj?.DomClass?.Id.ToString(),
+          obj?.NumGlommed ?? 0,
+          worldName,
+          worldComment
         ));
       }
       _nodeSearchIndex = searchEntries.ToArray();
@@ -1152,6 +1367,8 @@ namespace PugTools {
       internal String ObjectId { get; }
       internal String BaseClassId { get; }
       internal Int32 NumGlommed { get; }
+      internal String WorldName { get; }
+      internal String WorldComment { get; }
 
       internal NodeSearchEntry(
         String id,
@@ -1159,7 +1376,9 @@ namespace PugTools {
         String nodeName,
         String objectId,
         String baseClassId,
-        Int32 numGlommed
+        Int32 numGlommed,
+        String worldName = null,
+        String worldComment = null
       ) {
         Id = id ?? String.Empty;
         DisplayName = displayName ?? String.Empty;
@@ -1167,6 +1386,8 @@ namespace PugTools {
         ObjectId = objectId ?? String.Empty;
         BaseClassId = baseClassId ?? String.Empty;
         NumGlommed = numGlommed;
+        WorldName = worldName ?? String.Empty;
+        WorldComment = worldComment ?? String.Empty;
       }
     }
 
@@ -1227,7 +1448,7 @@ namespace PugTools {
         Boolean match = minGlommed.HasValue
           ? entry.NumGlommed >= minGlommed.Value
           : filter.Matches(
-              entry.Id, entry.DisplayName, entry.NodeName, entry.ObjectId, entry.BaseClassId
+              entry.Id, entry.DisplayName, entry.NodeName, entry.ObjectId, entry.BaseClassId, entry.WorldName, entry.WorldComment
             );
         if (!match) continue;
 
