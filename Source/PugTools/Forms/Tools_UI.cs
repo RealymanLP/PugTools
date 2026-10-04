@@ -19,6 +19,7 @@ namespace PugTools {
       return Application.OpenForms.Cast<Form>().Any(form =>
         form != null
         && !form.IsDisposed
+        && form.Visible
         && (form is global::PugTools.AssetBrowser
             || form is global::PugTools.AssetBrowserFileTable
             || form is global::PugTools.ModelBrowser

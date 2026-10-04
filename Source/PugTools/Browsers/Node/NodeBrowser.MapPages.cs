@@ -56,59 +56,75 @@ namespace PugTools {
     private void InitializeNodeMapPageUi() {
       if (_nodeMapPagePanel != null || splitContainer3?.Panel1 == null) return;
 
+      // Use explicit bounds for the two rows. WinForms docking order can otherwise
+      // make a Fill control extend over the information row on some DPI/font sizes.
       _nodeMapPagePanel = new Panel {
         Dock = DockStyle.Top,
-        Height = 62,
+        Height = 74,
         Padding = new Padding(8, 4, 8, 4),
         Visible = false,
         BackColor = SystemColors.Control
       };
 
-      // Keep the map selector controls in their own top row. Docking the Tiles checkbox
-      // directly into the 62px parent made it consume the full height and overlap the
-      // ComboBox/"Map page:" row on some DPI/font combinations.
-      Panel selectorRow = new Panel { Dock = DockStyle.Top, Height = 28 };
+      TableLayoutPanel selectorRow = new TableLayoutPanel {
+        Location = new Point(8, 4),
+        Size = new Size(1, 28),
+        Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
+        ColumnCount = 3,
+        RowCount = 1,
+        Margin = new Padding(0),
+        Padding = new Padding(0)
+      };
+      selectorRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 82f));
+      selectorRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+      selectorRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 64f));
+      selectorRow.RowStyles.Add(new RowStyle(SizeType.Absolute, 28f));
       _nodeMapPagePanel.Controls.Add(selectorRow);
 
       _nodeMapPageLabel = new Label {
+        Dock = DockStyle.Fill,
         AutoSize = false,
-        Width = 82,
-        Dock = DockStyle.Left,
         Text = "Map page:",
-        TextAlign = ContentAlignment.MiddleLeft
+        TextAlign = ContentAlignment.MiddleLeft,
+        Margin = new Padding(0)
       };
-      selectorRow.Controls.Add(_nodeMapPageLabel);
-
-      _nodeMapPageMiniMapCheck = new CheckBox {
-        AutoSize = false,
-        Width = 64,
-        Dock = DockStyle.Right,
-        Text = "Tiles",
-        TextAlign = ContentAlignment.MiddleCenter,
-        Checked = false
-      };
-      _nodeMapPageMiniMapCheck.CheckedChanged += NodeMapPageMiniMapCheckChanged;
-      selectorRow.Controls.Add(_nodeMapPageMiniMapCheck);
+      selectorRow.Controls.Add(_nodeMapPageLabel, 0, 0);
 
       _nodeMapPageCombo = new ComboBox {
         Dock = DockStyle.Fill,
         DropDownStyle = ComboBoxStyle.DropDownList,
         IntegralHeight = false,
         DropDownHeight = 420,
-        FormattingEnabled = true
+        FormattingEnabled = true,
+        Margin = new Padding(0, 2, 4, 2)
       };
       _nodeMapPageCombo.SelectedIndexChanged += NodeMapPageComboSelectedIndexChanged;
-      selectorRow.Controls.Add(_nodeMapPageCombo);
+      selectorRow.Controls.Add(_nodeMapPageCombo, 1, 0);
 
+      _nodeMapPageMiniMapCheck = new CheckBox {
+        Dock = DockStyle.Fill,
+        AutoSize = false,
+        Text = "Tiles",
+        TextAlign = ContentAlignment.MiddleCenter,
+        Checked = false,
+        Margin = new Padding(0)
+      };
+      _nodeMapPageMiniMapCheck.CheckedChanged += NodeMapPageMiniMapCheckChanged;
+      selectorRow.Controls.Add(_nodeMapPageMiniMapCheck, 2, 0);
+
+      // Keep this row physically below the selector. Do not dock it into the
+      // remaining space, because the ComboBox can otherwise cover it.
       _nodeMapPageInfoLabel = new Label {
-        Dock = DockStyle.Bottom,
-        Height = 22,
+        Location = new Point(8, 36),
+        Size = new Size(1, 30),
+        Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
         AutoEllipsis = true,
         TextAlign = ContentAlignment.MiddleLeft,
         ForeColor = SystemColors.GrayText,
         Text = String.Empty
       };
       _nodeMapPagePanel.Controls.Add(_nodeMapPageInfoLabel);
+      _nodeMapPageInfoLabel.BringToFront();
 
       splitContainer3.Panel1.Controls.Add(_nodeMapPagePanel);
       _nodeMapPagePanel.BringToFront();

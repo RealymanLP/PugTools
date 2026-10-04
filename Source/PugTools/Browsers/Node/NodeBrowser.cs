@@ -248,7 +248,6 @@ namespace PugTools {
       _currentAssets = AssetHandler.Instance.GetCurrentAssets(_assetsLocation, _assetsUsePts);
       LocalizationResolver.Apply(_currentAssets, Config.Language);
       _currentDom = DomHandler.Instance.GetCurrentDOM(_currentAssets);
-      BuildWorldAreaDisplayIndex();
 
       if (_compareNodes) {
         _previousAssets =
@@ -276,8 +275,24 @@ namespace PugTools {
         { "/", new NodeAsset("/", "", "Root", null) }
       };
 
-      _currentDom.NodeLookup.TryGetValue(typeof(GomObject), out _nodeDict);
-      // The world-area index needs the actual NodeLookup as an additional fallback for newly installed areas.
+      if (_currentDom == null) {
+        ProgressBarHide();
+        LoadingSwirlHide();
+        MessageBox.Show(
+          "The SWTOR DOM could not be loaded for this asset set.",
+          "Node Browser",
+          MessageBoxButtons.OK,
+          MessageBoxIcon.Error
+        );
+        return;
+      }
+
+      if (_currentDom.NodeLookup == null || !_currentDom.NodeLookup.TryGetValue(typeof(GomObject), out _nodeDict)) {
+        _nodeDict = new Dictionary<String, DomType>();
+      }
+
+      // Build the world-area index only after NodeLookup is available. The earlier call from
+      // BackgroundWorker1Run was redundant and could run while the browser was still initializing.
       BuildWorldAreaDisplayIndex();
       if (_compareNodes && _previousDom != null)
         _previousDom.NodeLookup.TryGetValue(typeof(GomObject), out _previousNodeDict);
