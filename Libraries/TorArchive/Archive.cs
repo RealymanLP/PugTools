@@ -3,6 +3,7 @@ using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 
 namespace TorArchive {
   /// <summary>
@@ -147,9 +148,9 @@ namespace TorArchive {
               HeaderSize = metadataLength,
               CompressedSize = compressedSize,
               UncompressedSize = uncompressedSize,
-              Checksum = checksum,
-              CompressionMethod = compressionMethod,
-              CRC = unchecked((Int32)checksum)
+              StoredChecksum = checksum,
+              OwnerArchive = this,
+              CompressionMethod = compressionMethod
             };
 
             // PugTools' historic hash API names are opposite to the on-disk TOR spec:
@@ -168,6 +169,78 @@ namespace TorArchive {
       }
 
       Initialized = true;
+    }
+
+    private readonly object _checksumLock = new object();
+
+    /// <summary>
+    /// Resolves the 0xDEADBEEF checksum placeholder used by beta v5 archives.
+    /// Jedipedia's format reader reconstructs the standard 36-byte metadata block
+    /// (version 2, SHA-256 length 32, SHA-256 of the uncompressed payload) and uses
+    /// lookup3/hashlittle2's c result as the checksum. This is done only when the
+    /// checksum is first requested, never while loading the archive's file table.
+    /// </summary>
+    internal UInt32 ResolveChecksum(FileInfo info) {
+      UInt32 stored = info.StoredChecksum;
+      if (stored != 0xDEADBEEF || info.HeaderSize != 0 || Version != 5) return stored;
+
+      lock (_checksumLock) {
+        stored = info.StoredChecksum;
+        if (stored != 0xDEADBEEF || info.HeaderSize != 0 || Version != 5) return stored;
+
+        if (info.UncompressedSize > Int32.MaxValue)
+          throw new InvalidDataException($"Beta TOR entry {info.FileId:X16} is too large to reconstruct its metadata checksum.");
+
+        using var entry = new File(this, info);
+        using Stream payload = entry.Open();
+        using var sha = SHA256.Create();
+        byte[] digest = sha.ComputeHash(payload);
+        if (digest.Length != 32)
+          throw new InvalidDataException($"Could not compute SHA-256 for beta TOR entry {info.FileId:X16}.");
+
+        byte[] metadata = new byte[36];
+        metadata[0] = 2; metadata[1] = 0;
+        metadata[2] = 32; metadata[3] = 0;
+        Buffer.BlockCopy(digest, 0, metadata, 4, digest.Length);
+        UInt32 resolved = HashLittle2C(metadata);
+        info.StoredChecksum = resolved;
+        return resolved;
+      }
+    }
+
+    private static UInt32 RotateLeft(UInt32 x, Int32 k) => (x << k) | (x >> (32 - k));
+
+    // Bob Jenkins' lookup3 hashlittle2, returning the first (c) result used by Jedipedia.
+    private static UInt32 HashLittle2C(byte[] data) {
+      UInt32 a = unchecked(0xDEADBEEF + (UInt32)data.Length), b = a, c = a;
+      Int32 offset = 0, remaining = data.Length;
+      while (remaining > 12) {
+        a = unchecked(a + BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(offset, 4)));
+        b = unchecked(b + BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(offset + 4, 4)));
+        c = unchecked(c + BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(offset + 8, 4)));
+        a = unchecked(a - c); a ^= RotateLeft(c, 4); c = unchecked(c + b);
+        b = unchecked(b - a); b ^= RotateLeft(a, 6); a = unchecked(a + c);
+        c = unchecked(c - b); c ^= RotateLeft(b, 8); b = unchecked(b + a);
+        a = unchecked(a - c); a ^= RotateLeft(c, 16); c = unchecked(c + b);
+        b = unchecked(b - a); b ^= RotateLeft(a, 19); a = unchecked(a + c);
+        c = unchecked(c - b); c ^= RotateLeft(b, 4); b = unchecked(b + a);
+        offset += 12; remaining -= 12;
+      }
+      if (remaining == 0) return c;
+      for (Int32 i = 0; i < remaining; i++) {
+        UInt32 value = (UInt32)data[offset + i];
+        if (i < 4) a = unchecked(a + (value << (i * 8)));
+        else if (i < 8) b = unchecked(b + (value << ((i - 4) * 8)));
+        else c = unchecked(c + (value << ((i - 8) * 8)));
+      }
+      c ^= b; c = unchecked(c - RotateLeft(b, 14));
+      a ^= c; a = unchecked(a - RotateLeft(c, 11));
+      b ^= a; b = unchecked(b - RotateLeft(a, 25));
+      c ^= b; c = unchecked(c - RotateLeft(b, 16));
+      a ^= c; a = unchecked(a - RotateLeft(c, 4));
+      b ^= a; b = unchecked(b - RotateLeft(a, 14));
+      c ^= b; c = unchecked(c - RotateLeft(b, 24));
+      return c;
     }
 
     private static UInt16 ReadUInt16(BinaryReader reader, Boolean littleEndian) {

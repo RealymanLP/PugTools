@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using GomLib.Models;
@@ -223,22 +223,31 @@ namespace GomLib.ModelLoader {
               prefix = titleTextLookup.ValueOrDefault<bool>("titleDetailLegacyPrefix", false);
           }*/
 
-          // TODO: This is not working, no items are being read.
-          List<Object> itemRew = rawRewards.ValueOrDefault<List<Object>>("achRewardItems", null);
+          // The reward collection can be represented as a list or as an indexed GOM map
+          // depending on the client data build. Reading only List<Object> silently discarded
+          // the map-shaped form, which is why achievement item rewards were often empty.
+          Object rawItemRewards = rawRewards.ValueOrDefault<Object>("achRewardItems", null);
+          IEnumerable<Object> itemRewards = rawItemRewards switch {
+            List<Object> list => list,
+            Dictionary<Object, Object> map => map.Values,
+            _ => Enumerable.Empty<Object>()
+          };
+
           ach.Rewards.ItemRewardList = new Dictionary<UInt64, Int64>();
+          foreach (Object rewardEntry in itemRewards) {
+            if (!(rewardEntry is GomObjectData itemData)) continue;
 
-          foreach (var gomDat in itemRew ?? new List<Object>()) {
-            if (!(gomDat is GomObjectData itemData)) continue;
-            Int64 quant = itemData.ValueOrDefault<Int64>("achRewardItemQty", 0);
             UInt64 itemId = itemData.ValueOrDefault<UInt64>("achRewardItemId", 0);
-            GomObject rew = _dom.GetObject(itemId);
+            Int64 quantity = itemData.ValueOrDefault<Int64>("achRewardItemQty", 0);
+            if (itemId == 0 || quantity <= 0) continue;
 
-            /*if (rew.Name.Contains("itm.stronghold.") && !rew.Name.Contains(".trophy.") && !rew.Name.Contains("datacron_master_display")) //obsolete debugging code
-            {
-                String paushere = "";
-            }*/
-
-            ach.Rewards.ItemRewardList.Add(itemId, quant);
+            // Some data revisions can repeat an item in multiple reward slots. Preserve
+            // the total rather than throwing from Dictionary.Add and aborting the load.
+            if (ach.Rewards.ItemRewardList.TryGetValue(itemId, out Int64 existingQuantity)) {
+              ach.Rewards.ItemRewardList[itemId] = existingQuantity + quantity;
+            } else {
+              ach.Rewards.ItemRewardList.Add(itemId, quantity);
+            }
           }
           }
         }

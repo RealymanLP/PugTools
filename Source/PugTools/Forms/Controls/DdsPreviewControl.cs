@@ -44,6 +44,9 @@ namespace PugTools {
     private Int64 m_lastInteractiveCubeRenderTick;
     private CancellationTokenSource m_cubeRenderCancellation;
     private Int32 m_cubeRenderGeneration;
+    private readonly FlowLayoutPanel m_cubeToolbar;
+    private readonly CheckBox m_cubeInvertXButton;
+    private readonly CheckBox m_cubeInvertYButton;
 
     internal DdsPreviewControl() {
       SetStyle(
@@ -56,6 +59,34 @@ namespace PugTools {
       BackColor = DrawingColor.White;
       Cursor = Cursors.Default;
       TabStop = true;
+
+      m_cubeToolbar = new FlowLayoutPanel {
+        Dock = DockStyle.Top,
+        Height = 30,
+        Padding = new Padding(4, 2, 4, 2),
+        WrapContents = false,
+        BackColor = DrawingColor.FromArgb(245, 245, 245),
+        Visible = false
+      };
+      m_cubeInvertXButton = new CheckBox {
+        AutoSize = true,
+        Text = "X-Achse invertieren",
+        Checked = Config.DdsCubeInvertX,
+        Margin = new Padding(0, 3, 10, 0)
+      };
+      m_cubeInvertXButton.CheckedChanged += CubeInvertXButtonChanged;
+      m_cubeToolbar.Controls.Add(m_cubeInvertXButton);
+
+      m_cubeInvertYButton = new CheckBox {
+        AutoSize = true,
+        Text = "Y-Achse invertieren",
+        Checked = Config.DdsCubeInvertY,
+        FlatStyle = FlatStyle.System,
+        Margin = new Padding(2, 2, 8, 0)
+      };
+      m_cubeInvertYButton.CheckedChanged += CubeInvertYButtonChanged;
+      m_cubeToolbar.Controls.Add(m_cubeInvertYButton);
+      Controls.Add(m_cubeToolbar);
     }
 
     internal Boolean IsCubeMap => m_cubeMap != null;
@@ -82,6 +113,7 @@ namespace PugTools {
     internal void SetBitmap(Bitmap bitmap) {
       CancelCubeRender();
       m_cubeMap = null;
+      m_cubeToolbar.Visible = false;
       DisposeBitmap(ref m_cubeFrame);
       DisposeBitmap(ref m_image);
       m_image = bitmap;
@@ -100,6 +132,9 @@ namespace PugTools {
       DisposeBitmap(ref m_image);
       DisposeBitmap(ref m_cubeFrame);
       m_cubeMap = cube;
+      m_cubeToolbar.Visible = true;
+      m_cubeInvertXButton.Checked = Config.DdsCubeInvertX;
+      m_cubeInvertYButton.Checked = Config.DdsCubeInvertY;
       m_cubeYaw = 0.0;
       m_cubePitch = 0.0;
       m_cubeFov = 70.0;
@@ -111,6 +146,7 @@ namespace PugTools {
     internal void ClearPreview() {
       CancelCubeRender();
       m_cubeMap = null;
+      m_cubeToolbar.Visible = false;
       DisposeBitmap(ref m_image);
       DisposeBitmap(ref m_cubeFrame);
       m_zoom = 1.0;
@@ -153,6 +189,22 @@ namespace PugTools {
         DisposeBitmap(ref m_cubeFrame);
       }
       base.Dispose(disposing);
+    }
+
+    private void CubeInvertXButtonChanged(Object sender, EventArgs e) {
+      Boolean value = m_cubeInvertXButton.Checked;
+      if (Config.DdsCubeInvertX == value) return;
+      Config.DdsCubeInvertX = value;
+      try { Config.Save(); } catch (Exception ex) { System.Diagnostics.Debug.WriteLine("Could not save DDS cubemap X setting: " + ex); }
+      if (m_cubeMap != null) RequestCubeRender(false);
+    }
+
+    private void CubeInvertYButtonChanged(Object sender, EventArgs e) {
+      Boolean value = m_cubeInvertYButton.Checked;
+      if (Config.DdsCubeInvertY == value) return;
+      Config.DdsCubeInvertY = value;
+      try { Config.Save(); } catch (Exception ex) { System.Diagnostics.Debug.WriteLine("Could not save DDS cubemap Y setting: " + ex); }
+      if (m_cubeMap != null) RequestCubeRender(false);
     }
 
     protected override void OnPaintBackground(PaintEventArgs pevent) {
@@ -259,8 +311,12 @@ namespace PugTools {
 
       if (m_cubeMap != null) {
         Double sensitivity = Math.Max(0.0014, m_cubeFov / 70.0 * 0.0045);
-        m_cubeYaw += dx * sensitivity;
-        m_cubePitch -= dy * sensitivity;
+        // The switches control the mouse-to-view direction, not the texture itself.
+        // Default: dragging left moves the view left, dragging up moves it up.
+        Double xDirection = Config.DdsCubeInvertX ? 1.0 : -1.0;
+        Double yDirection = Config.DdsCubeInvertY ? -1.0 : 1.0;
+        m_cubeYaw += dx * sensitivity * xDirection;
+        m_cubePitch -= dy * sensitivity * yDirection;
         m_cubePitch = Clamp(m_cubePitch, -Math.PI * 0.49, Math.PI * 0.49);
         RequestCubeRender(true);
       } else if (m_image != null) {
@@ -431,10 +487,11 @@ namespace PugTools {
               Double py = cosPitch * localY - sinPitch * localZ;
               Double pz = sinPitch * localY + cosPitch * localZ;
               Double wx = cosYaw * localX + sinYaw * pz;
-              Double wy = py;
               Double wz = -sinYaw * localX + cosYaw * pz;
 
-              row[x] = cube.Sample(wx, wy, wz);
+              // Axis inversion is deliberately handled in mouse control above.
+              // Do not mirror the cubemap texture itself.
+              row[x] = cube.Sample(wx, py, wz);
             }
           });
         }

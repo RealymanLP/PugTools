@@ -31,11 +31,23 @@ namespace TorArchive {
 
     #region Properties
 
-    /// <summary>CRC32 checksum</summary>
-    public UInt32 Checksum { get; set; }
+    private UInt32 _checksum;
+    private Archive _archive;
+
+    /// <summary>TOR metadata checksum. Beta placeholder values are reconstructed on first access.</summary>
+    public UInt32 Checksum {
+      get => _archive == null ? _checksum : _archive.ResolveChecksum(this);
+      set => _checksum = value;
+    }
+
+    internal UInt32 StoredChecksum { get => _checksum; set => _checksum = value; }
+    internal Archive OwnerArchive { get => _archive; set => _archive = value; }
     public UInt32 CompressedSize { get; set; }
     public UInt16 CompressionMethod { get; set; }
-    public Int32 CRC { get; set; }
+    public Int32 CRC {
+      get => unchecked((Int32)Checksum);
+      set => _checksum = unchecked((UInt32)value);
+    }
     public UInt64 FileId { get; set; }
     public UInt32 HeaderSize { get; set; }
     public Boolean IsCompressed => CompressionMethod != 0;

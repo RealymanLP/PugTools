@@ -273,8 +273,33 @@ namespace SlimDXNet {
       while (_running) {
         Timer.Tick();
         if (!AppPaused && _running) {
-          UpdateScene(Timer.DeltaTime);
-          DrawScene();
+          try {
+            UpdateScene(Timer.DeltaTime);
+            DrawScene();
+          }
+          catch (DXGIException ex) {
+            // A device removal/reset can be reported by Present() after the
+            // driver has already invalidated the device and its resources.
+            // Do not continue rendering with those resources or let the
+            // render thread terminate the whole application.
+            int resultCode = ex.HResult;
+            bool deviceLost =
+              resultCode == unchecked((int)0x887A0005) || // DXGI_ERROR_DEVICE_REMOVED
+              resultCode == unchecked((int)0x887A0006) || // DXGI_ERROR_DEVICE_HUNG
+              resultCode == unchecked((int)0x887A0007);   // DXGI_ERROR_DEVICE_RESET
+
+            if (!deviceLost)
+              throw;
+
+            _running = false;
+            Trace.TraceError(
+              "Direct3D rendering stopped because the graphics device was lost. " +
+              "HRESULT=0x{0:X8}; {1}",
+              resultCode,
+              ex
+            );
+            break;
+          }
         } else {
           Thread.Sleep(100);
         }

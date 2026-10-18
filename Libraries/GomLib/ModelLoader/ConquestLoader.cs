@@ -152,6 +152,11 @@ namespace GomLib.ModelLoader {
       var newActivePlanets = gom.ValueOrDefault("cnqConquestActivePlanets", new Dictionary<object, object>());
       foreach (var nap in newActivePlanets) {
         GomObjectData g = nap.Value as GomObjectData;
+        // Some data builds can contain an empty or unexpected nested planet entry.
+        // Skip it rather than aborting the entire conquest load.
+        if (g == null) {
+          continue;
+        }
         ulong cnqPlanetId = (ulong)nap.Key;
         string cnqPlanetDesignName = g.ValueOrDefault("cnqPlanetDesignName", "");
         //ulong cnqPlanetId = gom.ValueOrDefault<ulong>("cnqPlanetId", 0);
@@ -261,9 +266,9 @@ namespace GomLib.ModelLoader {
     }
 
     public Planet LoadPlanet(ulong id, GomObjectData gom, GomObjectData areaObject, StringTable areaTable) {
-      if (gom == null) { return new Planet(); }
-
+      // Preserve the planet ID and localized area name even when destination data is missing.
       var plt = LoadPlanet(id, areaObject, areaTable);
+      if (gom == null) { return plt; }
 
       var descTable = _dom.StringTable.Find("str.cdx");
 
@@ -306,6 +311,10 @@ namespace GomLib.ModelLoader {
           //Key is ulong, achievement node ID.
           //Value is dictionary, ulong planet id key, float key.
           List<object> objectiveDict = kvp.Value as List<object>;
+          if (objectiveDict == null) {
+            ObjectiveList.Add(package.Id, package);
+            continue;
+          }
           foreach (object objectiveKvp in objectiveDict) {
             ulong achID = (ulong)objectiveKvp;
             Achievement achObj = _dom.AchievementLoader.Load(achID);

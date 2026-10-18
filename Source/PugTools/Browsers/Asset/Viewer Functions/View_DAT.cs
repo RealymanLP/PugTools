@@ -859,7 +859,7 @@ namespace PugTools {
         // Jedipedia's default room view puts the resolved asset name front-and-centre
         // and hides the instance id by default. Mirror that emphasis in the two-column
         // Asset Browser tree while keeping both ids immediately available.
-        NodeListItem instance = Branch(assetName, instanceId.ToString(Invariant));
+        NodeListItem instance = Branch(assetName, assetName);
         instance.children.Add(Leaf("Instance ID", instanceId.ToString(Invariant)));
         instance.children.Add(Leaf("Asset ID", assetId.ToString(Invariant)));
 
@@ -931,7 +931,7 @@ namespace PugTools {
                   ? resolved
                   : "Asset " + assetIdText;
                 currentAssetName = assetName;
-                current = Branch(assetName, instanceId);
+                current = Branch(assetName, assetName);
                 current.children.Add(Leaf("Instance ID", instanceId));
                 current.children.Add(Leaf("Asset ID", assetIdText));
                 instances.children.Add(current);

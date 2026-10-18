@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Configuration;
 using System.IO;
@@ -15,6 +15,8 @@ namespace PugTools {
     private static String _prevAssetsPath = ".";
     private static Boolean _prevAssetsUsePTS;
     private static Int32 _nodePreviewTextHeight = 260;
+    private static Boolean _ddsCubeInvertX;
+    private static Boolean _ddsCubeInvertY;
 
     public static String AssetsPath {
       get => _assetsPath;
@@ -54,6 +56,14 @@ namespace PugTools {
     public static Boolean PrevAssetsUsePTS {
       get => _prevAssetsUsePTS;
       set => _prevAssetsUsePTS = value;
+    }
+    public static Boolean DdsCubeInvertX {
+      get => _ddsCubeInvertX;
+      set => _ddsCubeInvertX = value;
+    }
+    public static Boolean DdsCubeInvertY {
+      get => _ddsCubeInvertY;
+      set => _ddsCubeInvertY = value;
     }
     public static Int32 NodePreviewTextHeight {
       get => _nodePreviewTextHeight;
@@ -143,6 +153,13 @@ namespace PugTools {
       // not snap back to the default after every selection or application restart.
       str = ConfigFile.AppSettings.Settings["NodePreviewTextHeight"]?.Value;
       if (Int32.TryParse(str, out Int32 previewHeight)) NodePreviewTextHeight = previewHeight;
+
+      // Cubemap DDS preview: SWTOR environment maps use the inverted world-Y convention by default.
+      str = ConfigFile.AppSettings.Settings["DdsCubeInvertX"]?.Value;
+      if (Boolean.TryParse(str, out Boolean ddsCubeInvertX)) DdsCubeInvertX = ddsCubeInvertX;
+
+      str = ConfigFile.AppSettings.Settings["DdsCubeInvertY"]?.Value;
+      if (Boolean.TryParse(str, out Boolean ddsCubeInvertY)) DdsCubeInvertY = ddsCubeInvertY;
     }
     public static void Save() {
       // Path to the asset files
@@ -183,6 +200,18 @@ namespace PugTools {
         ConfigFile.AppSettings.Settings.Add("NodePreviewTextHeight", str);
       else
         ConfigFile.AppSettings.Settings["NodePreviewTextHeight"].Value = str;
+
+      str = DdsCubeInvertX.ToString();
+      if (ConfigFile.AppSettings.Settings["DdsCubeInvertX"] == null)
+        ConfigFile.AppSettings.Settings.Add("DdsCubeInvertX", str);
+      else
+        ConfigFile.AppSettings.Settings["DdsCubeInvertX"].Value = str;
+
+      str = DdsCubeInvertY.ToString();
+      if (ConfigFile.AppSettings.Settings["DdsCubeInvertY"] == null)
+        ConfigFile.AppSettings.Settings.Add("DdsCubeInvertY", str);
+      else
+        ConfigFile.AppSettings.Settings["DdsCubeInvertY"].Value = str;
 
       ConfigFile.Save(ConfigurationSaveMode.Modified);
       ConfigurationManager.RefreshSection("appSettings");

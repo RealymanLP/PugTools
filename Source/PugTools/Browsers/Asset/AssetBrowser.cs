@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -138,6 +138,7 @@ namespace PugTools {
       // File-reader style cross-links for all structured tree previews, not only the
       // dedicated MAT/FX controls. Double-clicking a resource path opens it in-place.
       treeViewGrid1.MouseDoubleClick += TreeViewGrid1MouseDoubleClickNavigateAsset;
+      treeViewGrid1.KeyDown += TreeViewGrid1KeyDownCopyValue;
       Config.Load();
 
       m_assetsLocation = assetLocation;
@@ -1748,6 +1749,37 @@ namespace PugTools {
               break;
             }
 
+            case "JSON": {
+              String jsonText = await Task.Run(ReadCurrentPreviewTextSmart);
+              try {
+                Newtonsoft.Json.Linq.JToken json = Newtonsoft.Json.Linq.JToken.Parse(jsonText);
+                Object jsonValue = JsonTokenToPreviewValue(json);
+                m_rootList.Clear();
+                m_rootList.Add(new NodeListItem("JSON", jsonValue));
+                FinishStructuredTreePreview();
+                treeViewGrid1.Visible = true;
+                treeViewGrid1.BringToFront();
+                txtRawView.Visible = false;
+                LoadingSwirl1Hide();
+                ProgressBar1Hide();
+                toolStripStatusLabel1.Text = "JSON structure inspector";
+                toolStripStatusLabel2.Text = "Expand objects and arrays to inspect keys and values; source asset remains unchanged.";
+              }
+              catch (Exception ex) {
+                System.Diagnostics.Debug.WriteLine("JSON preview parse failed: " + ex);
+                txtRawView.ReadOnly = false;
+                txtRawView.Text = jsonText;
+                txtRawView.ReadOnly = true;
+                txtRawView.Visible = true;
+                txtRawView.BringToFront();
+                LoadingSwirl1Hide();
+                ProgressBar1Hide();
+                toolStripStatusLabel1.Text = "JSON text preview";
+                toolStripStatusLabel2.Text = "JSON parsing failed; showing original text: " + ex.Message;
+              }
+              return;
+            }
+
             case "INI": {
               String iniText = await Task.Run(ReadCurrentPreviewTextSmart);
               m_structuredTextPreview.LoadIni(selectedAssetPath, iniText);
@@ -2209,7 +2241,17 @@ namespace PugTools {
 
             case "GFX":
             case "SWF":
-              await Task.Run(PreviewAssetGFX);
+              m_rootList.Clear();
+              try {
+                await Task.Run(() => PreviewAssetJedipediaFormat(previewExtension, asset.HashInfo.FileName));
+                FinishStructuredTreePreview();
+                toolStripStatusLabel1.Text = previewExtension + " / Scaleform movie inspector";
+                toolStripStatusLabel2.Text = "Header, compression, stage/frame metadata and tag payload offset; raw decompression remains available.";
+              }
+              catch (Exception ex) {
+                System.Diagnostics.Debug.WriteLine(previewExtension + " structured preview failed: " + ex);
+                await Task.Run(PreviewAssetGFX);
+              }
               break;
 
             default:
@@ -2336,99 +2378,9 @@ namespace PugTools {
       m_rootList = View_JedipediaFormats.Parse(m_inputStream, extension, fileName);
     }
 
-    private String ReadDdsHeaderInfo(Stream source) {
-      if (source == null || !source.CanRead || source.Length < 128) return "DDS header unavailable";
-      try {
-        source.Position = 0;
-        using BinaryReader br = new BinaryReader(source, Encoding.ASCII, true);
-        if (br.ReadUInt32() != 0x20534444u) return "Not a DDS file"; // "DDS "
-        UInt32 size = br.ReadUInt32();
-        UInt32 flags = br.ReadUInt32();
-        UInt32 height = br.ReadUInt32();
-        UInt32 width = br.ReadUInt32();
-        UInt32 pitchOrLinear = br.ReadUInt32();
-        UInt32 depth = br.ReadUInt32();
-        UInt32 mipCount = br.ReadUInt32();
-        for (Int32 i = 0; i < 11; i++) br.ReadUInt32();
-
-        UInt32 pfSize = br.ReadUInt32();
-        UInt32 pfFlags = br.ReadUInt32();
-        UInt32 pfFourCC = br.ReadUInt32();
-        UInt32 pfRgbBitCount = br.ReadUInt32();
-        UInt32 pfR = br.ReadUInt32();
-        UInt32 pfG = br.ReadUInt32();
-        UInt32 pfB = br.ReadUInt32();
-        UInt32 pfA = br.ReadUInt32();
-        UInt32 caps = br.ReadUInt32();
-        UInt32 caps2 = br.ReadUInt32();
-        br.ReadUInt32(); br.ReadUInt32(); br.ReadUInt32();
-
-        String format = DecodeDdsFormat(pfFlags, pfFourCC, pfRgbBitCount, pfR, pfG, pfB, pfA);
-        String dimension = width + " × " + height;
-        if ((caps2 & 0x00200000u) != 0) dimension += " × " + Math.Max(1u, depth) + " (volume)";
-        String kind = (caps2 & 0x0000FE00u) != 0 ? "Cubemap" : "2D texture";
-        if ((caps2 & 0x00200000u) != 0) kind = "Volume texture";
-        String mips = Math.Max(1u, mipCount).ToString(CultureInfo.InvariantCulture);
-        StringBuilder info = new StringBuilder();
-        info.Append(dimension).Append("  •  ").Append(format).Append("  •  ").Append(kind).Append("\n");
-        info.Append("Mipmaps: ").Append(mips);
-        if ((flags & 0x00000008u) != 0) info.Append("  •  pitch/linear: ").Append(pitchOrLinear.ToString("N0", CultureInfo.InvariantCulture));
-        if (pfFourCC != 0) info.Append("  •  FourCC: ").Append(FourCc(pfFourCC));
-        if (size != 124 || pfSize != 32) info.Append("  •  non-standard header size");
-        return info.ToString();
-      } catch (Exception ex) {
-        return "DDS header parse failed: " + ex.Message;
-      } finally {
-        try { source.Position = 0; } catch { }
-      }
-    }
-
-    private static String DecodeDdsFormat(UInt32 flags, UInt32 fourCC, UInt32 bits, UInt32 r, UInt32 g, UInt32 b, UInt32 a) {
-      if ((flags & 0x00000004u) != 0) {
-        String cc = FourCc(fourCC);
-        switch (cc) {
-          case "DXT1": return "BC1 / DXT1";
-          case "DXT2": return "BC2 / DXT2";
-          case "DXT3": return "BC2 / DXT3";
-          case "DXT4": return "BC3 / DXT4";
-          case "DXT5": return "BC3 / DXT5";
-          case "ATI1": return "BC4 / ATI1";
-          case "ATI2": return "BC5 / ATI2";
-          case "BC4U": return "BC4";
-          case "BC4S": return "BC4 signed";
-          case "BC5U": return "BC5";
-          case "BC5S": return "BC5 signed";
-          case "DX10": return "DX10 extended format";
-          default: return cc + " compressed";
-        }
-      }
-      if ((flags & 0x00000040u) != 0) {
-        if (bits == 32 && r == 0x00FF0000u && g == 0x0000FF00u && b == 0x000000FFu && a == 0xFF000000u) return "RGBA8 / BGRA byte order";
-        if (bits == 32 && r == 0x000000FFu && g == 0x0000FF00u && b == 0x00FF0000u && a == 0xFF000000u) return "RGBA8";
-        if (bits == 24 && r == 0x00FF0000u && g == 0x0000FF00u && b == 0x000000FFu) return "RGB8";
-        if (bits == 16 && r == 0xF800u && g == 0x07E0u && b == 0x001Fu) return "RGB565";
-        if (bits == 16 && r == 0x7C00u && g == 0x03E0u && b == 0x001Fu && a == 0x8000u) return "ARGB1555";
-        if (bits == 16 && r == 0x0F00u && g == 0x00F0u && b == 0x000Fu && a == 0xF000u) return "ARGB4444";
-        return bits + "-bit uncompressed RGB(A)";
-      }
-      if ((flags & 0x00020000u) != 0) return "Luminance";
-      if ((flags & 0x00040000u) != 0) return "Alpha";
-      return "Unknown DDS format";
-    }
-
-    private static String FourCc(UInt32 value) {
-      Byte[] bytes = BitConverter.GetBytes(value);
-      String s = Encoding.ASCII.GetString(bytes);
-      return s.TrimEnd('\0', ' ');
-    }
-
     private void PreviewAssetDDS() {
       try {
         if (m_inputStream == null) return;
-        m_inputStream.Position = 0;
-
-        String ddsInfo = ReadDdsHeaderInfo(m_inputStream);
-        m_ddsPreview.Invoke(new Action(() => m_ddsPreview.InfoText = ddsInfo));
         m_inputStream.Position = 0;
 
         using ImageImporter imp = new ImageImporter();
@@ -2499,6 +2451,12 @@ namespace PugTools {
         }
         catch (Exception) { }
       }
+    }
+
+    private void PreviewAssetJedipediaFormat(String extension, String fileName) {
+      if (m_inputStream == null) return;
+      m_inputStream.Position = 0;
+      m_rootList = View_JedipediaFormats.Parse(m_inputStream, extension, fileName);
     }
 
     private void PreviewAssetGFX() {
@@ -3573,6 +3531,28 @@ namespace PugTools {
         await Task.Run(() => PreviewAssetWEM(wem));
         m_audioPlaying = false;
       }
+    }
+
+    private static Object JsonTokenToPreviewValue(Newtonsoft.Json.Linq.JToken token) {
+      if (token == null || token.Type == Newtonsoft.Json.Linq.JTokenType.Null
+          || token.Type == Newtonsoft.Json.Linq.JTokenType.Undefined) return null;
+
+      if (token is Newtonsoft.Json.Linq.JObject jsonObject) {
+        Dictionary<Object, Object> values = new Dictionary<Object, Object>();
+        foreach (Newtonsoft.Json.Linq.JProperty property in jsonObject.Properties())
+          values[property.Name] = JsonTokenToPreviewValue(property.Value);
+        return values;
+      }
+
+      if (token is Newtonsoft.Json.Linq.JArray jsonArray) {
+        List<Object> values = new List<Object>();
+        foreach (Newtonsoft.Json.Linq.JToken item in jsonArray)
+          values.Add(JsonTokenToPreviewValue(item));
+        return values;
+      }
+
+      if (token is Newtonsoft.Json.Linq.JValue jsonValue) return jsonValue.Value;
+      return token.ToString(Newtonsoft.Json.Formatting.None);
     }
 
     private void PreviewAssetFX() {
@@ -5322,6 +5302,24 @@ namespace PugTools {
     #endregion
 
     #region TreeViewGrid1
+    private void TreeViewGrid1KeyDownCopyValue(Object sender, KeyEventArgs e) {
+      if (e.KeyCode != Keys.C || !e.Control || treeViewGrid1?.SelectedObject is not NodeListItem item) return;
+
+      String value = item.value == null ? String.Empty : Convert.ToString(item.value, CultureInfo.InvariantCulture);
+      if (String.IsNullOrWhiteSpace(value)) value = item.DisplayValue ?? String.Empty;
+      if (String.IsNullOrWhiteSpace(value)) value = item.DisplayName ?? String.Empty;
+      if (String.IsNullOrWhiteSpace(value)) return;
+
+      try {
+        Clipboard.SetText(value);
+        StatusLabel2Text("Structured value copied to clipboard.");
+        e.Handled = true;
+        e.SuppressKeyPress = true;
+      } catch (Exception ex) {
+        System.Diagnostics.Debug.WriteLine("Could not copy structured value: " + ex);
+      }
+    }
+
     private void TreeViewGrid1MouseDoubleClickNavigateAsset(Object sender, MouseEventArgs e) {
       if (e.Button != MouseButtons.Left || treeViewGrid1?.SelectedObject is not NodeListItem item) return;
       Boolean newTab = (ModifierKeys & Keys.Control) == Keys.Control;
@@ -5374,7 +5372,7 @@ namespace PugTools {
 
       String ext = Path.GetExtension(value);
       if (!String.IsNullOrWhiteSpace(ext)) yield break;
-      foreach (String suffix in new[] { ".gr2", ".dds", ".tex", ".mat", ".fxspec", ".prt", ".jba", ".mph", ".mag", ".spt", ".stg", ".dyn", ".xml", ".bnk", ".wem", ".lod", ".clo", ".dyc", ".epp", ".gfx", ".swf", ".amx", ".bkt", ".dat", ".not", ".stb", ".tbl", ".lst", ".manifest" })
+      foreach (String suffix in new[] { ".gr2", ".dds", ".tex", ".mat", ".fxspec", ".prt", ".jba", ".mph", ".mag", ".spt", ".stg", ".dyn", ".xml" })
         yield return value + suffix;
     }
 

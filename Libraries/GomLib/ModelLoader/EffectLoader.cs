@@ -172,10 +172,13 @@ namespace GomLib.ModelLoader {
 
       //Parse tag ids into tag strings
       var tagTable = _dom.GetObject("tagTablePrototype");
-      var tagIdToStringMap = tagTable.Data.Get<Dictionary<object, object>>("9223371996464079193");
+      var tagIdToStringMap = tagTable == null
+          ? null
+          : tagTable.Data.ValueOrDefault<Dictionary<object, object>>("9223371996464079193");
       eff.ParsedTags = new List<string>();
       foreach (long tagId in eff.Tags) {
-        tagIdToStringMap.TryGetValue(tagId, out object tag);
+        object tag = null;
+        if (tagIdToStringMap != null) tagIdToStringMap.TryGetValue(tagId, out tag);
         if (tag == null) tag = string.Format("Unknown tag: {0}", tagId);
         eff.ParsedTags.Add((string)tag);
       }
@@ -237,66 +240,77 @@ namespace GomLib.ModelLoader {
         if (output.FailureLocalizedString != null) output.FailureString = output.FailureLocalizedString["enMale"];
       }
       output.Params = new List<SubEffectFunctionParam>();
-      Dictionary<object, object> boolParams = obj.ValueOrDefault<Dictionary<object, object>>("effBoolParams");
+      Dictionary<object, object> boolParams = obj.ValueOrDefault("effBoolParams", new Dictionary<object, object>());
       foreach (KeyValuePair<object, object> kvp in boolParams) {
         output.Params.Add(MakeParam(kvp.Key, 1, (bool)kvp.Value));
       }
-      Dictionary<object, object> stringParams = obj.ValueOrDefault<Dictionary<object, object>>("effStringParams");
+      Dictionary<object, object> stringParams = obj.ValueOrDefault("effStringParams", new Dictionary<object, object>());
       foreach (KeyValuePair<object, object> kvp in stringParams) {
         output.Params.Add(MakeParam(kvp.Key, 2, (string)kvp.Value));
       }
-      Dictionary<object, object> intParams = obj.ValueOrDefault<Dictionary<object, object>>("effIntParams");
+      Dictionary<object, object> intParams = obj.ValueOrDefault("effIntParams", new Dictionary<object, object>());
       foreach (KeyValuePair<object, object> kvp in intParams) {
         output.Params.Add(MakeParam(kvp.Key, 3, (long)kvp.Value));
       }
-      Dictionary<object, object> floatParams = obj.ValueOrDefault<Dictionary<object, object>>("effFloatParams");
+      Dictionary<object, object> floatParams = obj.ValueOrDefault("effFloatParams", new Dictionary<object, object>());
       foreach (KeyValuePair<object, object> kvp in floatParams) {
         output.Params.Add(MakeParam(kvp.Key, 4, (float)kvp.Value));
       }
-      Dictionary<object, object> functionTags = obj.ValueOrDefault<Dictionary<object, object>>("effFunctionTags");
+      Dictionary<object, object> functionTags = obj.ValueOrDefault("effFunctionTags", new Dictionary<object, object>());
       output.Tags = new List<long>();
       foreach (KeyValuePair<object, object> kvp in functionTags) {
         //if ((bool)kvp.Value != true) throw new Exception("ERROR: Expected function tag to be true, but it is false"); //not really necessary
         output.Tags.Add((long)kvp.Key);
       }
-      Dictionary<object, object> timeParams = obj.ValueOrDefault<Dictionary<object, object>>("effTimeIntervalParams");
+      Dictionary<object, object> timeParams = obj.ValueOrDefault("effTimeIntervalParams", new Dictionary<object, object>());
       foreach (KeyValuePair<object, object> kvp in timeParams) {
         output.Params.Add(MakeParam(kvp.Key, 5, (ulong)kvp.Value));
       }
-      Dictionary<object, object> floatListParams = obj.ValueOrDefault<Dictionary<object, object>>("effFloatListParams");
+      Dictionary<object, object> floatListParams = obj.ValueOrDefault("effFloatListParams", new Dictionary<object, object>());
       foreach (KeyValuePair<object, object> kvp in floatListParams) {
+        var rawList = kvp.Value as List<object>;
+        if (rawList == null) continue;
         List<float> floatList = new List<float>();
-        foreach (float entry in (List<object>)kvp.Value) {
-          floatList.Add(entry);
+        foreach (object entry in rawList) {
+          if (entry is float value) floatList.Add(value);
+          else if (entry is double doubleValue) floatList.Add((float)doubleValue);
+          else if (entry != null && float.TryParse(entry.ToString(), out float parsed)) floatList.Add(parsed);
         }
         output.Params.Add(MakeParam(kvp.Key, 6, floatList));
       }
-      Dictionary<object, object> intListParams = obj.ValueOrDefault<Dictionary<object, object>>("effIntListParams");
+      Dictionary<object, object> intListParams = obj.ValueOrDefault("effIntListParams", new Dictionary<object, object>());
       foreach (KeyValuePair<object, object> kvp in intListParams) {
+        var rawList = kvp.Value as List<object>;
+        if (rawList == null) continue;
         List<long> intList = new List<long>();
-        foreach (long entry in (List<object>)kvp.Value) {
-          intList.Add(entry);
+        foreach (object entry in rawList) {
+          if (entry is long value) intList.Add(value);
+          else if (entry != null && long.TryParse(entry.ToString(), out long parsed)) intList.Add(parsed);
         }
         output.Params.Add(MakeParam(kvp.Key, 7, intList));
       }
-      Dictionary<object, object> idListParams = obj.ValueOrDefault<Dictionary<object, object>>("effIdListParams");
-      if (idListParams != null) {
-        foreach (KeyValuePair<object, object> kvp in idListParams) {
-          List<ulong> idList = new List<ulong>();
-          foreach (ulong entry in (List<object>)kvp.Value) {
-            idList.Add(entry);
-          }
-          output.Params.Add(MakeParam(kvp.Key, 8, idList));
+      Dictionary<object, object> idListParams = obj.ValueOrDefault("effIdListParams", new Dictionary<object, object>());
+      foreach (KeyValuePair<object, object> kvp in idListParams) {
+        var rawList = kvp.Value as List<object>;
+        if (rawList == null) continue;
+        List<ulong> idList = new List<ulong>();
+        foreach (object entry in rawList) {
+          if (entry is ulong value) idList.Add(value);
+          else if (entry != null && ulong.TryParse(entry.ToString(), out ulong parsed)) idList.Add(parsed);
         }
+        output.Params.Add(MakeParam(kvp.Key, 8, idList));
       }
       //TODO unknown: 4611686346551820000
 
       //Parse tag ids into tag strings
       var tagTable = _dom.GetObject("tagTablePrototype");
-      var tagIdToStringMap = tagTable.Data.Get<Dictionary<object, object>>("9223371996464079193");
+      var tagIdToStringMap = tagTable == null
+          ? null
+          : tagTable.Data.ValueOrDefault<Dictionary<object, object>>("9223371996464079193");
       output.ParsedTags = new List<string>();
       foreach (long tagId in output.Tags) {
-        tagIdToStringMap.TryGetValue(tagId, out object tag);
+        object tag = null;
+        if (tagIdToStringMap != null) tagIdToStringMap.TryGetValue(tagId, out tag);
         if (tag == null) tag = string.Format("Unknown tag: {0}", tagId);
         output.ParsedTags.Add((string)tag);
       }

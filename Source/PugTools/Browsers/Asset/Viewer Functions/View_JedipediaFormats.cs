@@ -5,6 +5,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Xml;
 
 namespace PugTools {
   /// <summary>
@@ -30,6 +31,10 @@ namespace PugTools {
         "BIN" => ParseBin(br, fileName),
         "BKT" => ParseBkt(br),
         "FBX" => ParseFbx(br),
+        "GR2" => ParseGr2(br, fileName),
+        "JBA" => ParseJba(br, fileName),
+        "EPP" => ParseEpp(br, fileName),
+        "FXSPEC" => ParseFxSpec(br, fileName),
         "GOM" => ParseGom(br),
         "NODE" => ParseNode(br),
         "INFO" => magic switch {
@@ -37,6 +42,8 @@ namespace PugTools {
           0x464E4950u => ParsePrototypeInfo(br), // PINF
           _ => throw new InvalidDataException("Unsupported .info magic 0x" + magic.ToString("X8", CultureInfo.InvariantCulture))
         },
+        "GFX" => ParseSwfLike(br, fileName, true),
+        "SWF" => ParseSwfLike(br, fileName, false),
         "LIST" => magic switch {
           0x46454453u => ParseScriptDefList(br), // SDEF
           0x53444953u => ParseScriptIdsList(br), // SIDS
@@ -98,6 +105,324 @@ namespace PugTools {
     private static UInt64 ReadHeroVarUInt(BinaryReader br) {
       Int64 value = ReadHeroVarInt(br);
       return unchecked((UInt64)value);
+    }
+
+    // ---------------- TEX ----------------
+    private static ArrayList ParseEpp(BinaryReader br, String fileName) {
+      Stream stream = br.BaseStream;
+      stream.Position = 0;
+      XmlDocument doc = new XmlDocument { XmlResolver = null };
+      using (XmlReader reader = XmlReader.Create(stream, new XmlReaderSettings { DtdProcessing = DtdProcessing.Prohibit, XmlResolver = null, IgnoreComments = true, IgnoreWhitespace = true })) {
+        doc.Load(reader);
+      }
+      XmlElement rootElement = doc.DocumentElement;
+      if (rootElement == null) throw new InvalidDataException("EPP XML has no document element.");
+
+      NodeListItem summary = Branch("EPP ability-effect appearance", rootElement.Name);
+      Add(summary, "File", fileName ?? String.Empty);
+      Add(summary, "Root element", rootElement.Name);
+      Add(summary, "FQN", rootElement.GetAttribute("fqn"));
+      Add(summary, "Attributes", rootElement.Attributes.Count);
+      Add(summary, "Elements", rootElement.GetElementsByTagName("*").Count);
+
+      NodeListItem references = Branch("Effect / animation references");
+      String[] referenceNames = { "fxSpecString", "projectileFXString", "casterAnim", "targetAnim" };
+      Int32 referenceCount = 0;
+      foreach (String referenceName in referenceNames) {
+        XmlNodeList matches = rootElement.GetElementsByTagName(referenceName);
+        foreach (XmlNode match in matches) {
+          String value = (match.InnerText ?? String.Empty).Trim();
+          if (value.Length == 0) continue;
+          NodeListItem entry = Branch(referenceName, value);
+          if (referenceName.IndexOf("fx", StringComparison.OrdinalIgnoreCase) >= 0)
+            Add(entry, "Expected resource", "/resources/art/fx/fxspec/" + value + ".fxspec");
+          references.children.Add(entry);
+          referenceCount++;
+        }
+      }
+      Add(summary, "Recognized references", referenceCount);
+
+      NodeListItem tree = Branch("XML structure (bounded preview)");
+      Int32 shown = 0;
+      AddEppXmlNode(tree, rootElement, 0, ref shown);
+      Add(tree, "Preview limit", LargePreviewLimit + " XML nodes");
+      return Roots(summary, references, tree);
+    }
+
+    private static void AddEppXmlNode(NodeListItem parent, XmlNode node, Int32 depth, ref Int32 shown) {
+      if (node == null || shown >= LargePreviewLimit || depth > 32) return;
+      if (node.NodeType != XmlNodeType.Element) return;
+      shown++;
+      String value = String.Empty;
+      if (!node.HasChildNodes || (node.ChildNodes.Count == 1 && node.FirstChild.NodeType == XmlNodeType.Text))
+        value = (node.InnerText ?? String.Empty).Trim();
+      NodeListItem item = Branch(node.Name, value);
+      if (node.Attributes != null) {
+        foreach (XmlAttribute attribute in node.Attributes) {
+          if (shown >= LargePreviewLimit) break;
+          Add(item, "@" + attribute.Name, attribute.Value);
+          shown++;
+        }
+      }
+      parent.children.Add(item);
+      foreach (XmlNode child in node.ChildNodes) {
+        if (shown >= LargePreviewLimit) break;
+        AddEppXmlNode(item, child, depth + 1, ref shown);
+      }
+    }
+
+    // ---------------- FXSPEC ----------------
+    private static ArrayList ParseFxSpec(BinaryReader br, String fileName) {
+      Stream stream = br.BaseStream;
+      stream.Position = 0;
+      XmlDocument doc = new XmlDocument { XmlResolver = null };
+      using (XmlReader reader = XmlReader.Create(stream, new XmlReaderSettings {
+        DtdProcessing = DtdProcessing.Prohibit,
+        XmlResolver = null,
+        IgnoreComments = true,
+        IgnoreWhitespace = true
+      })) {
+        doc.Load(reader);
+      }
+
+      XmlElement root = doc.DocumentElement;
+      if (root == null) throw new InvalidDataException("FXSPEC XML has no document element.");
+      NodeListItem summary = Branch("FXSPEC effect specification", root.Name);
+      Add(summary, "File", fileName ?? String.Empty);
+      Add(summary, "Root element", root.Name);
+      Add(summary, "FQN", root.GetAttribute("fqn"));
+      Add(summary, "Root attributes", root.Attributes?.Count ?? 0);
+      Add(summary, "Elements", root.GetElementsByTagName("*").Count);
+
+      NodeListItem refs = Branch("Resource-like values");
+      Int32 refCount = 0;
+      Int32 shownRefs = 0;
+      foreach (XmlNode node in root.SelectNodes(".//*")) {
+        if (shownRefs >= LargePreviewLimit) break;
+        String name = node.Name ?? String.Empty;
+        String value = (node.InnerText ?? String.Empty).Trim();
+        if (value.Length == 0 || value.Length > 2048) continue;
+        Boolean resourceLike = name.IndexOf("resource", StringComparison.OrdinalIgnoreCase) >= 0
+          || name.IndexOf("texture", StringComparison.OrdinalIgnoreCase) >= 0
+          || name.IndexOf("model", StringComparison.OrdinalIgnoreCase) >= 0
+          || name.IndexOf("sound", StringComparison.OrdinalIgnoreCase) >= 0
+          || name.IndexOf("fx", StringComparison.OrdinalIgnoreCase) >= 0
+          || name.IndexOf("file", StringComparison.OrdinalIgnoreCase) >= 0;
+        if (!resourceLike) continue;
+        NodeListItem entry = Branch(name, value);
+        if (node.Attributes != null) {
+          foreach (XmlAttribute attribute in node.Attributes)
+            Add(entry, "@" + attribute.Name, attribute.Value);
+        }
+        refs.children.Add(entry);
+        refCount++;
+        shownRefs++;
+      }
+      Add(summary, "Resource-like entries", refCount);
+
+      NodeListItem structure = Branch("XML structure (bounded preview)");
+      Int32 shownNodes = 0;
+      AddEppXmlNode(structure, root, 0, ref shownNodes);
+      Add(structure, "Preview limit", LargePreviewLimit + " XML nodes");
+      return Roots(summary, refs, structure);
+    }
+
+    private static ArrayList ParseTex(BinaryReader br, String fileName) {
+      br.BaseStream.Position = 0;
+      XmlDocument doc = new XmlDocument();
+      doc.Load(br.BaseStream);
+      XmlElement root = doc.DocumentElement;
+      if (root == null) throw new InvalidDataException("Expected XML root in TEX file.");
+
+      NodeListItem summary = Branch("TEX / " + root.Name);
+      Add(summary, "File", fileName ?? String.Empty);
+      Add(summary, "Root", root.Name);
+      Add(summary, "Attributes", root.Attributes?.Count ?? 0);
+
+      if (root.Attributes != null)
+        foreach (XmlAttribute attr in root.Attributes)
+          Add(summary, "@" + attr.Name, attr.Value);
+
+      NodeListItem fields = Branch("Properties");
+      Int32 childCount = 0;
+      foreach (XmlNode child in root.ChildNodes) {
+        if (child.NodeType != XmlNodeType.Element) continue;
+        childCount++;
+        if (childCount > LargePreviewLimit) break;
+        NodeListItem row = Branch(child.Name);
+        if (child.Attributes != null)
+          foreach (XmlAttribute attr in child.Attributes)
+            Add(row, "@" + attr.Name, attr.Value);
+        String text = child.InnerText?.Trim() ?? String.Empty;
+        if (child.ChildNodes.Count == 1 && !String.IsNullOrEmpty(text)) Add(row, "Value", text);
+        if (child.ChildNodes.Count > 1) Add(row, "Children", child.ChildNodes.Count);
+        fields.children.Add(row);
+      }
+      if (childCount > LargePreviewLimit)
+        fields.children.Add(Leaf("…", (childCount - LargePreviewLimit).ToString(CultureInfo.InvariantCulture) + " more elements omitted"));
+
+      Add(summary, "Elements", childCount);
+      return Roots(summary, fields);
+    }
+
+
+    // ---------------- GR2 / BWAG ----------------
+    // SWTOR uses both original Granny GR2 files and BioWare's BWAG-derived
+    // geometry files.  The exact payload layout differs between generations,
+    // so this inspector deliberately exposes only header-level facts that are
+    // stable and verifiable rather than guessing at mesh offsets.
+    private static ArrayList ParseGr2(BinaryReader br, String fileName) {
+      br.BaseStream.Position = 0;
+      Int64 length = br.BaseStream.Length;
+      Byte[] head = br.ReadBytes((Int32)Math.Min(128, length));
+      String ascii = Encoding.ASCII.GetString(head);
+      String printable = new String(head.Select(b => b >= 32 && b < 127 ? (Char)b : '.').ToArray());
+
+      String family;
+      if (ascii.StartsWith("Granny", StringComparison.Ordinal)) family = "Original Granny 3D / GR2";
+      else if (ascii.IndexOf("BWAG", StringComparison.OrdinalIgnoreCase) >= 0) family = "BioWare BWAG geometry";
+      else family = "GR2/BWAG (header signature not recognized)";
+
+      NodeListItem summary = Branch("GR2 / Geometry");
+      Add(summary, "File", fileName ?? String.Empty);
+      Add(summary, "Size", length.ToString("N0", CultureInfo.InvariantCulture) + " bytes");
+      Add(summary, "Format family", family);
+      Add(summary, "Header bytes", head.Length);
+      Add(summary, "ASCII preview", printable.TrimEnd('.'));
+      Add(summary, "Header (hex)", BitConverter.ToString(head).Replace("-", " "));
+
+      NodeListItem strings = Branch("Embedded strings (header scan)");
+      Int32 found = 0;
+      StringBuilder current = new StringBuilder();
+      for (Int32 i = 0; i < Math.Min(head.Length, 4096); i++) {
+        Byte b = head[i];
+        if (b >= 32 && b < 127) current.Append((Char)b);
+        else {
+          if (current.Length >= 4) {
+            strings.children.Add(Leaf(found.ToString(CultureInfo.InvariantCulture), current.ToString()));
+            found++;
+            if (found >= 50) break;
+          }
+          current.Clear();
+        }
+      }
+      if (current.Length >= 4 && found < 50)
+        strings.children.Add(Leaf(found.ToString(CultureInfo.InvariantCulture), current.ToString()));
+      if (found == 0) strings.children.Add(Leaf("Info", "No printable strings found in the header."));
+
+      NodeListItem note = Branch("Parser status");
+      Add(note, "Geometry payload", "Not decoded here; use the existing 3D preview for meshes/materials.");
+      Add(note, "Why", "GR2/BWAG has multiple generations/layouts; header facts are shown without guessing offsets.");
+      return Roots(summary, strings, note);
+    }
+
+    // ---------------- JBA / skeletal animation ----------------
+    // PugTools already contains the full JBA reader used by the animation
+    // preview. Reuse that decoder here instead of maintaining a second binary
+    // parser. This exposes the same facts Jedipedia's reader derives while
+    // keeping the potentially huge per-frame key data out of the WinForms tree.
+    private static ArrayList ParseJba(BinaryReader br, String fileName) {
+      br.BaseStream.Position = 0;
+      FileFormats.JBAAnimation animation = FileFormats.JBAReader.Read(br);
+
+      NodeListItem summary = Branch("JBA / Skeletal animation");
+      Add(summary, "File", fileName ?? String.Empty);
+      Add(summary, "Size", br.BaseStream.Length.ToString("N0", CultureInfo.InvariantCulture) + " bytes");
+      Add(summary, "Version", animation.Version);
+      Add(summary, "Layout", animation.Is64BitLayout ? "64-bit JAWB" : animation.IsBetaHeapLayout ? "32-bit beta heap" : "32-bit legacy");
+      if (!String.IsNullOrWhiteSpace(animation.ClipName)) Add(summary, "Clip", animation.ClipName);
+      Add(summary, "Length", animation.Length.ToString("0.###", CultureInfo.InvariantCulture) + " s");
+      Add(summary, "FPS", animation.FPS.ToString("0.###", CultureInfo.InvariantCulture));
+      Add(summary, "Frames", animation.FrameCount);
+      Add(summary, "Bones", animation.BoneCount);
+      Add(summary, "Blocks", animation.BlockCount);
+
+      NodeListItem bones = Branch("Bones (" + animation.BoneNames.Count.ToString(CultureInfo.InvariantCulture) + ")");
+      Int32 limit = Math.Min(animation.BoneNames.Count, LargePreviewLimit);
+      for (Int32 i = 0; i < limit; i++)
+        bones.children.Add(Leaf(i.ToString(CultureInfo.InvariantCulture), animation.BoneNames[i]));
+      if (animation.BoneNames.Count > limit)
+        bones.children.Add(Leaf("…", (animation.BoneNames.Count - limit).ToString(CultureInfo.InvariantCulture) + " more bones omitted"));
+
+      NodeListItem status = Branch("Animation data");
+      Add(status, "Decoded", "Yes — using the existing JBAReader used by the animation viewer.");
+      Add(status, "Keyframes", "Kept out of the tree preview to avoid creating thousands of WinForms nodes.");
+      Add(status, "Playback", "Use the existing JBA animation viewer for timeline playback and pose inspection.");
+
+      return Roots(summary, bones, status);
+    }
+
+    // ---------------- SWF / GFX ----------------
+    // Scaleform GFX files use the SWF family of headers. Decode only the stable
+    // header and tag framing here; the existing GFX decompressor/raw viewer remains
+    // available for payload inspection.
+    private static ArrayList ParseSwfLike(BinaryReader br, String fileName, Boolean isGfx) {
+      br.BaseStream.Position = 0;
+      if (br.BaseStream.Length < 8) throw new InvalidDataException("SWF/GFX file is too small for a header.");
+
+      Byte[] header = br.ReadBytes(8);
+      String signature = Encoding.ASCII.GetString(header, 0, 3);
+      Byte version = header[3];
+      UInt32 declaredLength = BitConverter.ToUInt32(header, 4);
+      NodeListItem summary = Branch((isGfx ? "GFX" : "SWF") + " / Scaleform movie");
+      Add(summary, "File", fileName ?? String.Empty);
+      Add(summary, "Size", br.BaseStream.Length.ToString("N0", CultureInfo.InvariantCulture) + " bytes");
+      Add(summary, "Signature", signature);
+      Add(summary, "Version", version);
+      Add(summary, "Declared uncompressed length", declaredLength.ToString("N0", CultureInfo.InvariantCulture) + " bytes");
+      Add(summary, "Compression", signature == "CWS" ? "ZLIB" : signature == "ZWS" ? "LZMA" : signature == "FWS" ? "None" : "Unknown");
+      Add(summary, "Payload", "Use the existing raw/GFX decompressor view for full tag payloads.");
+
+      NodeListItem headerNode = Branch("Header");
+      headerNode.children.Add(Leaf("Raw", BitConverter.ToString(header).Replace("-", " ")));
+
+      if (signature != "FWS") {
+        NodeListItem note = Branch("Compressed movie");
+        Add(note, "Frame/tag parsing", "Not decoded here because the payload is compressed; the existing GFX decompressor can expose the expanded bytes.");
+        return Roots(summary, headerNode, note);
+      }
+
+      try {
+        br.BaseStream.Position = 8;
+        Byte rectFirst = br.ReadByte();
+        Int32 nbits = rectFirst >> 3;
+        Int32 rectBytes = (5 + nbits * 4 + 7) / 8;
+        br.BaseStream.Position = 8;
+        Byte[] rect = br.ReadBytes(rectBytes);
+        if (rect.Length == rectBytes) {
+          Int32 bitPos = 5;
+          Int32 xMin = ReadSignedBits(rect, ref bitPos, nbits);
+          Int32 xMax = ReadSignedBits(rect, ref bitPos, nbits);
+          Int32 yMin = ReadSignedBits(rect, ref bitPos, nbits);
+          Int32 yMax = ReadSignedBits(rect, ref bitPos, nbits);
+          Int32 pos = 8 + rectBytes;
+          if (pos + 4 <= br.BaseStream.Length) {
+            br.BaseStream.Position = pos;
+            UInt16 frameRateRaw = br.ReadUInt16();
+            UInt16 frameCount = br.ReadUInt16();
+            Add(summary, "Stage", ((xMax - xMin) / 20.0).ToString(CultureInfo.InvariantCulture) + " x " + ((yMax - yMin) / 20.0).ToString(CultureInfo.InvariantCulture) + " px");
+            Add(summary, "Frame rate", (frameRateRaw / 256.0).ToString("0.###", CultureInfo.InvariantCulture) + " fps");
+            Add(summary, "Frames", frameCount);
+            Add(summary, "Tag data offset", pos + 4);
+          }
+        }
+      } catch (Exception ex) {
+        Add(summary, "Header parse warning", ex.Message);
+      }
+
+      return Roots(summary, headerNode);
+    }
+
+    private static Int32 ReadSignedBits(Byte[] data, ref Int32 bitPos, Int32 count) {
+      if (count <= 0 || count > 31 || bitPos + count > data.Length * 8) throw new InvalidDataException("Invalid SWF RECT bit field.");
+      UInt32 value = 0;
+      for (Int32 i = 0; i < count; i++) {
+        Int32 p = bitPos++;
+        value = (value << 1) | (UInt32)((data[p >> 3] >> (7 - (p & 7))) & 1);
+      }
+      UInt32 sign = 1u << (count - 1);
+      if ((value & sign) != 0) value |= UInt32.MaxValue << count;
+      return unchecked((Int32)value);
     }
 
     // ---------------- BIN ----------------
