@@ -55,6 +55,9 @@ namespace PugTools {
     private object worldConversationCinematicCacheDom;
     private readonly Dictionary<string, GomObjectData> worldConversationStageCache = new Dictionary<string, GomObjectData>(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, GomObjectData> worldConversationAutoCameraCache = new Dictionary<string, GomObjectData>(StringComparer.OrdinalIgnoreCase);
+    // stgCameraOffsetsPrototype: body type -> shot category -> Vector3 (see ApplyWorldConversationAutoCameraHeight).
+    private object worldConversationCameraOffsets;
+    private bool worldConversationCameraOffsetsLoaded;
 
     // File-backed conversation diagnostics. Visual Studio's Debug output can become very expensive while the world
     // renderer is running, so the Yalt/Morpheme diagnostics deliberately bypass Debug.WriteLine.
@@ -118,6 +121,7 @@ namespace PugTools {
       if (player != null && staging.Player != null && !String.IsNullOrWhiteSpace(staging.Player.Stage) && !String.IsNullOrWhiteSpace(staging.Player.Mark) &&
           TryResolveWorldConversationActorMark(staging.Player.Stage, staging.Player.Mark, out Vector3 playerPosition, out float playerYaw, out Room playerRoom)) {
         if (player.ConversationVirtual && playerRoom != null) player.Room = playerRoom;
+        WorldConversationDiagnosticFileWrite("CNV staging: node=" + node.NodeId + " PLAYER stage=" + staging.Player.Stage + " mark=" + staging.Player.Mark + " world=" + WorldConversationVec(playerPosition));
         panelRender.SetWorldConversationActorMark(player, playerPosition, playerYaw);
         worldConversationStagedNpcs.Add(player);
       }
@@ -128,8 +132,12 @@ namespace PugTools {
 
         ApplyWorldConversationDefaultStance(placement);
         if (markRef == null || String.IsNullOrWhiteSpace(markRef.Stage) || String.IsNullOrWhiteSpace(markRef.Mark)) continue;
-        if (!TryResolveWorldConversationActorMark(markRef.Stage, markRef.Mark, out Vector3 position, out float yaw, out Room markRoom)) continue;
+        if (!TryResolveWorldConversationActorMark(markRef.Stage, markRef.Mark, out Vector3 position, out float yaw, out Room markRoom)) {
+          WorldConversationDiagnosticFileWrite("CNV staging: node=" + node.NodeId + " SPEAKER " + placement.SourceFqn + " stage=" + markRef.Stage + " mark=" + markRef.Mark + " UNRESOLVED");
+          continue;
+        }
         if (placement.ConversationVirtual && markRoom != null) placement.Room = markRoom;
+        WorldConversationDiagnosticFileWrite("CNV staging: node=" + node.NodeId + " SPEAKER " + placement.SourceFqn + " stage=" + markRef.Stage + " mark=" + markRef.Mark + " world=" + WorldConversationVec(position));
         panelRender.SetWorldConversationActorMark(placement, position, yaw);
         worldConversationStagedNpcs.Add(placement);
       }
@@ -160,6 +168,7 @@ namespace PugTools {
         if (!TryResolveWorldConversationCameraPose(conversation, node, action.Value, out WorldConversationCameraPose pose)) return;
         Dictionary<string, string> parameters = WorldConversationActionParameters(action.Params);
         ApplyWorldConversationCameraOverrides(pose, parameters);
+        WorldConversationDiagnosticFileWrite(WorldConversationCameraDiagnostic(conversation, node, kind, action.Value, pose));
         bool moving = String.Equals(kind, "Move Camera To Mark", StringComparison.OrdinalIgnoreCase);
         float moveSeconds = moving ? WorldConversationParameterSeconds(parameters, "cameramoveduration") : 0f;
         float rotateSeconds = moving ? WorldConversationParameterSeconds(parameters, "camerarotateduration") : 0f;
@@ -184,6 +193,7 @@ namespace PugTools {
         if (split <= 0 || split + 1 >= text.Length) return;
         if (!TryResolveWorldConversationActorMark(text.Substring(0, split), text.Substring(split + 1), out Vector3 position, out float yaw, out Room markRoom)) return;
         if (placement.ConversationVirtual && markRoom != null) placement.Room = markRoom;
+        WorldConversationDiagnosticFileWrite("CNV set mark: node=" + (node?.NodeId ?? 0) + " " + placement.SourceFqn + " -> " + text + " world=" + WorldConversationVec(position));
         panelRender.SetWorldConversationActorMark(placement, position, yaw);
         worldConversationStagedNpcs.Add(placement);
         return;
@@ -567,11 +577,69 @@ namespace PugTools {
       }
       WorldNpcPlacement placement = FindWorldConversationActorPlacement(fqn);
       if (placement != null) return placement;
-      if (worldConversationPrimaryNpc != null && !String.IsNullOrWhiteSpace(fqn)) {
-        if (String.IsNullOrWhiteSpace(worldConversationPrimaryStandInFqn)) worldConversationPrimaryStandInFqn = fqn.Trim();
-        if (String.Equals(worldConversationPrimaryStandInFqn, fqn.Trim(), StringComparison.OrdinalIgnoreCase)) return worldConversationPrimaryNpc;
-      }
+      if (WorldConversationMayStandInForPrimary(fqn)) return worldConversationPrimaryNpc;
       return EnsureWorldConversationCastPlacement(fqn);
+    }
+
+    // The primary NPC stands in for ONE speaker the area never placed (a conversation started from a variant of the
+    // body it names). It must not stand in for a second, different cast member while the primary NPC is itself named
+    // by the conversation: both would then be staged on the same body and the later mark (here the pit one of
+    // yalts_wife, NPC2) would carry the primary NPC away from the speaker it really is.
+    private bool WorldConversationMayStandInForPrimary(string fqn) {
+      if (worldConversationPrimaryNpc == null || String.IsNullOrWhiteSpace(fqn)) return false;
+      string clean = fqn.Trim();
+      if (!String.IsNullOrWhiteSpace(worldConversationPrimaryStandInFqn) &&
+          String.Equals(worldConversationPrimaryStandInFqn, clean, StringComparison.OrdinalIgnoreCase)) return true;
+      if (!String.IsNullOrWhiteSpace(worldConversationPrimaryStandInFqn)) return false;
+      if (WorldConversationNamesPrimaryNpc()) {
+        WorldConversationDiagnosticFileWrite("CNV speaker " + clean + " is a different cast member than the primary NPC " + worldConversationPrimaryNpc.SourceFqn + "; no stand-in");
+        return false;
+      }
+      worldConversationPrimaryStandInFqn = clean;
+      return true;
+    }
+
+    private WorldConversationStageMarkRef WorldConversationPrimarySpeakerMark(WorldConversationStagingInfo staging) {
+      string primary = worldConversationPrimaryNpc?.SourceFqn;
+      if (staging == null || String.IsNullOrWhiteSpace(primary)) return null;
+      foreach (KeyValuePair<ulong, WorldConversationStageMarkRef> pair in staging.Speakers) {
+        string fqn = null;
+        try { fqn = WorldResolveGomObject(pair.Key)?.Name; } catch { }
+        if (String.IsNullOrWhiteSpace(fqn)) { try { fqn = currentDom?.ConversationLoader.LoadSpeaker(pair.Key)?.Fqn; } catch { } }
+        if (!String.IsNullOrWhiteSpace(fqn) && String.Equals(fqn.Trim(), primary.Trim(), StringComparison.OrdinalIgnoreCase)) return pair.Value;
+      }
+      return null;
+    }
+
+    private bool WorldConversationNamesPrimaryNpc() {
+      string primary = worldConversationPrimaryNpc?.SourceFqn;
+      if (String.IsNullOrWhiteSpace(primary) || worldConversationPlaybackConversation == null) return false;
+      try {
+        // Every speaker the conversation stages, in every group of the tree, not just the current node's.
+        foreach (string speakerFqn in WorldConversationAllSpeakerFqns(worldConversationPlaybackConversation))
+          if (String.Equals(speakerFqn, primary, StringComparison.OrdinalIgnoreCase)) return true;
+      } catch { }
+      return false;
+    }
+
+    private IEnumerable<string> WorldConversationAllSpeakerFqns(Conversation conversation) {
+      var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+      GomObject raw = null;
+      try {
+        raw = conversation.Id != 0 ? WorldResolveGomObject(conversation.Id) : null;
+        if (raw == null && !String.IsNullOrWhiteSpace(conversation.Fqn)) raw = WorldResolveGomObject(conversation.Fqn);
+      } catch { }
+      if (raw?.Data == null) yield break;
+      object speakerGroups = WorldInteractionDataValue(raw.Data, "cnvStagePresetMarksNPCs", "4611686068758931193");
+      foreach (KeyValuePair<object, object> group in WorldConversationMapEntries(speakerGroups))
+        foreach (KeyValuePair<object, object> row in WorldConversationMapEntries(group.Value)) {
+          ulong id = WorldInteractionUnsigned(row.Key);
+          if (id == 0) continue;
+          string fqn = null;
+          try { fqn = WorldResolveGomObject(id)?.Name; } catch { }
+          if (String.IsNullOrWhiteSpace(fqn)) { try { fqn = currentDom?.ConversationLoader.LoadSpeaker(id)?.Fqn; } catch { } }
+          if (!String.IsNullOrWhiteSpace(fqn) && seen.Add(fqn.Trim())) yield return fqn.Trim();
+        }
     }
 
     private WorldConversationStagingInfo ReadWorldConversationStaging(Conversation conversation, long nodeId) {
@@ -622,6 +690,26 @@ namespace PugTools {
       return IsFiniteVector(position);
     }
 
+    private static string WorldConversationVec(Vector3 x) =>
+      x.X.ToString("0.000", CultureInfo.InvariantCulture) + "," + x.Y.ToString("0.000", CultureInfo.InvariantCulture) + "," + x.Z.ToString("0.000", CultureInfo.InvariantCulture);
+
+    private string WorldConversationCameraDiagnostic(Conversation conversation, DialogNode node, string kind, string value, WorldConversationCameraPose pose) {
+      Func<Vector3, string> v = x => x.X.ToString("0.000", CultureInfo.InvariantCulture) + "," + x.Y.ToString("0.000", CultureInfo.InvariantCulture) + "," + x.Z.ToString("0.000", CultureInfo.InvariantCulture);
+      var sb = new System.Text.StringBuilder();
+      sb.Append("CNV camera: node=").Append(node?.NodeId ?? 0).Append(' ').Append(kind).Append(" '").Append(value).Append("' pos=").Append(v(pose.Position))
+        .Append(" look=").Append(v(pose.Look)).Append(" fov=").Append(pose.Fov.HasValue ? pose.Fov.Value.ToString("0.000", CultureInfo.InvariantCulture) : "-");
+      try {
+        WorldNpcPlacement speaker = FindWorldConversationSpeakerPlacement(conversation, node);
+        if (speaker != null) {
+          Matrix w = speaker.ConversationWorld ?? Matrix.Identity;
+          sb.Append(" | speaker=").Append(speaker.SourceFqn).Append(" body=").Append(speaker.BodyType ?? "?")
+            .Append(" at=").Append(speaker.ConversationWorld.HasValue ? v(new Vector3(w.M41, w.M42, w.M43)) : "authored")
+            .Append(" hidden=").Append(speaker.ConversationHidden).Append(" unplaced=").Append(speaker.ConversationUnplaced).Append(" virtual=").Append(speaker.ConversationVirtual);
+        } else sb.Append(" | speaker=none");
+      } catch { }
+      return sb.ToString();
+    }
+
     private bool TryResolveWorldConversationCameraPose(Conversation conversation, DialogNode node, string value, out WorldConversationCameraPose pose) {
       pose = null;
       string text = (value ?? String.Empty).Trim();
@@ -634,7 +722,7 @@ namespace PugTools {
         GomObjectData camera = WorldConversationNamedObject(WorldInteractionDataValue(stage.Data, "stgTemplateCameraMarkList_ForPrototype", "4611686042788570001"), markName);
         if (camera != null) { pose = WorldConversationPoseFromCameraMark(stage, camera, 0f); return pose != null; }
         GomObjectData auto = WorldConversationNamedObject(WorldInteractionDataValue(stage.Data, "stgTemplateAutoCameraList_ForPrototype", "4611686042788570003"), markName);
-        if (auto != null) { pose = WorldConversationPoseFromAutoCamera(stage, auto); return pose != null; }
+        if (auto != null) { pose = WorldConversationPoseFromAutoCamera(stage, auto, ReadWorldConversationStaging(conversation, node?.NodeId ?? 0)); return pose != null; }
         return false;
       }
       return TryResolveWorldConversationAutoShot(conversation, node, text, out pose);
@@ -656,6 +744,10 @@ namespace PugTools {
       ulong speakerId = node != null && node.SpeakerId != 0 ? node.SpeakerId : conversation?.DefaultSpeakerId ?? 0;
       if (speakerId != 0) staging.Speakers.TryGetValue(speakerId, out speaker);
       if (speaker == null && staging.Speakers.Count == 1) speaker = staging.Speakers.Values.First();
+      // A player line names no speaker of its own, and a group that also stages a second cast member (here a
+      // cinematic_utility body) has more than one. Jedipedia then takes the speaker the conversation was started from
+      // (anchorSpeakerId); without it such a shot found no pair of marks and the camera simply stayed where it was.
+      if (speaker == null) speaker = WorldConversationPrimarySpeakerMark(staging);
       WorldConversationStageMarkRef player = staging.Player;
       WorldConversationStageMarkRef subject = node != null && node.IsPlayerNode ? player : speaker;
       WorldConversationStageMarkRef other = node != null && node.IsPlayerNode ? speaker : player;
@@ -680,6 +772,7 @@ namespace PugTools {
       }
 
       GomObjectData selected = exact;
+      string via = exact != null ? "exact" : String.Empty;
       if (selected == null && !String.IsNullOrWhiteSpace(subjectMark) && !String.IsNullOrWhiteSpace(otherMark)) {
         string generated = WorldConversationAutoCameraTemplate(stage, shot, subjectMark, otherMark);
         if (!String.IsNullOrWhiteSpace(generated)) {
@@ -687,11 +780,17 @@ namespace PugTools {
           selected.Dictionary["4611686025877970030"] = otherMark;
           selected.Dictionary["4611686025877970031"] = subjectMark;
           selected.Dictionary["4611686025877970033"] = generated;
+          via = "generated";
         }
       }
       selected ??= any;
-      if (selected == null) return false;
-      pose = WorldConversationPoseFromAutoCamera(stage, selected);
+      if (selected == null) { WorldConversationDiagnosticFileWrite("CNV auto shot: " + shot + " found no entry in " + stageFqn); return false; }
+      if (via.Length == 0) via = "any";
+      WorldConversationDiagnosticFileWrite("CNV auto shot: node=" + (node?.NodeId ?? 0) + " " + shot + " stage=" + stageFqn + " stageOrigin=" + WorldConversationVec(new Vector3(stage.World.M41, stage.World.M42, stage.World.M43)) +
+        " subject=" + (subject?.Stage ?? "-") + ":" + subjectMark + " other=" + (other?.Stage ?? "-") + ":" + otherMark + " via=" + via +
+        " to=" + WorldInteractionText(WorldInteractionDataValue(selected, "stgAutoCameraToMark", "4611686025877970031")) +
+        " from=" + WorldInteractionText(WorldInteractionDataValue(selected, "stgAutoCameraFromMark", "4611686025877970030")));
+      pose = WorldConversationPoseFromAutoCamera(stage, selected, staging);
       return pose != null;
     }
 
@@ -711,7 +810,7 @@ namespace PugTools {
       return "cam.auto." + whole.ToString(CultureInfo.InvariantCulture) + "-" + tenth.ToString(CultureInfo.InvariantCulture) + "." + shot.ToLowerInvariant();
     }
 
-    private WorldConversationCameraPose WorldConversationPoseFromAutoCamera(WorldConversationStageContext stage, GomObjectData entry) {
+    private WorldConversationCameraPose WorldConversationPoseFromAutoCamera(WorldConversationStageContext stage, GomObjectData entry, WorldConversationStagingInfo staging = null) {
       string fromName = WorldInteractionText(WorldInteractionDataValue(entry, "stgAutoCameraFromMark", "4611686025877970030"));
       string toName = WorldInteractionText(WorldInteractionDataValue(entry, "stgAutoCameraToMark", "4611686025877970031"));
       string specFqn = WorldInteractionText(WorldInteractionDataValue(entry, "stgAutoCameraSpec", "4611686025877970033"));
@@ -733,7 +832,154 @@ namespace PugTools {
       WorldConversationCameraPose pose = WorldConversationPoseFromCameraMark(stage, spec, -frameYaw);
       if (pose == null) return null;
       pose.Position = Vector3.TransformCoordinate(here + offset, stage.World);
+      // The game frames an AUTO camera on whoever is in the shot: its height follows the actors' own camera bones.
+      ApplyWorldConversationAutoCameraHeight(stage, spec, pose, here, away,
+        WorldConversationMarkActor(staging, toName), WorldConversationMarkActor(staging, fromName));
       return pose;
+    }
+
+    // ---- Camera height correction for AUTO cameras (port of Jedipedia cnvPreview.js viewerCnvAdjustAutoPose) --------
+    //
+    // The game applies a per-body-type height correction to an AUTO camera and to nothing else (an authored CAM mark is
+    // left exactly where the designer put it). stgCameraOffsetsPrototype maps body type -> shot category -> Vector3; the
+    // row's y is minus the height the shot was framed at, and stgStage.GetCharacterCameraOffset adds the height of the
+    // actor's own `Camera` bone above its mark. What comes out is how much taller/shorter THIS character is than the
+    // body the shot was authored for. Body types without a row take the default rise below.
+    //
+    // Only the y of a row is applied (taken along the camera's own up axis). The two rows that also carry x/z
+    // (astromech, hutt) are NOT applied horizontally yet -- the sign of the camera's right axis in this renderer's
+    // handedness has not been verified, and a wrong sign would be worse than none.
+    private const string WorldConversationCameraOffsetsNode = "stgCameraOffsetsPrototype";
+    private const string WorldConversationCameraOffsetsField = "4611686061669731191";
+    private const string WorldConversationCameraCategoryField = "4611686026015590038";
+    private const float WorldConversationCameraRiseDefault = -0.18611453f;
+
+    // Who stands on one of the staging's marks: the body a shot is framed on, rather than the spot it is framed at.
+    private WorldNpcPlacement WorldConversationMarkActor(WorldConversationStagingInfo staging, string markName) {
+      if (staging == null || String.IsNullOrWhiteSpace(markName)) return null;
+      if (staging.Player != null && String.Equals(staging.Player.Mark, markName, StringComparison.OrdinalIgnoreCase))
+        return worldConversationPlayerNpc;
+      foreach (KeyValuePair<ulong, WorldConversationStageMarkRef> pair in staging.Speakers)
+        if (pair.Value != null && String.Equals(pair.Value.Mark, markName, StringComparison.OrdinalIgnoreCase))
+          return FindWorldConversationSpeakerPlacement(pair.Key);
+      return null;
+    }
+
+    private object LoadWorldConversationCameraOffsets() {
+      EnsureWorldConversationCinematicCaches();
+      if (worldConversationCameraOffsetsLoaded) return worldConversationCameraOffsets;
+      worldConversationCameraOffsetsLoaded = true;
+      try {
+        GomObjectData node = WorldResolveGomObject(WorldConversationCameraOffsetsNode)?.Data;
+        worldConversationCameraOffsets = WorldInteractionDataValue(node, null, WorldConversationCameraOffsetsField);
+      } catch { worldConversationCameraOffsets = null; }
+      return worldConversationCameraOffsets;
+    }
+
+    private static object WorldConversationMapValue(object map, string key) {
+      foreach (KeyValuePair<object, object> pair in WorldConversationMapEntries(map))
+        if (String.Equals(pair.Key?.ToString(), key, StringComparison.OrdinalIgnoreCase)) return pair.Value;
+      return null;
+    }
+
+    // GetCharacterCameraOffset for one actor, along the camera's up axis. `rise` is how far the actor's Camera bone
+    // stands above the mark it is on; it travels with the offset because the shoulder and two-shot compare two actors.
+    private bool TryGetWorldConversationCameraOffset(WorldNpcPlacement actor, float markWorldY, string category, Vector3 up,
+        out Vector3 at, out float rise) {
+      at = Vector3.Zero; rise = 0f;
+      if (actor == null || panelRender == null || !panelRender.TryGetWorldConversationActorCameraRise(actor, markWorldY, out rise)) return false;
+      float rowY = WorldConversationCameraRiseDefault;
+      object rows = WorldConversationMapValue(LoadWorldConversationCameraOffsets(), actor.BodyType ?? String.Empty);
+      object row = rows != null && !(rows is string) ? WorldConversationMapValue(rows, category) : null;
+      if (row != null) rowY = SpnDynVector3(row, new Vector3(0f, WorldConversationCameraRiseDefault, 0f)).Y;
+      at = up * (rowY + rise);
+      return IsFiniteVector(at);
+    }
+
+    private static bool WorldConversationCameraUp(Vector3 look, out Vector3 up) {
+      up = Vector3.UnitY;
+      if (look.LengthSquared() < .000001f) return false;
+      look.Normalize();
+      // The camera never rolls, so its up axis is the world's up taken square to the view direction.
+      up = Vector3.UnitY - look * Vector3.Dot(Vector3.UnitY, look);
+      if (up.LengthSquared() < .000001f) return false;
+      up.Normalize();
+      return true;
+    }
+
+    // A mark's authored pitch is positive looking UP (Look is the negated view direction, so Look.Y = -sin(pitch)).
+    // Jedipedia keeps the viewer's pitch, positive downwards, and subtracts the correction from it; that is this
+    // adding it to the authored one: an actor taller than the shot was framed for tilts the camera up to them.
+    private static void WorldConversationRaisePitch(WorldConversationCameraPose pose, float delta) {
+      if (!Single.IsFinite(delta) || pose.Look.LengthSquared() < .000001f) return;
+      Vector3 look = pose.Look; look.Normalize();
+      float pitch = -(float)Math.Asin(Math.Max(-1f, Math.Min(1f, look.Y))) + delta;
+      float yaw = (float)Math.Atan2(look.X, look.Z), cp = (float)Math.Cos(pitch);
+      pose.Look = new Vector3((float)Math.Sin(yaw) * cp, -(float)Math.Sin(pitch), (float)Math.Cos(yaw) * cp);
+      pose.Look.Normalize();
+    }
+
+    // utlMath:IntersectVectorExtentPlane -- the vector along `ray` to the plane through `point` with `normal`.
+    private static Vector3 WorldConversationIntersectRay(Vector3 ray, Vector3 normal, Vector3 point) {
+      float along = Vector3.Dot(ray, normal);
+      return along != 0f ? ray * (Vector3.Dot(point, normal) / along) : Vector3.Zero;
+    }
+
+    private void ApplyWorldConversationAutoCameraHeight(WorldConversationStageContext stage, GomObjectData spec, WorldConversationCameraPose pose,
+        Vector3 subjectLocal, Vector3 otherLocal, WorldNpcPlacement subjectActor, WorldNpcPlacement otherActor) {
+      if (stage == null || spec == null || pose == null || subjectActor == null) return;
+      string category = (WorldInteractionText(WorldInteractionDataValue(spec, "stgCameraCategory", WorldConversationCameraCategoryField)) ?? String.Empty).Trim().ToUpperInvariant();
+      if (category.Length == 0 || !WorldConversationCameraUp(pose.Look, out Vector3 up)) return;
+      // Each actor's height is measured from the mark it stands on; the shot's own geometry on the staging's floor
+      // (GetAdjustedCameraParameters zeroes a mark's y for an AUTO camera).
+      float subjectY = Vector3.TransformCoordinate(subjectLocal, stage.World).Y;
+      float otherY = Vector3.TransformCoordinate(otherLocal, stage.World).Y;
+      if (!TryGetWorldConversationCameraOffset(subjectActor, subjectY, category, up, out Vector3 at, out float rise)) return;
+      bool haveOther = TryGetWorldConversationCameraOffset(otherActor, otherY, category, up, out Vector3 otherAt, out float otherRise);
+      Vector3 subjectFlat = Vector3.TransformCoordinate(new Vector3(subjectLocal.X, 0f, subjectLocal.Z), stage.World);
+      Vector3 otherFlat = Vector3.TransformCoordinate(new Vector3(otherLocal.X, 0f, otherLocal.Z), stage.World);
+      if (category == "OVER_THE_SHOULDER") { if (haveOther) AdjustWorldConversationShoulder(pose, subjectFlat, otherFlat, at, otherAt, rise, otherRise); return; }
+      if (category == "TWO_SHOT") { if (haveOther) AdjustWorldConversationTwoShot(pose, subjectFlat, otherFlat, at.Y, otherAt.Y); return; }
+      pose.Position += at;
+      WorldConversationDiagnosticFileWrite("CNV camera height: " + category + " body=" + (subjectActor.BodyType ?? "?") +
+        " rise=" + rise.ToString("0.0000", CultureInfo.InvariantCulture) + " at=" + at.X.ToString("0.0000", CultureInfo.InvariantCulture) +
+        "," + at.Y.ToString("0.0000", CultureInfo.InvariantCulture) + "," + at.Z.ToString("0.0000", CultureInfo.InvariantCulture));
+    }
+
+    // The over-the-shoulder shot does not move with the subject: the camera's own axis is followed out to each actor's
+    // plane, both hit points are raised by that actor's own correction, and the camera slides along the line between
+    // them back to the plane it started on, then pitches along the line joining the two eyelines.
+    private static void AdjustWorldConversationShoulder(WorldConversationCameraPose pose, Vector3 subject, Vector3 other,
+        Vector3 subjectAt, Vector3 otherAt, float rise, float otherRise) {
+      Vector3 normal = subject - other;
+      float span = normal.Length();
+      if (!(span > .000001f)) return;
+      normal /= span;
+      Vector3 origin = pose.Position;
+      Vector3 forward = pose.Look; forward.Normalize(); // the line is what matters here, so the sign of Look does not
+      if (Vector3.Dot(forward, normal) == 0f) return;
+      Vector3 toSubject = origin + WorldConversationIntersectRay(forward, normal, subject - origin) + subjectAt;
+      Vector3 toOther = origin + WorldConversationIntersectRay(forward, normal, other - origin) + otherAt;
+      Vector3 line = toSubject - toOther;
+      if (Vector3.Dot(line, normal) == 0f) return;
+      pose.Position = toOther + WorldConversationIntersectRay(line, normal, origin - toOther);
+      WorldConversationRaisePitch(pose, (float)Math.Atan2(rise - otherRise, span));
+    }
+
+    // The two-shot holds both actors at once, so it does not move: it opens the field of view by as much as the two
+    // heights disagree and pitches to the middle of them.
+    private static void AdjustWorldConversationTwoShot(WorldConversationCameraPose pose, Vector3 subject, Vector3 other,
+        float subjectRaise, float otherRaise) {
+      if (!pose.Fov.HasValue || !(pose.Fov.Value > 0f)) return;
+      Vector3 origin = pose.Position;
+      float tan = (float)Math.Tan(pose.Fov.Value / 2f);
+      Func<float, Vector3, float> subtend = (raise, mark) => {
+        float flat = (float)Math.Sqrt((origin.X - mark.X) * (origin.X - mark.X) + (origin.Z - mark.Z) * (origin.Z - mark.Z));
+        return flat > 0f ? (float)Math.Atan2(raise, (tan * tan + raise * tan / flat + 1f) * flat) : 0f;
+      };
+      float high = subtend(subjectRaise, subject), low = subtend(otherRaise, other);
+      pose.Fov = pose.Fov.Value + Math.Abs(high - low);
+      WorldConversationRaisePitch(pose, (high + low) / 2f);
     }
 
     private WorldConversationCameraPose WorldConversationPoseFromCameraMark(WorldConversationStageContext stage, GomObjectData mark, float extraYaw) {
@@ -750,7 +996,17 @@ namespace PugTools {
       Vector3 look = new Vector3((float)Math.Sin(yaw) * cp, -sp, (float)Math.Cos(yaw) * cp);
       if (!IsFiniteVector(look) || look.LengthSquared() < .000001f) return null;
       look.Normalize();
-      float fovDegrees = SpnDynNumber(WorldInteractionDataValue(mark, "stgCameraFov", "4611686025915590054"), Single.NaN);
+      float fovDegrees = SpnDynNumber(WorldInteractionDataValue(mark, "stgCameraFOV", "4611686025915590054") ?? WorldInteractionDataValue(mark, "stgCameraFov", null), Single.NaN);
+      if (Single.IsNaN(fovDegrees)) {
+        // Authored camera marks carry a field of view of 18.5-30 degrees; a camera without one falls back on the
+        // viewer's own, much wider, which changes the whole framing. Record what the mark does hold.
+        var held = new System.Text.StringBuilder();
+        foreach (KeyValuePair<string, object> kv in mark.Dictionary) {
+          string text = kv.Value == null ? "null" : kv.Value.ToString();
+          held.Append(kv.Key).Append('=').Append(text.Length > 40 ? text.Substring(0, 40) : text).Append("; ");
+        }
+        WorldConversationDiagnosticFileWrite("CNV camera mark without fov: " + held);
+      }
       return new WorldConversationCameraPose {
         Position = Vector3.TransformCoordinate(local, stage.World),
         Look = look,
@@ -880,6 +1136,8 @@ namespace PugTools {
       worldConversationCinematicCacheDom = currentDom;
       worldConversationStageCache.Clear();
       worldConversationAutoCameraCache.Clear();
+      worldConversationCameraOffsets = null;
+      worldConversationCameraOffsetsLoaded = false;
     }
 
     private static string NormalizeWorldConversationStageAsset(AreaAsset asset) {

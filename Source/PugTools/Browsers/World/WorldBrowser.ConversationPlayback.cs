@@ -90,6 +90,7 @@ namespace PugTools {
       worldConversationOriginCameraPosition = panelRender != null ? panelRender.CurrentCameraPosition : (Vector3?)null;
       worldConversationPrimaryStandInFqn = null;
       worldConversationPlaybackConversation = conversation;
+      ResetWorldConversationGraph(conversation);
       worldConversationPlaybackForm.Text = "Conversation — " + (conversation.Fqn ?? "(unnamed)");
       worldConversationPlaybackStatus.Text = "Preparing conversation…";
       if (!worldConversationPlaybackForm.Visible) worldConversationPlaybackForm.Show(this);
@@ -145,7 +146,7 @@ namespace PugTools {
         ShowInTaskbar = false,
         StartPosition = FormStartPosition.CenterParent,
         MinimumSize = new Size(560, 300),
-        Size = new Size(760, 430),
+        Size = new Size(760, 620),
         BackColor = Color.FromArgb(13, 24, 29)
       };
       worldConversationPlaybackSpeaker = new Label {
@@ -173,6 +174,8 @@ namespace PugTools {
       var close = WorldDarkActionButton("Close", 92);
       var stop = WorldDarkActionButton("Stop", 92);
       var tree = WorldDarkActionButton("Show tree", 104);
+      worldConversationGraphToggle = WorldDarkActionButton(worldConversationGraphVisible ? "Hide graph" : "Show graph", 104);
+      worldConversationGraphToggle.Click += (_, __) => ToggleWorldConversationGraph();
       worldConversationPlaybackNext = WorldDarkActionButton("Next", 92);
       close.Click += (_, __) => { StopWorldConversationPlayback(true); worldConversationPlaybackForm.Hide(); };
       stop.Click += (_, __) => StopWorldConversationPlayback(false);
@@ -183,12 +186,14 @@ namespace PugTools {
         ShowWorldConversationPreview(worldConversationPlaybackConversation, false);
       };
       worldConversationPlaybackNext.Click += (_, __) => ContinueWorldConversationAfterLine();
-      buttons.Controls.Add(close); buttons.Controls.Add(stop); buttons.Controls.Add(tree); buttons.Controls.Add(worldConversationPlaybackNext);
+      buttons.Controls.Add(close); buttons.Controls.Add(stop); buttons.Controls.Add(tree); buttons.Controls.Add(worldConversationGraphToggle); buttons.Controls.Add(worldConversationPlaybackNext);
 
       worldConversationPlaybackForm.Controls.Add(worldConversationPlaybackText);
       worldConversationPlaybackForm.Controls.Add(worldConversationPlaybackChoices);
       worldConversationPlaybackForm.Controls.Add(worldConversationPlaybackStatus);
       worldConversationPlaybackForm.Controls.Add(buttons);
+      // Added before the speaker line so that it docks under it, above the text.
+      worldConversationPlaybackForm.Controls.Add(BuildWorldConversationGraphHost());
       worldConversationPlaybackForm.Controls.Add(worldConversationPlaybackSpeaker);
       worldConversationPlaybackForm.FormClosing += (_, e) => {
         if (_closing) return;
@@ -204,6 +209,7 @@ namespace PugTools {
         worldConversationPlaybackText = null;
         worldConversationPlaybackChoices = null;
         worldConversationPlaybackNext = null;
+        worldConversationGraphHost = null; worldConversationGraphView = null; worldConversationGraphCaption = null; worldConversationGraphToggle = null;
       };
     }
 
@@ -222,6 +228,7 @@ namespace PugTools {
       ClearWorldConversationFaceFx();
       ClearWorldConversationAnimations();
       worldConversationPlaybackNode = node;
+      worldConversationGraphView?.SetCurrent(nodeId);
       worldConversationPlaybackChoices.Controls.Clear();
       worldConversationPlaybackChoices.Height = 112;
       worldConversationPlaybackNext.Enabled = false;
@@ -578,6 +585,7 @@ namespace PugTools {
       worldConversationVfxAnchors.Clear();
       worldConversationPrimaryStandInFqn = null;
       worldConversationPlaybackNode = null;
+      worldConversationGraphView?.ClearCurrent();
       if (worldConversationPlaybackChoices != null) worldConversationPlaybackChoices.Controls.Clear();
       if (worldConversationPlaybackNext != null) worldConversationPlaybackNext.Enabled = false;
       if (clearConversation) {
@@ -667,10 +675,7 @@ namespace PugTools {
       }
       WorldNpcPlacement placement = FindWorldConversationActorPlacement(fqn);
       if (placement != null) return placement;
-      if (worldConversationPrimaryNpc != null && !String.IsNullOrWhiteSpace(fqn)) {
-        if (String.IsNullOrWhiteSpace(worldConversationPrimaryStandInFqn)) worldConversationPrimaryStandInFqn = fqn.Trim();
-        if (String.Equals(worldConversationPrimaryStandInFqn, fqn.Trim(), StringComparison.OrdinalIgnoreCase)) return worldConversationPrimaryNpc;
-      }
+      if (WorldConversationMayStandInForPrimary(fqn)) return worldConversationPrimaryNpc;
       return EnsureWorldConversationCastPlacement(fqn);
     }
 

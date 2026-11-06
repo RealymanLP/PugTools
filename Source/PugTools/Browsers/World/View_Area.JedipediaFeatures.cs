@@ -14,6 +14,23 @@ using Buffer = SlimDX.Direct3D11.Buffer;
 
 namespace PugTools {
   internal sealed partial class View_AREA {
+    // View_AREA is a different class from WorldBrowser, so it needs its own
+    // file logger for the renderer-side diagnostics.
+    private static readonly object worldConversationRenderDiagnosticLock = new object();
+    private static void WorldConversationDiagnosticFileWrite(string line) {
+      if (String.IsNullOrWhiteSpace(line)) return;
+      lock (worldConversationRenderDiagnosticLock) {
+        try {
+          string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+          string path = !String.IsNullOrWhiteSpace(local)
+            ? System.IO.Path.Combine(local, "PugTools", "PugTools-Yalt-Debug.log")
+            : System.IO.Path.Combine(System.IO.Path.GetTempPath(), "PugTools-Yalt-Debug.log");
+          string directory = System.IO.Path.GetDirectoryName(path);
+          if (!String.IsNullOrWhiteSpace(directory)) System.IO.Directory.CreateDirectory(directory);
+          System.IO.File.AppendAllText(path, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff", System.Globalization.CultureInfo.InvariantCulture) + " " + line + Environment.NewLine);
+        } catch { }
+      }
+    }
     private sealed class UtilityRenderEntry {
       public Room Room;
       public AssetInstance Instance;
@@ -178,6 +195,7 @@ namespace PugTools {
     // enumerates; the UI/player thread can replace it atomically as cast members are added.
     private volatile WorldNpcPlacement worldConversationVirtualPlayer;
     private volatile WorldNpcPlacement[] worldConversationVirtualActors = Array.Empty<WorldNpcPlacement>();
+    private int worldConversationRenderDiagnosticTick;
     private readonly object worldConversationVirtualActorLock = new object();
     private readonly HashSet<WorldNpcPlacement> worldConversationVirtualActorSet = new HashSet<WorldNpcPlacement>();
     private readonly List<WorldNpcPlacement> worldConversationVirtualResources = new List<WorldNpcPlacement>();
@@ -392,6 +410,7 @@ namespace PugTools {
         }
         worldConversationVirtualActors = worldConversationVirtualActorSet.ToArray();
       }
+      WorldConversationDiagnosticFileWrite("render-actor-register kind=player name='" + (placement?.Name ?? "") + "' fqn='" + (placement?.SourceFqn ?? "") + "' models=" + (placement?.Models?.Count ?? 0));
       // Its GR2s are prepared lazily by DrawModel/TryDrawAnimatedNpcModel just like streamed population models.
       // No population snapshot or dPVS index mutation is necessary.
     }
@@ -403,6 +422,7 @@ namespace PugTools {
         if (!worldConversationVirtualResources.Contains(placement)) worldConversationVirtualResources.Add(placement);
         worldConversationVirtualActors = worldConversationVirtualActorSet.ToArray();
       }
+      WorldConversationDiagnosticFileWrite("render-actor-register kind=virtual name='" + (placement.Name ?? "") + "' fqn='" + (placement.SourceFqn ?? "") + "' models=" + (placement.Models?.Count ?? 0) + " room=" + (placement.Room?.ToString() ?? "<null>"));
     }
 
     internal void ClearWorldConversationVirtualActors() {
@@ -411,6 +431,7 @@ namespace PugTools {
         worldConversationVirtualActors = Array.Empty<WorldNpcPlacement>();
         worldConversationVirtualPlayer = null;
       }
+      WorldConversationDiagnosticFileWrite("render-actor-clear");
       // GPU resources stay in worldConversationVirtualResources until the AREA changes. Releasing them immediately
       // from the WinForms playback thread can race an in-flight D3D draw; the existing area teardown owns disposal.
     }
@@ -971,8 +992,11 @@ namespace PugTools {
     }
 
     private static bool NpcLayerVisible(WorldNpcPlacement placement, WorldRenderSettings s) {
+      // Conversation-staged authored NPCs must remain visible even when the general NPC layer is disabled.
+      // ConversationWorld is set only while the conversation preview owns/stages this placement.
+      bool conversationActor = placement?.ConversationVirtual == true || placement?.ConversationWorld.HasValue == true;
       return placement?.ConversationHidden != true && placement?.ConversationUnplaced != true && s != null &&
-        (placement?.ConversationVirtual == true || s.ShowNpcs || (s.ShowTaxiTerminals && IsTaxiNpc(placement)));
+        (conversationActor || s.ShowNpcs || (s.ShowTaxiTerminals && IsTaxiNpc(placement)));
     }
 
     private bool NpcVisibleForWork(Vector3 position) {
@@ -985,33 +1009,53 @@ namespace PugTools {
 
     private void DrawJedipediaNpcs(Matrix vp, HashSet<string> visible, WorldRenderSettings s, AreaEnvironmentScheme cameraEnv, bool sceneShadows) {
       bool haveVirtualActors = HasWorldConversationVirtualActors;
-      if ((!s.ShowNpcs && !s.ShowTaxiTerminals && !haveVirtualActors) ||
+      bool haveStagedAuthoredActors = false;
+      if (npcPlacements != null) {
+        // Snapshot before inspecting the collection: streaming can update the population while the render thread runs.
+        foreach (WorldNpcPlacement candidate in npcPlacements.ToArray()) {
+          if (candidate?.ConversationWorld.HasValue == true && candidate.ConversationHidden != true && candidate.ConversationUnplaced != true) {
+            haveStagedAuthoredActors = true;
+            break;
+          }
+        }
+      }
+      if ((!s.ShowNpcs && !s.ShowTaxiTerminals && !haveVirtualActors && !haveStagedAuthoredActors) ||
           ((npcPlacements == null || npcPlacements.Count == 0) && !haveVirtualActors)) return;
       EnsureNpcGeometryPrepared();
+      int diagnosticTick = ++worldConversationRenderDiagnosticTick;
+      bool traceConversationActors = diagnosticTick % 30 == 0;
       Room activeRoom = null;
       foreach (WorldNpcPlacement placement in NearbyNpcPlacements(NpcMaxRenderDistance)) {
-        if (!NpcLayerVisible(placement, s)) continue;
+        bool isConversationActor = placement != null && (placement.ConversationVirtual || placement.ConversationWorld.HasValue || placement.ConversationAnimation != null);
+        bool traceActor = traceConversationActors && isConversationActor;
+        if (traceActor) WorldConversationDiagnosticFileWrite("render-actor-check name='" + (placement.Name ?? "") + "' fqn='" + (placement.SourceFqn ?? "") + "' virtual=" + placement.ConversationVirtual + " staged=" + placement.ConversationWorld.HasValue + " hidden=" + placement.ConversationHidden + " unplaced=" + placement.ConversationUnplaced + " instance=" + (placement.Instance != null) + " room=" + (placement.Room != null) + " models=" + (placement.Models?.Count ?? 0) + " clip=" + (placement.ConversationAnimation?.Animation != null) + " layer=" + (s?.ShowNpcs.ToString() ?? "<null>"));
+        if (!NpcLayerVisible(placement, s)) { if (traceActor) WorldConversationDiagnosticFileWrite("render-actor-reject reason=NpcLayerVisible"); continue; }
         bool virtualActor = placement?.ConversationVirtual == true;
-        if (placement == null || (!virtualActor && placement.Instance == null) || placement.Room == null || placement.Models == null) continue;
-        if (!SpnVariantActive(placement.VariantIndex, placement.VariantCount, placement.SpawnPoints)) continue;
+        if (placement == null || (!virtualActor && placement.Instance == null) || placement.Room == null || placement.Models == null) { if (traceActor) WorldConversationDiagnosticFileWrite("render-actor-reject reason=missing-placement-instance-room-or-models"); continue; }
+        if (!SpnVariantActive(placement.VariantIndex, placement.VariantCount, placement.SpawnPoints)) { if (traceActor) WorldConversationDiagnosticFileWrite("render-actor-reject reason=inactive-variant"); continue; }
         bool hasSpawnMotion = placement.SpawnPoints != null && placement.SpawnPoints.Count > 0;
         // A conversation player is not an AREA instance at all. Its stage mark is already in world space, so the
         // static room/phase gates would incorrectly discard it. Authored NPCs retain the normal dPVS checks.
-        if (!virtualActor && !hasSpawnMotion && !InstanceRoomVisible(placement.Instance, placement.Room, visible)) continue;
-        if (!virtualActor && !InstanceVisibleInWorld(placement.Instance, s)) continue;
+        if (!virtualActor && !hasSpawnMotion && !InstanceRoomVisible(placement.Instance, placement.Room, visible)) { if (traceActor) WorldConversationDiagnosticFileWrite("render-actor-reject reason=InstanceRoomVisible"); continue; }
+        if (!virtualActor && !InstanceVisibleInWorld(placement.Instance, s)) { if (traceActor) WorldConversationDiagnosticFileWrite("render-actor-reject reason=InstanceVisibleInWorld"); continue; }
 
         Matrix baseWorld = NpcPlacementBaseWorld(placement);
         Vector3 rootPosition = new Vector3(baseWorld.M41, baseWorld.M42, baseWorld.M43);
         // This test intentionally happens before animation sampling/CPU skinning. On population-heavy hubs that is
         // the expensive work Jedipedia avoids for the hundreds of characters that are far away or off screen.
-        if (s.Mode != WorldRenderMode.Map && !NpcVisibleForWork(rootPosition)) continue;
+        if (s.Mode != WorldRenderMode.Map && !isConversationActor && !NpcVisibleForWork(rootPosition)) { if (traceActor) WorldConversationDiagnosticFileWrite("render-actor-reject reason=distance-or-frustum position=" + rootPosition); continue; }
 
         // Query result comes from the previous stable depth frame, so hidden NPCs can be skipped before the
         // comparatively expensive animation sampling/CPU skinning work.
         Matrix npcWorld = Matrix.RotationY((float)Math.PI) * baseWorld;
         bool haveReceiver = TryWorldModelsSphere(placement.Models, npcWorld, out Vector3 receiverCenter, out float receiverRadius);
-        if (s.Mode == WorldRenderMode.Map && haveReceiver && !MapSphereVisible(receiverCenter, receiverRadius)) continue;
-        if (haveReceiver && !DynamicReceiverVisibleByOcclusion(placement, receiverCenter, receiverRadius)) continue;
+        if (s.Mode == WorldRenderMode.Map && haveReceiver && !MapSphereVisible(receiverCenter, receiverRadius)) { if (traceActor) WorldConversationDiagnosticFileWrite("render-actor-reject reason=MapSphereVisible"); continue; }
+        // Conversation actors can move substantially away from the bind-pose GR2 bounds during a cinematic
+        // animation. Until the animated bone envelope is available in this renderer, a stale depth-frame
+        // occlusion result must not hide the actor using that bind-pose sphere. Jedipedia computes a per-pose
+        // animated bounds envelope; this conservative bypass preserves ordinary NPC occlusion while keeping
+        // staged/animated conversation actors visible.
+        if (haveReceiver && !isConversationActor && !DynamicReceiverVisibleByOcclusion(placement, receiverCenter, receiverRadius)) { if (traceActor) WorldConversationDiagnosticFileWrite("render-actor-reject reason=DynamicReceiverVisibleByOcclusion"); continue; }
 
         if (!ReferenceEquals(activeRoom, placement.Room)) {
           ApplyRoomEnvironment(placement.Room, cameraEnv, s, sceneShadows);
@@ -1048,9 +1092,13 @@ namespace PugTools {
           placement.OverheadIconLocalFrame = NpcBindOverheadIconFrame(placement);
         }
 
+        if (traceActor) WorldConversationDiagnosticFileWrite("render-actor-draw name='" + (placement.Name ?? "") + "' models=" + placement.Models.Count + " animate=" + animate + " clip='" + (activeClip?.DisplayName ?? "") + "' time=" + animationTime.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture) + " receiver=" + haveReceiver);
         foreach (GR2 model in placement.Models) {
-          if (!animate || !TryDrawAnimatedNpcModel(model, npcWorld, vp, s, activeClip, animationTime, placement))
+          bool animatedDrawn = animate && TryDrawAnimatedNpcModel(model, npcWorld, vp, s, activeClip, animationTime, placement);
+          if (!animatedDrawn) {
+            if (traceActor && animate) WorldConversationDiagnosticFileWrite("render-actor-static-fallback name='" + (placement.Name ?? "") + "' reason='animated-pass-submitted-no-body-pieces-or-palette-unavailable'");
             DrawModel(model, npcWorld, vp, s, false, null);
+          }
         }
         DrawNpcWeapons(placement, npcWorld, vp, s, activeClip, animationTime, animate);
         if (!placement.NameplateLocal.HasValue) placement.NameplateLocal = NpcBindNameplateLocal(placement);
@@ -1303,8 +1351,10 @@ namespace PugTools {
         Matrix? frame = NpcOverheadIconFrameFromSkin(state);
         if (frame.HasValue) nameplatePlacement.OverheadIconLocalFrame = frame.Value;
       }
-      DrawNpcModelWithSkinBuffers(model, state, world, vp, s, blueGlow);
-      return true;
+      // A valid rig/palette does not guarantee that any mesh survived LOD, buffer binding and
+      // material filtering. Only claim the animated path handled this model when it submitted
+      // at least one body piece; otherwise the caller must use DrawModel's static fallback.
+      return DrawNpcModelWithSkinBuffers(model, state, world, vp, s, blueGlow);
     }
 
     private void DrawNpcWeapons(WorldNpcPlacement placement, Matrix npcWorld, Matrix vp, WorldRenderSettings s,
@@ -1820,9 +1870,10 @@ namespace PugTools {
       return true;
     }
 
-    private void DrawNpcModelWithSkinBuffers(GR2 model, NpcSkinState state, Matrix world, Matrix vp, WorldRenderSettings s, bool blueGlow = false) {
-      if(model==null)return;
+    private bool DrawNpcModelWithSkinBuffers(GR2 model, NpcSkinState state, Matrix world, Matrix vp, WorldRenderSettings s, bool blueGlow = false) {
+      if(model==null)return false;
       int selectedLod=SelectModelLodLevel(model,world,s.Mode==WorldRenderMode.Map);
+      int submittedPieces=0;
       fx.SetWorld(world);fx.SetViewProj(vp);fx.SetPlaceableBlueGlow(blueGlow&&s.Mode!=WorldRenderMode.Map);
       try {
         foreach(GR2_Mesh mesh in model.meshes) {
@@ -1834,14 +1885,19 @@ namespace PugTools {
             fx.SetMaterial(mat);
             (gpuSkinned?PickSkinnedModelTech(s,mat):PickModelTech(s,mat,false)).GetPassByIndex(0).Apply(ImmediateContext);
             ImmediateContext.DrawIndexed((int)piece.numPieceFaces*3,(int)piece.startIndex*3,0);
+            submittedPieces++;
           }
         }
-        if(HasLocalLightOverflow)DrawNpcModelLocalLightOverflow(model,state,world,vp,s,selectedLod);
+        if(submittedPieces>0&&HasLocalLightOverflow)DrawNpcModelLocalLightOverflow(model,state,world,vp,s,selectedLod);
       } finally { ImmediateContext.InputAssembler.InputLayout=inputLayout; }
 
+      // Do not consume attached models on a failed/empty animated body pass: DrawModel() must get the
+      // whole model tree in that case, including attachments.
+      if(submittedPieces<=0)return false;
       // Slot-attached GR2s currently have their attachment transform baked into their static vertex buffer by the
       // world geometry builder. Keep drawing those through the proven static path until bone-bound equipment is ported.
       foreach(GR2 attached in model.attachedModels)DrawModel(attached,world,vp,s,false,null,-1,blueGlow);
+      return true;
     }
 
     private void DrawNpcModelLocalLightOverflow(GR2 model, NpcSkinState state, Matrix world, Matrix vp, WorldRenderSettings s, int selectedLod) {

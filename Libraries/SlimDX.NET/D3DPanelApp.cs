@@ -270,7 +270,21 @@ namespace SlimDXNet {
     public void Run() {
       Timer.Reset();
       Timer.FrameTime = 1.0f / 60.0f;
+      bool wasMinimized = false;
       while (_running) {
+        // Avoid running the full update/draw/present pipeline while the owning
+        // WinForms window is minimized. This saves CPU/GPU time for large world
+        // scenes, which otherwise continue rendering frames the user cannot see.
+        if (Window != null && Window.WindowState == FormWindowState.Minimized) {
+          wasMinimized = true;
+          Thread.Sleep(100);
+          continue;
+        }
+        if (wasMinimized) {
+          // Do not feed the long minimized interval into the next frame's delta.
+          Timer.Reset();
+          wasMinimized = false;
+        }
         Timer.Tick();
         if (!AppPaused && _running) {
           try {

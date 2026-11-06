@@ -95,6 +95,37 @@ namespace PugTools {
       }
     }
 
+    // How much higher an actor's `Camera` bone stands than the mark it is on, measured on the pose the actor is in right
+    // now (a kneeling or unconscious actor drops it by more than a metre) and on the bind pose where nothing is playing.
+    // Jedipedia: viewerCnvCameraRise. False where there is nothing to measure -- no body placed, no camera bone.
+    internal bool TryGetWorldConversationActorCameraRise(WorldNpcPlacement placement, float markWorldY, out float rise) {
+      rise = 0f;
+      if (placement == null || placement.ConversationUnplaced) return false;
+      WorldNpcAnimationClip clip = placement.ConversationAnimation ?? placement.Animation;
+      bool conversationClip = placement.ConversationAnimation != null;
+      bool animate = clip?.Animation != null;
+      float animationTime = 0f;
+      if (animate) {
+        float length = clip.Animation.Length;
+        float baseTime = conversationClip
+          ? Math.Max(0f, (elapsed - placement.ConversationAnimationStart) * Math.Max(.0001f, placement.ConversationAnimationSpeed) + placement.ConversationAnimationOffset)
+          : elapsed + placement.AnimationPhase * length;
+        if (conversationClip && !placement.ConversationAnimationLoop) animationTime = length > 0f ? Math.Min(baseTime, Math.Max(0f, length - .0001f)) : 0f;
+        else { animationTime = length > 0f ? baseTime % length : 0f; if (animationTime < 0f) animationTime += length; }
+      }
+      if (!TryNpcWeaponBoneFrame(placement, clip, animationTime, animate, "Camera", out Matrix frame)) return false;
+      Matrix npcWorld = Matrix.RotationY((float)Math.PI) * NpcPlacementBaseWorld(placement);
+      Vector3 world = Vector3.TransformCoordinate(new Vector3(frame.M41, frame.M42, frame.M43), npcWorld);
+      if (!IsFinite(world)) return false;
+      // Measured from the actor's own root, not from the mark: when the actor is on its mark they are the same number,
+      // and when staging did not move it (fallback anchors, stand-ins) the mark is somewhere else entirely and the
+      // difference would be a rise of hundreds of metres.
+      rise = world.Y - npcWorld.M42;
+      // A real camera bone stands within a few metres of its root (units here are 10 m). Anything else is a bad
+      // reading, and no correction is better than throwing the camera out of the area.
+      return Single.IsFinite(rise) && Math.Abs(rise) <= .6f;
+    }
+
     internal void SetWorldConversationActorHidden(WorldNpcPlacement placement, bool hidden) {
       if (placement == null) return;
       placement.ConversationHidden = hidden;
