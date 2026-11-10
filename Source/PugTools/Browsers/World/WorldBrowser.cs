@@ -78,7 +78,6 @@ namespace PugTools {
     private ToolStripDropDownButton btnWorldLayersMenu;
     private ToolStripDropDownButton btnWorldNavigationMenu;
     private ToolStripDropDownButton btnWorldToolsMenu;
-    private ToolStripDropDownButton btnWorldDialogsMenu;
     private ToolStripMenuItem btnWorldMiniMap;
     private ToolStripMenuItem btnWorldMapEntireArea;
     private ToolStripMenuItem btnWorldMapnoteNavigator;
@@ -910,14 +909,12 @@ namespace PugTools {
       btnWorldLayersMenu = new ToolStripDropDownButton("World") { DisplayStyle = ToolStripItemDisplayStyle.Text, ToolTipText = "World layers, population, authoring helpers and culling" };
       btnWorldNavigationMenu = new ToolStripDropDownButton("Navigation") { DisplayStyle = ToolStripItemDisplayStyle.Text, ToolTipText = "Walking, map navigation and saved views" };
       btnWorldToolsMenu = new ToolStripDropDownButton("Tools") { DisplayStyle = ToolStripItemDisplayStyle.Text, ToolTipText = "Inspection, diagnostics and screenshots" };
-      btnWorldDialogsMenu = new ToolStripDropDownButton("Dialogs") { DisplayStyle = ToolStripItemDisplayStyle.Text, ToolTipText = "Open World Browser dialogs directly from one list" };
       KeepCheckMenuOpen(btnWorldRenderMenu);
       KeepCheckMenuOpen(btnWorldLayersMenu);
       worldToolbar.Items.Add(btnWorldRenderMenu);
       worldToolbar.Items.Add(btnWorldLayersMenu);
       worldToolbar.Items.Add(btnWorldNavigationMenu);
       worldToolbar.Items.Add(btnWorldToolsMenu);
-      worldToolbar.Items.Add(btnWorldDialogsMenu);
 
       btnWorldRenderMenu.DropDownItems.Add(new ToolStripLabel("Mode:"));
       cmbWorldMode = new ToolStripComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 150 };
@@ -1253,30 +1250,6 @@ namespace PugTools {
       var shot = new ToolStripMenuItem("Screenshot");
       shot.Click += (_, __) => panelRender?.RequestScreenshot();
       btnWorldToolsMenu.DropDownItems.Add(shot);
-
-      // Keep this menu focused on conversation playback and conversation-specific inspection.
-      // General navigation, map notes, teleporting, codex and vendor tools live in their own menus.
-      var conversationDialog = new ToolStripMenuItem("Selected object: conversation tree…");
-      conversationDialog.Click += (_, __) => OpenSelectedWorldConversationPreview();
-      btnWorldDialogsMenu.DropDownItems.Add(conversationDialog);
-
-      var browseConversationsDialog = new ToolStripMenuItem("Browse area conversations…") {
-        ToolTipText = "Search conversations attached to NPCs in the loaded area and start one directly"
-      };
-      browseConversationsDialog.Click += (_, __) => ShowWorldConversationNavigator();
-      btnWorldDialogsMenu.DropDownItems.Add(browseConversationsDialog);
-
-      var playConversationDialog = new ToolStripMenuItem("Play target conversation…");
-      playConversationDialog.Click += (_, __) => StartWorldConversationPlayback(panelRender?.InteractionTargetWorldInteraction);
-      btnWorldDialogsMenu.DropDownItems.Add(playConversationDialog);
-
-      btnWorldDialogsMenu.DropDownOpening += (_, __) => {
-        WorldInteractionInfo selected = panelRender?.SelectedWorldInteraction;
-        WorldInteractionInfo target = panelRender?.InteractionTargetWorldInteraction;
-        conversationDialog.Enabled = CanOpenWorldConversation(selected);
-        browseConversationsDialog.Enabled = currentDom != null && worldNpcPlacements.Any(p => p?.Interaction?.HasConversation == true);
-        playConversationDialog.Enabled = CanOpenWorldConversation(target);
-      };
 
       splitContainer3.Panel1.Controls.Add(worldToolbar);
       worldToolbar.BringToFront();
@@ -3323,6 +3296,7 @@ namespace PugTools {
 
     private void InvalidateMiniMapSnapshot() {
       if (miniMapImage != null) { miniMapImage.Dispose(); miniMapImage = null; }
+      ClearMiniMapDetail();
       miniMapMinX = miniMapMaxX = miniMapMinZ = miniMapMaxZ = 0;
       miniMapZoom = 1f; miniMapCenterX = miniMapCenterZ = 0f; miniMapPanning = miniMapSuppressClick = false;
       if (miniMapPicture != null) miniMapPicture.Invalidate();
@@ -3345,6 +3319,7 @@ namespace PugTools {
       bool restoringFollowView = miniMapFollowRestoreView;
       miniMapImage?.Dispose();
       miniMapImage = bitmap;
+      ClearMiniMapDetail();
       miniMapFollowRefreshPending = false;
       // A forced full-extent refresh is attempted only once for the current page. A normal page/scope snapshot clears
       // the flag again, so malformed/incomplete area bounds cannot cause an endless render-refresh loop.
@@ -3528,6 +3503,8 @@ namespace PugTools {
       }
       RectangleF src = MiniMapSourceRectangle();
       DrawMiniMapBackingImage(e.Graphics, dst, src);
+      DrawMiniMapDetailImage(e.Graphics, dst);
+      TouchMiniMapDetail();
       if (panelRender == null || miniMapMaxX <= miniMapMinX || miniMapMaxZ <= miniMapMinZ) return;
       MiniMapVisibleWorldBounds(out float visibleMinX, out float visibleMaxX, out float visibleMinZ, out float visibleMaxZ);
 
@@ -4672,6 +4649,7 @@ namespace PugTools {
       worldOverlayTimer = null;
       miniMapImage?.Dispose();
       miniMapImage = null;
+      DisposeMiniMapDetail();
       foreach (Image image in worldMapIconImages.Values) image?.Dispose();
       worldMapIconImages.Clear();
       if (worldSelectionInfoForm != null && !worldSelectionInfoForm.IsDisposed) worldSelectionInfoForm.Dispose();

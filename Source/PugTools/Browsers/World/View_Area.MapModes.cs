@@ -175,6 +175,7 @@ namespace PugTools {
         // the generated world. This keeps terrain/rooms outside the SWTOR DDS visible in the small minimap as well.
         if (miniMapPreferOriginalArt && selected?.HasImage == true) ExpandMapExtentToIncludePage(selected);
       }
+      ApplyMiniMapDetailExtent();
       mapCenter = new Vector2((mapExtentMinX + mapExtentMaxX) * .5f, (mapExtentMinZ + mapExtentMaxZ) * .5f);
       mapZoom = 1f;
       UpdateMapCamera();
@@ -194,6 +195,7 @@ namespace PugTools {
     public void RequestMiniMapSnapshot(bool autoSelectScope, bool forceFullExtent) {
       miniMapCaptureUseAutoScope = autoSelectScope;
       miniMapCaptureForceFullExtent = forceFullExtent;
+      miniMapDetailRequested = false; // a main picture asked for later than a detail one replaces it
       miniMapCaptureRequested = true;
     }
 

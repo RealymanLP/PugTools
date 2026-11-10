@@ -1860,10 +1860,16 @@ namespace PugTools {
       }
       if(captureMiniMap){
         Bitmap snapshot=CaptureBackBufferBitmap();
+        bool detailCapture=miniMapCaptureIsDetail;int detailToken=miniMapDetailToken;
         if(snapshot!=null&&Window is WorldBrowser browser){
           snapshot=CropMiniMapToArea(snapshot,out float minX,out float maxX,out float minZ,out float maxZ);
-          browser.PostMiniMapSnapshot(snapshot,minX,maxX,minZ,maxZ);
-        } else snapshot?.Dispose();
+          if(detailCapture)browser.PostMiniMapDetailSnapshot(snapshot,minX,maxX,minZ,maxZ,detailToken);
+          else browser.PostMiniMapSnapshot(snapshot,minX,maxX,minZ,maxZ);
+        } else {
+          snapshot?.Dispose();
+          if(detailCapture&&Window is WorldBrowser failedBrowser)failedBrowser.PostMiniMapDetailSnapshot(null,0,0,0,0,detailToken);
+        }
+        FinishMiniMapDetailCapture();
         // Do not present the temporary top-down render. The next render iteration immediately draws the
         // normal camera again, so opening/refreshing the minimap never flashes a full-screen map.
         miniMapCaptureRendering=false;
@@ -5698,41 +5704,25 @@ namespace PugTools {
       if(model==null)return;modelGeometryPrepared.Remove(model);modelGeometryLastUseFrame.Remove(model);
       foreach(GR2 attached in model.attachedModels)ForgetPreparedModelGeometry(attached);
     }
-    // Some material/model dictionaries are populated by background streaming workers while the render thread trims
-    // residency. Dictionary enumerators are fail-fast, so a concurrent insert/clear must not terminate DrawScene.
-    // This is a best-effort snapshot: if the source changes during enumeration, keep the values collected so far.
-    private static TValue[] SnapshotDictionaryValues<TKey,TValue>(Dictionary<TKey,TValue> source){
-      if(source==null)return Array.Empty<TValue>();
-      var values=new List<TValue>();
-      try{
-        using(var enumerator=source.GetEnumerator()){
-          while(true){
-            bool moved;
-            try{moved=enumerator.MoveNext();}catch(InvalidOperationException){break;}
-            if(!moved)break;
-            try{values.Add(enumerator.Current.Value);}catch(InvalidOperationException){break;}
-          }
-        }
-      }catch(InvalidOperationException){}
-      return values.ToArray();
-    }
     private IEnumerable<GR2> WorldModelResidencyRoots(){
-      foreach(GR2 model in SnapshotDictionaryValues(models))if(model!=null)yield return model;
-      if(utilityMarkerModels!=null)foreach(GR2 model in SnapshotDictionaryValues(utilityMarkerModels))if(model!=null)yield return model;
-      // Collection snapshots keep maintenance observational instead of allowing browser refreshes to kill rendering.
+      foreach(GR2 model in models.Values)if(model!=null)yield return model;
+      if(utilityMarkerModels!=null)foreach(GR2 model in utilityMarkerModels.Values)if(model!=null)yield return model;
+      // Population data normally belongs exclusively to the render view, but keep this maintenance pass resilient to
+      // a browser-side refresh as well. List<T>.foreach is versioned and throws immediately when another thread
+      // clears/rebuilds the source list; small array snapshots make VRAM trimming observational instead of fatal.
       WorldNpcPlacement[] npcSnapshot=npcPlacements?.ToArray()??Array.Empty<WorldNpcPlacement>();
       foreach(WorldNpcPlacement placement in npcSnapshot){GR2[] placementModels=placement?.Models?.ToArray()??Array.Empty<GR2>();foreach(GR2 model in placementModels)if(model!=null)yield return model;}
       WorldSpnPlacement[] spnSnapshot=spnPlacements?.ToArray()??Array.Empty<WorldSpnPlacement>();
       foreach(WorldSpnPlacement placement in spnSnapshot){GR2[] placementModels=placement?.Models?.ToArray()??Array.Empty<GR2>();foreach(GR2 model in placementModels)if(model!=null)yield return model;}
-      foreach(GR2 model in SnapshotDictionaryValues(dynamicDetailMeshModels))if(model!=null)yield return model;
-      foreach(GR2 model in SnapshotDictionaryValues(strongholdHookModels))if(model!=null)yield return model;
+      foreach(GR2 model in dynamicDetailMeshModels.Values)if(model!=null)yield return model;
+      foreach(GR2 model in strongholdHookModels.Values)if(model!=null)yield return model;
       if(taxiRideVehicleModel!=null)yield return taxiRideVehicleModel;
     }
     private IEnumerable<GR2_Material> WorldMaterialResidencySet(){
       var seenMaterials=new HashSet<GR2_Material>();
-      foreach(GR2_Material material in SnapshotDictionaryValues(materials))if(material!=null&&seenMaterials.Add(material))yield return material;
-      foreach(GR2_Material material in SnapshotDictionaryValues(terrainMaterials))if(material!=null&&seenMaterials.Add(material))yield return material;
-      foreach(GR2_Material material in SnapshotDictionaryValues(dynamicDetailMaterials))if(material!=null&&seenMaterials.Add(material))yield return material;
+      foreach(GR2_Material material in materials.Values)if(material!=null&&seenMaterials.Add(material))yield return material;
+      foreach(GR2_Material material in terrainMaterials.Values)if(material!=null&&seenMaterials.Add(material))yield return material;
+      foreach(GR2_Material material in dynamicDetailMaterials.Values)if(material!=null&&seenMaterials.Add(material))yield return material;
 
       // Models loaded for population appearances can own per-NPC palette/complexion materials.  Walk attached
       // models as well, but de-duplicate both models and materials because attachments often intentionally share them.
