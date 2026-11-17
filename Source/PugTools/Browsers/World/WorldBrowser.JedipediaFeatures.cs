@@ -1947,7 +1947,17 @@ namespace PugTools {
             // duplicate WorldSpnFxPart for every state in which the row is visited.
             continue;
           }
-          if (!SpnDynRowVisible(rowStates, stateName)) continue;
+          if (!SpnDynRowVisible(rowStates, stateName)) {
+            // Not drawn in this state, but a scene can switch the piece on (`Set Dyn Piece Visible`): keep the recipe for
+            // building it, not the model. The captures are copies because the loop variables are shared across rows.
+            int recipeRow = rowIndex; GomObjectData recipeData = row; string recipeVisual = visual; bool recipeMag = isMag;
+            state.RowParts[recipeRow] = () => {
+              WorldNpcAnimationClip recipeAnimation = null;
+              GR2 recipeModel = recipeMag ? LoadSpnMag(recipeVisual, null, out recipeAnimation) : LoadSpnModel(recipeVisual);
+              return recipeModel == null ? null : new WorldSpnDynPart { Model = recipeModel, LocalMatrix = SpnDynLocalMatrix(recipeData), Animation = recipeAnimation, Row = recipeRow };
+            };
+            continue;
+          }
           GomObjectData selectedState = !String.IsNullOrWhiteSpace(stateName) && rowStates != null && rowStates.TryGetValue(stateName, out GomObjectData stateRow)
             ? stateRow : null;
           string action = selectedState == null ? null : CleanGomString(WorldInteractionDataValue(selectedState, "dynMagName", "4611686038108070003"));
@@ -1979,7 +1989,8 @@ namespace PugTools {
             Model = model,
             LocalMatrix = SpnDynLocalMatrix(row),
             Animation = animation,
-            BlueGlow = SpnDynRowBlueGlow(rowStates, stateName)
+            BlueGlow = SpnDynRowBlueGlow(rowStates, stateName),
+            Row = rowIndex
           });
         }
         template.States.Add(state);
@@ -2741,6 +2752,12 @@ namespace PugTools {
         if (String.IsNullOrWhiteSpace(modelPath) || !modelPath.EndsWith(".gr2", StringComparison.OrdinalIgnoreCase)) continue;
         GR2 model = LoadNpcPartModel(modelPath, slot, appearance, pair.Key, bodyType);
         if (model != null) {
+          // appSlotFace holds the helmets/masks/goggles a conversation can take off (`Hide Helmet`); the head under
+          // them is appSlotHead. Mark the model and its attachments before they are flattened into the placement.
+          if (String.Equals(pair.Key, "appSlotFace", StringComparison.OrdinalIgnoreCase)) {
+            WorldNpcHelmets.MarkModel(model);
+            if (model.attachedModels != null) foreach (GR2 attachedHelmetPart in model.attachedModels) WorldNpcHelmets.MarkModel(attachedHelmetPart);
+          }
           result.Add(model);
           // Attached appearance GR2s (hair, facial pieces, armour accessories, etc.) are real skinned NPP parts.
           // Drawing them recursively through DrawModel() leaves them in bind pose while the parent body animates,

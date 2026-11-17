@@ -589,6 +589,23 @@ namespace PugTools {
       return fallback;
     }
 
+    // Every name GetWorldAreaNodeDisplayName could show beside a world.areas.<id> node, joined for the search index.
+    private String GetWorldAreaNodeSearchNames(String id) {
+      if (String.IsNullOrWhiteSpace(id) || !id.StartsWith("world.areas.", StringComparison.OrdinalIgnoreCase)) return String.Empty;
+      String[] parts = id.Split('.');
+      if (parts.Length != 3 || !UInt64.TryParse(parts[2], out UInt64 areaId)) return String.Empty;
+      var names = new List<String>(3);
+      void Add(String value) {
+        if (String.IsNullOrWhiteSpace(value)) return;
+        value = value.Trim();
+        if (!names.Any(n => String.Equals(n, value, StringComparison.OrdinalIgnoreCase))) names.Add(value);
+      }
+      if (_worldAreaMapNames.TryGetValue(areaId, out String mapName)) Add(mapName);
+      if (_worldAreaInternalNames.TryGetValue(areaId, out String internalName)) Add(internalName);
+      if (WorldAreaCatalogDisplayNames.TryGetValue(areaId, out String catalogName)) Add(catalogName);
+      return String.Join(" ", names);
+    }
+
     private void BuildCompareNodeTree() {
       _assetDict = new Dictionary<String, NodeAsset>();
 
@@ -782,10 +799,13 @@ namespace PugTools {
         if (item == null) continue;
         GomObject obj = item.Obj;
 
-        String worldName = String.Empty;
+        // The name(s) written beside a world.areas.<id> node -- the localized map name, the installed area's own
+        // internal name, the bundled catalog's name -- are all searchable, not just the catalog's.
+        String worldName = GetWorldAreaNodeSearchNames(item.id);
         String worldComment = String.Empty;
         if (TryGetWorldAreaCatalogInfo(item.id, out WorldAreaCatalogEntry worldEntry)) {
-          worldName = worldEntry.InternalName;
+          if (!String.IsNullOrWhiteSpace(worldEntry.InternalName) && worldName.IndexOf(worldEntry.InternalName, StringComparison.OrdinalIgnoreCase) < 0)
+            worldName = (worldName + " " + worldEntry.InternalName).Trim();
           worldComment = worldEntry.Comment;
         }
         searchEntries.Add(new NodeSearchEntry(

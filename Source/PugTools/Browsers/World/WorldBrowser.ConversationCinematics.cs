@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Text.RegularExpressions;
 using FileFormats;
 using GomLib;
 using GomLib.Models;
@@ -156,6 +157,7 @@ namespace PugTools {
       if (stance == null) return;
       panelRender.SetWorldConversationAnimation(placement, stance, true);
       worldConversationAnimatedNpcs.Add(placement);
+      ApplyWorldConversationPostureWeapon(placement, "Normal");
     }
 
     private void ApplyWorldConversationCinematicAction(Conversation conversation, DialogNode node, WorldConversationCinematicAction action) {
@@ -181,11 +183,36 @@ namespace PugTools {
         return;
       }
 
-      bool vfxAction = String.Equals(kind, "Play VFX", StringComparison.OrdinalIgnoreCase) ||
+      // `Set Target` performs nothing: whom an actor is aiming at is not a pose, a mark or a look. It is remembered
+      // because the beat that later fires an effect between the two of them (`Play Targeted VFX`) names only the caster.
+      if (String.Equals(kind, "Set Target", StringComparison.OrdinalIgnoreCase)) {
+        string targetKey = WorldConversationTargetKey(action);
+        if (targetKey.Length > 0) worldConversationTargets[targetKey] = (action.Value ?? String.Empty).Trim();
+        return;
+      }
+
+      // The placeables a scene drives: the ship it launches, the door it opens, the console it blows up.
+      bool dynStateAction = String.Equals(kind, "Set Dynamic Placeable State", StringComparison.OrdinalIgnoreCase) ||
+        String.Equals(kind, "Set Cinematic Dynamic Placeable State", StringComparison.OrdinalIgnoreCase) ||
+        String.Equals(kind, "Queue Dyn State Change", StringComparison.OrdinalIgnoreCase);
+      bool dynPieceShow = String.Equals(kind, "Set Dyn Piece Visible", StringComparison.OrdinalIgnoreCase);
+      bool dynPieceHide = String.Equals(kind, "Set Dyn Piece Invisible", StringComparison.OrdinalIgnoreCase);
+      if (dynStateAction || dynPieceShow || dynPieceHide) {
+        ApplyWorldConversationDynAction(conversation, node, action, dynPieceShow || dynPieceHide, dynPieceShow);
+        return;
+      }
+
+      bool targetedVfx = String.Equals(kind, "Play Targeted VFX", StringComparison.OrdinalIgnoreCase);
+      bool appearanceAction = String.Equals(kind, "Play Appearance", StringComparison.OrdinalIgnoreCase);
+      bool vfxAction = targetedVfx || appearanceAction || String.Equals(kind, "Play VFX", StringComparison.OrdinalIgnoreCase) ||
         String.Equals(kind, "Stop Character VFX", StringComparison.OrdinalIgnoreCase);
       // Do not synthesize a visible NPC merely because a VFX beat names it. Cinematic-extras nodes are often
       // transform-only markers; if no real/cast body already exists, the VFX path below resolves a staging anchor.
-      WorldNpcPlacement placement = FindWorldConversationActionPlacement(conversation, node, action, !vfxAction);
+      bool equipWeaponAction = String.Equals(kind, "Equip Weapon", StringComparison.OrdinalIgnoreCase);
+      bool hideHelmetAction = String.Equals(kind, "Hide Helmet", StringComparison.OrdinalIgnoreCase);
+      bool lookAtAction = String.Equals(kind, "Set Look At", StringComparison.OrdinalIgnoreCase);
+      // None of these builds a cast body just to give it a weapon, take its helmet off or turn its head.
+      WorldNpcPlacement placement = FindWorldConversationActionPlacement(conversation, node, action, !vfxAction && !equipWeaponAction && !hideHelmetAction && !lookAtAction);
       if (String.Equals(kind, "Set Mark", StringComparison.OrdinalIgnoreCase)) {
         if (placement == null) return;
         string text = (action.Value ?? String.Empty).Trim();
@@ -207,9 +234,35 @@ namespace PugTools {
         return;
       }
 
-      if (String.Equals(kind, "Play VFX", StringComparison.OrdinalIgnoreCase)) {
+      if (lookAtAction) {
+        ApplyWorldConversationLookAt(conversation, node, action, placement);
+        return;
+      }
+
+      if (hideHelmetAction) {
+        if (placement == null) return;
+        bool helmetHidden = !String.Equals((action.Value ?? String.Empty).Trim(), "false", StringComparison.OrdinalIgnoreCase);
+        SetWorldConversationHelmetHidden(placement, helmetHidden);
+        return;
+      }
+
+      if (equipWeaponAction) {
+        if (placement == null) return;
+        if (WorldConversationEquipWeaponModes.TryGetValue((action.Value ?? String.Empty).Trim(), out int equipMode)) ApplyWorldConversationWeaponMode(placement, equipMode);
+        return;
+      }
+
+      if (appearanceAction) {
+        PlayWorldConversationAppearance(conversation, node, action, placement);
+        return;
+      }
+
+      if (targetedVfx || String.Equals(kind, "Play VFX", StringComparison.OrdinalIgnoreCase)) {
         if (placement == null) placement = EnsureWorldConversationVfxAnchor(conversation, node, action);
-        if (placement != null && !String.IsNullOrWhiteSpace(action.Value)) panelRender.PlayWorldConversationFx(placement, action.Value);
+        if (placement != null && !String.IsNullOrWhiteSpace(action.Value)) {
+          WorldNpcPlacement aimedAt = targetedVfx ? ResolveWorldConversationVfxTarget(conversation, node, action, placement) : null;
+          panelRender.PlayWorldConversationFx(placement, action.Value, aimedAt);
+        }
         return;
       }
 
@@ -223,6 +276,13 @@ namespace PugTools {
       bool animation = posture || String.Equals(kind, "Play Animation", StringComparison.OrdinalIgnoreCase) || String.Equals(kind, "Queue Animation", StringComparison.OrdinalIgnoreCase);
       if (!animation || placement == null || String.IsNullOrWhiteSpace(action.Value)) return;
       EnsureWorldConversationAnimationCache();
+      // An `ad_*` beat is a delta over the actor's own pose, not a pose: it never becomes the body clip.
+      if (!posture && WorldConversationIsAdditive(action.Value)) {
+        PlayWorldConversationAdditive(placement, action);
+        return;
+      }
+      // The stance alone says which weapon is out, even when its clip cannot be resolved below.
+      if (posture) ApplyWorldConversationPostureWeapon(placement, action.Value.Trim());
       WorldNpcAnimationClip clip = posture
         ? ResolveNpcConversationPostureClip(action.Value.Trim(), placement.BodyType, worldConversationAnimationCache)
         : ResolveNpcConversationAnimationClip(action.Value.Trim(), placement.BodyType, worldConversationAnimationCache);
@@ -239,6 +299,191 @@ namespace PugTools {
       float speed = WorldConversationParameterFloat(animationParameters, "speed", out float authoredSpeed) && authoredSpeed > 0f ? authoredSpeed : 1f;
       panelRender.SetWorldConversationAnimation(placement, clip, posture, startAt, speed);
       worldConversationAnimatedNpcs.Add(placement);
+    }
+
+    // ---- Weapon in hand (port of Jedipedia cnvPreview.js viewerCnvSetWeapon / viewerCnvEquipWeapon / viewerCnvPostureWeapon) ----
+    // A body a conversation brings in (or an area NPC whose idle package draws nothing) stands empty-handed through
+    // scenes that are about the weapon. A scene states which weapon is out in two places: the `Equip Weapon` action and
+    // the stance (`po_pistol_threaten` is a hand shaped around a pistol). Both are read here and drive the existing
+    // placement CombatMode, which DrawNpcWeapons already uses to choose the drawn weapon (1 = away, 2 = melee, 3 = ranged).
+    private const int WorldConversationWeaponAway = 1;
+    private const int WorldConversationWeaponMelee = 2;
+    private const int WorldConversationWeaponRanged = 3;
+
+    // The mode each placement came into the conversation with, so the end of the preview can put it back.
+    private readonly Dictionary<WorldNpcPlacement, int> worldConversationOriginalCombatModes = new Dictionary<WorldNpcPlacement, int>();
+
+    // What `Equip Weapon` names: a closed vocabulary. NONE/false put the weapon away; the two hands, true and
+    // cbtType_default name no class and mean whatever the actor is carrying (0).
+    private static readonly Dictionary<string, int> WorldConversationEquipWeaponModes = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase) {
+      ["NONE"] = WorldConversationWeaponAway, ["FALSE"] = WorldConversationWeaponAway,
+      ["PRIMARY MELEE"] = WorldConversationWeaponMelee, ["SECONDARY MELEE"] = WorldConversationWeaponMelee,
+      ["PRIMARY RANGED"] = WorldConversationWeaponRanged, ["SECONDARY RANGED"] = WorldConversationWeaponRanged,
+      ["CBTTYPE_RIFLE"] = WorldConversationWeaponRanged, ["CBTTYPE_BLASTER"] = WorldConversationWeaponRanged,
+      ["CBTTYPE_CANNON"] = WorldConversationWeaponRanged,
+      ["CBTTYPE_LIGHTSABER"] = WorldConversationWeaponMelee, ["CBTTYPE_VIBROBLADE"] = WorldConversationWeaponMelee,
+      ["CBTTYPE_POLESABER"] = WorldConversationWeaponMelee, ["CBTTYPE_ELECTROSTAFF"] = WorldConversationWeaponMelee,
+      ["CBTTYPE_SABER"] = WorldConversationWeaponMelee, ["CBTTYPE_SHOTO"] = WorldConversationWeaponMelee,
+      ["CBTTYPE_SHOVEL"] = WorldConversationWeaponMelee,
+      ["RIGHT HAND"] = 0, ["LEFT HAND"] = 0, ["TRUE"] = 0, ["CBTTYPE_DEFAULT"] = 0
+    };
+
+    private static readonly Regex WorldConversationPostureRangedRegex = new Regex(@"(^|_)(pistol|rifle)(_|$)|^standrifle$|^conversationstandrifle$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+    private static readonly Regex WorldConversationPostureMeleeRegex = new Regex(@"(^|_)(saber|pole|staff|sword)(_|$)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+    // po_weapon_* and the wt_* pair name a weapon without saying which; the body answers (0 = whichever it carries).
+    private static readonly Regex WorldConversationPostureAnyWeaponRegex = new Regex(@"(^|_)weapon(_|$)|^wt_", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+    // null = the stance names no weapon at all.
+    private static int? WorldConversationPostureWeaponMode(string posture) {
+      string name = (posture ?? String.Empty).Trim();
+      if (name.Length == 0) return null;
+      if (WorldConversationPostureRangedRegex.IsMatch(name)) return WorldConversationWeaponRanged;
+      if (WorldConversationPostureMeleeRegex.IsMatch(name)) return WorldConversationWeaponMelee;
+      if (WorldConversationPostureAnyWeaponRegex.IsMatch(name)) return 0;
+      return null;
+    }
+
+    // The modes this body actually has a weapon for. A mode the body carries no weapon for is left alone rather than
+    // written: the actor would look identical either way.
+    private static int[] WorldConversationCarriedWeaponModes(WorldNpcPlacement placement) {
+      if (placement?.Weapons == null || placement.Weapons.Count == 0) return Array.Empty<int>();
+      return placement.Weapons.Where(w => w?.Model != null).Select(w => w.WeaponMode).Distinct().ToArray();
+    }
+
+    private void ApplyWorldConversationWeaponMode(WorldNpcPlacement placement, int mode) {
+      if (placement == null) return;
+      int[] carried = WorldConversationCarriedWeaponModes(placement);
+      // An actor carrying nothing has neither a weapon to draw nor one to put away.
+      if (carried.Length == 0) return;
+      int wanted = mode;
+      if (wanted == 0) {
+        // "Whichever one it has" is only answered when it has exactly one.
+        if (carried.Length != 1) return;
+        wanted = carried[0];
+      }
+      if (wanted != WorldConversationWeaponAway && Array.IndexOf(carried, wanted) < 0) return;
+      if (!worldConversationOriginalCombatModes.ContainsKey(placement)) worldConversationOriginalCombatModes[placement] = placement.CombatMode;
+      if (placement.CombatMode == wanted) return;
+      placement.CombatMode = wanted;
+      WorldConversationDiagnosticFileWrite("CNV weapon: " + (placement.SourceFqn ?? "<virtual>") + " combat mode -> " + wanted);
+    }
+
+    private void ApplyWorldConversationPostureWeapon(WorldNpcPlacement placement, string posture) {
+      if (placement == null) return;
+      int? mode = WorldConversationPostureWeaponMode(posture);
+      if (mode.HasValue) { ApplyWorldConversationWeaponMode(placement, mode.Value); return; }
+      // A stance that names no weapon puts back the mode the placement came into the conversation with.
+      if (worldConversationOriginalCombatModes.TryGetValue(placement, out int original) && placement.CombatMode != original)
+        placement.CombatMode = original;
+    }
+
+    // ---- Headgear (port of Jedipedia cnvPreview.js viewerCnvSetHelmetHidden) ----
+    // `Hide Helmet` takes the actor's headgear off for the length of the scene -- a cutscene shows the face of a
+    // character the world places in a helmet -- and the end of the preview puts it back. Only the FACE slot's models are
+    // hidden (see WorldNpcHelmets); the hair and head under them were always there. Like the weapon in hand, this
+    // outlives the node that stated it, so it is restored when playback ends, not when the next node starts.
+    private readonly HashSet<WorldNpcPlacement> worldConversationHelmetHiddenNpcs = new HashSet<WorldNpcPlacement>();
+
+    private void SetWorldConversationHelmetHidden(WorldNpcPlacement placement, bool hidden) {
+      if (placement == null) return;
+      // A body without a headgear model has no helmet to take off and must not be claimed for it.
+      if (hidden && !WorldNpcHelmets.HasHelmet(placement)) return;
+      WorldNpcHelmets.SetHidden(placement, hidden);
+      if (hidden) worldConversationHelmetHiddenNpcs.Add(placement); else worldConversationHelmetHiddenNpcs.Remove(placement);
+      WorldConversationDiagnosticFileWrite("CNV helmet: " + (placement.SourceFqn ?? "<virtual>") + (hidden ? " hidden" : " shown"));
+    }
+
+    // Puts back everything a conversation changed on an actor that is not a per-node staging: the weapon in hand and
+    // the headgear.
+    // ---- Aimed effects (port of Jedipedia cnvPreview.js viewerCnvVfxTarget / viewerCnvTargetFqn / viewerCnvTargetKey) ----
+    // Whom an actor was last told to target, by the action's own actor id (a participant's key or a role's hash), which
+    // is what the tree spells on both beats -- not by the body behind it. Lives for the whole conversation.
+    private readonly Dictionary<string, string> worldConversationTargets = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+    private static string WorldConversationTargetKey(WorldConversationCinematicAction action) {
+      if (action == null) return String.Empty;
+      if (action.ActorId != 0) return "#" + action.ActorId.ToString(CultureInfo.InvariantCulture);
+      return (action.Actor ?? String.Empty).Trim();
+    }
+
+    // `Set Target` names its target in one of three spellings: the last segment of the participant's fqn
+    // (`satele_shan`, the large majority), the full fqn, or one of the symbolic roles (Speaker, Listener, Player 1...).
+    // The actor lookup already joins the short form to the placed NPC; the roles are answered here. An effect aimed at
+    // its own caster, or at a target that is not in the scene, is aimed at nothing.
+    private WorldNpcPlacement ResolveWorldConversationVfxTarget(Conversation conversation, DialogNode node, WorldConversationCinematicAction action, WorldNpcPlacement caster) {
+      if (!worldConversationTargets.TryGetValue(WorldConversationTargetKey(action), out string value) || String.IsNullOrWhiteSpace(value)) return null;
+      string text = value.Trim();
+      string symbolic = text.ToLowerInvariant().Replace("_", " ").Replace("-", " ");
+      WorldNpcPlacement target;
+      if (symbolic == "speaker" || symbolic == "speaker cc") target = FindWorldConversationSpeakerPlacement(conversation, node);
+      else if (symbolic == "listener" || symbolic == "listener cc")
+        target = node != null && node.IsPlayerNode ? FindWorldConversationNpcSpeakerPlacement(conversation, node) : EnsureWorldConversationPlayerPlacement();
+      else target = FindWorldConversationActorPlacement(text);
+      WorldConversationDiagnosticFileWrite("CNV aimed vfx: '" + action.Value + "' target='" + text + "' -> " + (target?.SourceFqn ?? "<not found>"));
+      return ReferenceEquals(target, caster) ? null : target;
+    }
+
+    // ---- Placeables (port of Jedipedia cnvPreview.js viewerCnvDynState / viewerCnvDynPiece / viewerCnvDynPieceRow) ----
+    // What this scene has done to each placeable so far: its state and the pieces it switched. Cumulative across beats
+    // and nodes, like the game's, and put back when the preview ends (RestoreWorldConversationActorProps).
+    private sealed class WorldConversationDynRecord {
+      public string State;
+      public readonly Dictionary<int, bool> Pieces = new Dictionary<int, bool>();
+    }
+    private readonly Dictionary<WorldSpnPlacement, WorldConversationDynRecord> worldConversationDynRecords = new Dictionary<WorldSpnPlacement, WorldConversationDynRecord>();
+
+    // The piece one action names: 1-based into the assembly's rows, either bare ("3") or as the editor lists a row in its
+    // own dropdowns ("ship_door - [4]"). Answered 0-based, or -1 for a value that names no row -- including the actions
+    // that name piece 0, which is no piece at all.
+    private static readonly Regex WorldConversationDynPieceRegex = new Regex(@"(?:^|\[)\s*(\d+)\s*\]?$", RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+    private static int WorldConversationDynPieceRow(string value) {
+      Match match = WorldConversationDynPieceRegex.Match((value ?? String.Empty).Trim());
+      int piece = 0;
+      if (match.Success) Int32.TryParse(match.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture, out piece);
+      return piece >= 1 ? piece - 1 : -1;
+    }
+
+    // Only a placement that came out of a plc can answer: an npc named by one of these actions has neither states nor
+    // pieces. Nothing is built for an actor the area does not place.
+    private WorldSpnPlacement FindWorldConversationDynPlacement(Conversation conversation, DialogNode node, WorldConversationCinematicAction action) {
+      string fqn = (action?.Actor ?? String.Empty).Trim();
+      if (!fqn.StartsWith("plc.", StringComparison.OrdinalIgnoreCase) || panelRender == null) return null;
+      WorldNpcPlacement near = worldConversationPrimaryNpc ?? FindWorldConversationSpeakerPlacement(conversation, node);
+      return panelRender.FindWorldConversationSpn(fqn, near);
+    }
+
+    private void ApplyWorldConversationDynAction(Conversation conversation, DialogNode node, WorldConversationCinematicAction action, bool piece, bool visible) {
+      string value = (action?.Value ?? String.Empty).Trim();
+      if (value.Length == 0) return;
+      WorldSpnPlacement spn = FindWorldConversationDynPlacement(conversation, node, action);
+      if (spn == null) return;
+      if (!worldConversationDynRecords.TryGetValue(spn, out WorldConversationDynRecord record)) record = new WorldConversationDynRecord();
+      if (piece) {
+        int row = WorldConversationDynPieceRow(value);
+        if (row < 0) return;
+        if (record.Pieces.TryGetValue(row, out bool current) && current == visible) return;
+        record.Pieces[row] = visible;
+      } else {
+        if (String.Equals(record.State, value, StringComparison.OrdinalIgnoreCase)) return;
+        record.State = value;
+      }
+      worldConversationDynRecords[spn] = record;
+      bool applied = panelRender.SetWorldConversationDyn(spn, record.State, record.Pieces);
+      WorldConversationDiagnosticFileWrite("CNV dyn: " + action.Actor + (piece ? " piece " + (WorldConversationDynPieceRow(value) + 1) + (visible ? " visible" : " invisible") : " state '" + value + "'") + (applied ? "" : " (not applied)"));
+    }
+
+    private void RestoreWorldConversationActorProps() {
+      RestoreWorldConversationLookAts();
+      panelRender?.ClearWorldConversationAdditives();
+      worldConversationDynRecords.Clear();
+      panelRender?.ClearWorldConversationDyn();
+      worldConversationTargets.Clear();
+      foreach (KeyValuePair<WorldNpcPlacement, int> pair in worldConversationOriginalCombatModes.ToArray())
+        if (pair.Key != null) pair.Key.CombatMode = pair.Value;
+      worldConversationOriginalCombatModes.Clear();
+      foreach (WorldNpcPlacement placement in worldConversationHelmetHiddenNpcs.ToArray()) WorldNpcHelmets.SetHidden(placement, false);
+      worldConversationHelmetHiddenNpcs.Clear();
     }
 
     private static void DebugWorldConversationClipDiagnostics(WorldNpcPlacement placement, WorldNpcAnimationClip clip) {

@@ -78,6 +78,7 @@ namespace PugTools {
     private ToolStripDropDownButton btnWorldLayersMenu;
     private ToolStripDropDownButton btnWorldNavigationMenu;
     private ToolStripDropDownButton btnWorldToolsMenu;
+    private ToolStripButton btnWorldConversations;
     private ToolStripMenuItem btnWorldMiniMap;
     private ToolStripMenuItem btnWorldMapEntireArea;
     private ToolStripMenuItem btnWorldMapnoteNavigator;
@@ -915,6 +916,14 @@ namespace PugTools {
       worldToolbar.Items.Add(btnWorldLayersMenu);
       worldToolbar.Items.Add(btnWorldNavigationMenu);
       worldToolbar.Items.Add(btnWorldToolsMenu);
+      // The conversation navigator (search every NPC conversation of the loaded area and play it) lives behind this
+      // button. It had no entry point left in the toolbar, so the whole window was unreachable.
+      btnWorldConversations = new ToolStripButton("Dialog") { DisplayStyle = ToolStripItemDisplayStyle.Text, ToolTipText = "Search the conversations of this area and play them" };
+      btnWorldConversations.Click += (_, __) => {
+        if (worldNpcPlacements.Count == 0) { SetStatusLabel("Load an area first: there are no NPC conversations to search yet."); return; }
+        ShowWorldConversationNavigator();
+      };
+      worldToolbar.Items.Add(btnWorldConversations);
 
       btnWorldRenderMenu.DropDownItems.Add(new ToolStripLabel("Mode:"));
       cmbWorldMode = new ToolStripComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 150 };

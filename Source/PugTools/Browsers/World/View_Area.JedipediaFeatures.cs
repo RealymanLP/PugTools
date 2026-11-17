@@ -1094,6 +1094,7 @@ namespace PugTools {
 
         if (traceActor) WorldConversationDiagnosticFileWrite("render-actor-draw name='" + (placement.Name ?? "") + "' models=" + placement.Models.Count + " animate=" + animate + " clip='" + (activeClip?.DisplayName ?? "") + "' time=" + animationTime.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture) + " receiver=" + haveReceiver);
         foreach (GR2 model in placement.Models) {
+          if (WorldNpcHelmets.IsDrawSuppressed(placement, model)) continue;
           bool animatedDrawn = animate && TryDrawAnimatedNpcModel(model, npcWorld, vp, s, activeClip, animationTime, placement);
           if (!animatedDrawn) {
             if (traceActor && animate) WorldConversationDiagnosticFileWrite("render-actor-static-fallback name='" + (placement.Name ?? "") + "' reason='animated-pass-submitted-no-body-pieces-or-palette-unavailable'");
@@ -1431,6 +1432,9 @@ namespace PugTools {
 
     private WorldSpnDynState ActiveSpnDynState(WorldSpnPlacement placement, bool animateStates = true) {
       if (placement?.DynStates == null || placement.DynStates.Count == 0) return null;
+      // A scene that drives this placeable names its state; that beats the preview clock and the ship-window override.
+      WorldSpnDynState conversationState = placement.ConversationDyn;
+      if (conversationState != null) return conversationState;
       // Jedipedia shipVfx overrides the generic shared two-second state clock: hydra scripts hold these assemblies at
       // one destination and explicitly sequence the globe/backdrop/tunnel during a jump.
       if (TryGetShipVfxStateName(placement, out string shipState)) {
@@ -1784,7 +1788,10 @@ namespace PugTools {
         state.Clip.Animation.SampleInto(animationTime, state.PoseSamples);
         WorldNpcFaceFxClip face = placement?.ConversationFaceFx;
         float[] faceValues = face == null ? null : NpcEvaluateFaceFx(state, face, Math.Max(0f, elapsed - placement.ConversationFaceFxStart));
-        NpcBuildJbaWorldPose(state, state.PoseSamples, face, faceValues);
+        // The head turn a conversation's `Set Look At` holds: additive rotations on the neck and head bones.
+        // A beat's own `ad_*` delta (a nod, a glance) and the head turn, composed: the turn rides over the nod.
+        System.Numerics.Quaternion?[] lookDeltas = NpcMergeAdditiveDeltas(NpcEvaluateConversationAdditive(state, placement), NpcEvaluateLookAt(state, placement));
+        NpcBuildJbaWorldPose(state, state.PoseSamples, face, faceValues, lookDeltas);
         state.SkinMatrices.Clear();
         IList<GR2_Bone_Skeleton> skeleton = state.Skeleton;
         for (int i = 0; i < skeleton.Count; i++) {
@@ -2052,7 +2059,7 @@ namespace PugTools {
       return hero;
     }
 
-    private static void NpcBuildJbaWorldPose(NpcSkinState state, IReadOnlyList<JBATransform> poseFrame, WorldNpcFaceFxClip face = null, float[] faceValues = null) {
+    private static void NpcBuildJbaWorldPose(NpcSkinState state, IReadOnlyList<JBATransform> poseFrame, WorldNpcFaceFxClip face = null, float[] faceValues = null, System.Numerics.Quaternion?[] lookDeltas = null) {
       IList<GR2_Bone_Skeleton> skeleton = state?.Skeleton;
       if (state == null || poseFrame == null || skeleton == null) return;
       int count = Math.Min(skeleton.Count, state.CurrentWorld.Length);
@@ -2070,6 +2077,10 @@ namespace PugTools {
           rotation = state.BindRotationMorpheme[i];
           translation = state.BindTranslationMorpheme[i];
         }
+        // An ADDITIVE layer (the head turn) goes on the parent side of whatever the body clip put there, and before the
+        // face, which is the finer of the two and belongs closest to the bone.
+        if (driven && lookDeltas != null && i < lookDeltas.Length && lookDeltas[i].HasValue)
+          rotation = NpcJbaQuatMultiply(lookDeltas[i].Value, rotation);
         // FaceFX runs after the body clip has produced its finished local pose and before hierarchy composition.
         // Like the SWTOR client/Jedipedia, only channels actually driven by the current Morpheme LOD receive face
         // deltas; undriven facial bones remain inherited from the nearest driven ancestor.

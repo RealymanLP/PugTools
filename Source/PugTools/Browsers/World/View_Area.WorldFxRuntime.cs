@@ -872,6 +872,12 @@ namespace PugTools {
     private readonly Dictionary<object, WorldFxPlayer> worldFxPlayers = new Dictionary<object, WorldFxPlayer>();
     private sealed class WorldConversationFxEntry {
       public WorldNpcPlacement Placement;
+      // The placement an aimed effect (`Play Targeted VFX`) is cast at; null for an ordinary `Play VFX`.
+      public WorldNpcPlacement Target;
+      // What an appearance (`Play Appearance`) hands the effect: the dynamic data an .fxspec's _fxStartIF reads, and
+      // the body locator that stands in for a weapon slot's bones.
+      public IReadOnlyDictionary<string, string> DynamicData;
+      public string SlotBone;
       public string Path;
       public object Owner;
     }
@@ -925,7 +931,8 @@ namespace PugTools {
       return "/resources/art/fx/fxspec/" + path.TrimStart('/').ToLowerInvariant() + ".fxspec";
     }
 
-    internal void PlayWorldConversationFx(WorldNpcPlacement placement, string fxSpecName) {
+    internal void PlayWorldConversationFx(WorldNpcPlacement placement, string fxSpecName, WorldNpcPlacement target = null,
+        IReadOnlyDictionary<string, string> dynamicData = null, string slotBone = null) {
       if (placement == null) return;
       string path = NormalizeWorldAmbientFxSpecPath(fxSpecName);
       if (String.IsNullOrWhiteSpace(path)) return;
@@ -935,7 +942,7 @@ namespace PugTools {
         // Play VFX is a new one-shot instance even when the same named spec was already running. Replacing the owner
         // makes TryDrawWorldFxPlayer create a fresh clock; the old cached player simply ages out through the normal
         // five-second prune without cross-thread mutation of the renderer-owned dictionary.
-        playing[path] = new WorldConversationFxEntry { Placement = placement, Path = path, Owner = new object() };
+        playing[path] = new WorldConversationFxEntry { Placement = placement, Target = ReferenceEquals(target, placement) ? null : target, DynamicData = dynamicData, SlotBone = slotBone, Path = path, Owner = new object() };
         worldConversationFxSnapshot = worldConversationFx.Values.SelectMany(x => x.Values).ToArray();
       }
     }
@@ -978,9 +985,9 @@ namespace PugTools {
       }
       foreach (var candidate in candidates.OrderBy(x => x.DistanceSquared).Take(WorldConversationFxMaxLive)) {
         WorldNpcPlacement npc = candidate.Entry.Placement;
-        WorldFxHostContext host = BuildWorldFxNpcHostContext(npc, candidate.Frame, settings);
+        WorldFxHostContext host = BuildWorldFxNpcHostContext(npc, candidate.Frame, settings, candidate.Entry.Target, candidate.Entry.SlotBone);
         TryDrawWorldFxPlayer(candidate.Entry.Owner, candidate.Entry.Path, candidate.Frame, viewProj, WorldFxMaxRenderParticlesPerWorldEffect, out _, null,
-          settings, false, 0, null, true, host, true);
+          settings, false, 0, candidate.Entry.DynamicData, true, host, true);
       }
     }
 
@@ -1060,18 +1067,33 @@ namespace PugTools {
       return BuildWorldFxNpcHostContext(npc, fxFrame, renderSettings);
     }
 
-    private WorldFxHostContext BuildWorldFxNpcHostContext(WorldNpcPlacement npc, Matrix fxFrame, WorldRenderSettings renderSettings) {
+    // `target` is the placement an aimed effect (`Play Targeted VFX`) is cast AT: a force lightning arc, a scanner cone, a
+    // welding beam. Jedipedia hands FxPlayer that placement's position as opts.target and lets TARGET-anchored bones
+    // ride its rig, so the same two pieces are provided here. An effect aimed at its own caster is aimed at nothing,
+    // which is what the default TargetFrame already is.
+    private WorldFxHostContext BuildWorldFxNpcHostContext(WorldNpcPlacement npc, Matrix fxFrame, WorldRenderSettings renderSettings, WorldNpcPlacement target = null, string slotBone = null) {
       if (npc == null) return null;
       Matrix invFx;
       try { invFx = Matrix.Invert(fxFrame); } catch { return null; }
       Matrix npcWorld;
       try { npcWorld = npc.ConversationFxAnchor ? NpcPlacementBaseWorld(npc) : NpcNameplateWorld(npc); } catch { return null; }
       var host = new WorldFxHostContext { CasterFrame = npcWorld * invFx };
-      host.BoneFrame = (actor, boneName) => {
-        if (!String.Equals(actor, "CASTER", StringComparison.OrdinalIgnoreCase) || String.IsNullOrWhiteSpace(boneName)) return null;
-        WorldNpcAnimationClip clip = npc.ConversationAnimation ?? npc.Animation;
-        bool conversationClip = npc.ConversationAnimation != null;
-        Vector3 npcPosition = new Vector3(npcWorld.M41, npcWorld.M42, npcWorld.M43);
+
+      Matrix? targetWorld = null;
+      if (target != null && !ReferenceEquals(target, npc)) {
+        try {
+          Matrix frame = target.ConversationFxAnchor ? NpcPlacementBaseWorld(target) : NpcNameplateWorld(target);
+          // opts.target is a point, not an actor orientation frame.
+          host.TargetFrame = Matrix.Translation(frame.M41, frame.M42, frame.M43) * invFx;
+          targetWorld = frame;
+        } catch { target = null; }
+      }
+
+      // One actor's named bone, in the effect's own coordinate system.
+      Matrix? BoneInFxSpace(WorldNpcPlacement who, Matrix whoWorld, string boneName) {
+        WorldNpcAnimationClip clip = who.ConversationAnimation ?? who.Animation;
+        bool conversationClip = who.ConversationAnimation != null;
+        Vector3 npcPosition = new Vector3(whoWorld.M41, whoWorld.M42, whoWorld.M43);
         bool animate = clip?.Animation != null && (conversationClip ||
           ((renderSettings?.AnimateNpcs ?? true) && (renderSettings == null || renderSettings.Mode != WorldRenderMode.Map) &&
             (camera == null || (npcPosition - camera.Position).LengthSquared() <= NpcAnimationRenderDistance * NpcAnimationRenderDistance)));
@@ -1079,13 +1101,26 @@ namespace PugTools {
         if (animate) {
           float length = clip.Animation.Length;
           float baseTime = conversationClip
-            ? Math.Max(0f, (elapsed - npc.ConversationAnimationStart) * Math.Max(.0001f, npc.ConversationAnimationSpeed) + npc.ConversationAnimationOffset)
-            : elapsed + npc.AnimationPhase * length;
-          if (conversationClip && !npc.ConversationAnimationLoop) animationTime = length > 0f ? Math.Min(baseTime, Math.Max(0f, length - .0001f)) : 0f;
+            ? Math.Max(0f, (elapsed - who.ConversationAnimationStart) * Math.Max(.0001f, who.ConversationAnimationSpeed) + who.ConversationAnimationOffset)
+            : elapsed + who.AnimationPhase * length;
+          if (conversationClip && !who.ConversationAnimationLoop) animationTime = length > 0f ? Math.Min(baseTime, Math.Max(0f, length - .0001f)) : 0f;
           else { animationTime = length > 0f ? baseTime % length : 0f; if (animationTime < 0f) animationTime += length; }
         }
-        if (!TryNpcWeaponBoneFrame(npc, clip, animationTime, animate, boneName, out Matrix boneLocal)) return null;
-        return boneLocal * npcWorld * invFx;
+        if (!TryNpcWeaponBoneFrame(who, clip, animationTime, animate, boneName, out Matrix boneLocal)) return null;
+        return boneLocal * whoWorld * invFx;
+      }
+
+      host.BoneFrame = (actor, boneName) => {
+        if (String.IsNullOrWhiteSpace(boneName)) return null;
+        bool asTarget = String.Equals(actor, "TARGET", StringComparison.OrdinalIgnoreCase);
+        if (asTarget && target != null && targetWorld.HasValue) return BoneInFxSpace(target, targetWorld.Value, boneName);
+        if (!asTarget && !String.Equals(actor, "CASTER", StringComparison.OrdinalIgnoreCase)) return null;
+        // An effect aimed at nobody has no other end, so a TARGET bone rides the caster's rig (Jedipedia
+        // viewerFxBoneFrame). A bone the body really does not carry, on an effect hung off one of the caster's WEAPON
+        // slots, is stood in for by the locator the body carries for that slot (`slotBone`).
+        Matrix? resolved = BoneInFxSpace(npc, npcWorld, boneName);
+        if (!resolved.HasValue && !String.IsNullOrWhiteSpace(slotBone)) resolved = BoneInFxSpace(npc, npcWorld, slotBone);
+        return resolved;
       };
       return host;
     }

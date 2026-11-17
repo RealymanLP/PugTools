@@ -64,6 +64,10 @@ namespace PugTools {
       internal UInt32 WeightControl = UInt32.MaxValue;
       internal UInt32 Operation;
       internal Single Constant0;
+      // The second constant of a one-input operator (`norm_head_yaw` is (45, -45), a clamp is (low, high)).
+      internal Single Constant1;
+      // A Blend2 whose first source is a DELTA over the second rather than a weighted choice between them.
+      internal Boolean Additive;
       internal readonly List<Single> Weights = new List<Single>();
       internal MphStateMachine StateMachine;
     }
@@ -456,6 +460,7 @@ namespace PugTools {
         case 107:
         case 101:
           flow(U(0)); flow(U(1));
+          node.Additive = (U(3) & 0x10000U) != 0;
           node.WeightControl = U(2) & 0xFFFF;
           ctrl(node.WeightControl);
           node.Fields["Weight control"] = FormatNodeRef(node.WeightControl);
@@ -472,6 +477,7 @@ namespace PugTools {
           ctrl(U(0) & 0xFFFF);
           node.Operation = U(1);
           node.Constant0 = F(2);
+          node.Constant1 = F(3);
           node.Fields["Operation"] = node.Operation.ToString(CultureInfo.InvariantCulture);
           node.Fields["Constants"] = F(2).ToString("0.####", CultureInfo.InvariantCulture) + ", " + F(3).ToString("0.####", CultureInfo.InvariantCulture);
           break;

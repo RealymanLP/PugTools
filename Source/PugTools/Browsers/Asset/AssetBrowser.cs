@@ -835,6 +835,52 @@ namespace PugTools {
       return regularArea || generatedArea;
     }
 
+    // Everything a user can read beside a world's area folder, per area id: the internal name the tree shows, plus the
+    // bundled catalog's readable name ("(Empire) Imperial Fleet") and a user override's name. Built once per index build.
+    private Dictionary<UInt64, String> BuildWorldAreaSearchTexts() {
+      var result = new Dictionary<UInt64, String>();
+      void Add(UInt64 id, String text) {
+        if (id == 0 || String.IsNullOrWhiteSpace(text)) return;
+        text = text.Trim();
+        if (result.TryGetValue(id, out String existing)) {
+          if (existing.IndexOf(text, StringComparison.OrdinalIgnoreCase) < 0) result[id] = existing + " " + text;
+        } else result[id] = text;
+      }
+      foreach (KeyValuePair<UInt64, String> pair in m_worldAreaInternalNames) Add(pair.Key, pair.Value);
+      foreach (WorldAreaCatalogEntry entry in WorldAreaCatalog.Entries) {
+        if (entry == null) continue;
+        Add(entry.Id, entry.InternalName);
+        Add(entry.Id, entry.Comment);
+      }
+      foreach (KeyValuePair<UInt64, WorldAreaOverride> pair in WorldAreaNameOverrides.LoadEntries()) {
+        if (pair.Value == null) continue;
+        Add(pair.Key, pair.Value.Name);
+        Add(pair.Key, pair.Value.InternalName);
+      }
+      return result;
+    }
+
+    // The world text of the area folder a file lives in: resources/world/areas/<id>/... or
+    // resources/world/livecontent/systemgenerated/<id>/... Files elsewhere have none.
+    private static String GetWorldAreaSearchTextForPath(String path, Dictionary<UInt64, String> texts) {
+      if (String.IsNullOrEmpty(path) || texts == null || texts.Count == 0) return String.Empty;
+      if (path.IndexOf("world/", StringComparison.OrdinalIgnoreCase) < 0) return String.Empty;
+      String[] parts = path.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+      for (Int32 i = 2; i + 1 < parts.Length; i++) {
+        Boolean regular = String.Equals(parts[i], "areas", StringComparison.OrdinalIgnoreCase)
+          && String.Equals(parts[i - 1], "world", StringComparison.OrdinalIgnoreCase)
+          && String.Equals(parts[i - 2], "resources", StringComparison.OrdinalIgnoreCase);
+        Boolean generated = i >= 3
+          && String.Equals(parts[i], "systemgenerated", StringComparison.OrdinalIgnoreCase)
+          && String.Equals(parts[i - 1], "livecontent", StringComparison.OrdinalIgnoreCase)
+          && String.Equals(parts[i - 2], "world", StringComparison.OrdinalIgnoreCase)
+          && String.Equals(parts[i - 3], "resources", StringComparison.OrdinalIgnoreCase);
+        if (!regular && !generated) continue;
+        return UInt64.TryParse(parts[i + 1], out UInt64 areaId) && texts.TryGetValue(areaId, out String text) ? text : String.Empty;
+      }
+      return String.Empty;
+    }
+
     private String GetWorldAreaDirectoryDisplayName(String directory, String fallback) {
       if (!TryGetWorldAreaIdFromTreeDirectory(directory, out UInt64 areaId)
           || !m_worldAreaInternalNames.TryGetValue(areaId, out String internalName)
@@ -868,6 +914,7 @@ namespace PugTools {
       // which was a cross-thread UI access and still forced every later filter reset to allocate
       // and sort the complete tree again.
       Dictionary<String, String> heroScriptAliases = BuildHeroScriptQuickOpenAliases(m_currentAssets);
+      Dictionary<UInt64, String> worldAreaSearchText = BuildWorldAreaSearchTexts();
       m_assetSearchIndex = m_assetDict.Values
         .Where(item => item?.HashInfo?.File != null)
         .Select(item => {
@@ -880,7 +927,8 @@ namespace PugTools {
             item.HashInfo.FirstSeenVersion,
             resourcePath,
             item.HashInfo.File == null ? String.Empty : item.HashInfo.File.FileInfo.FileId.ToString("X16", CultureInfo.InvariantCulture),
-            scriptAlias
+            scriptAlias,
+            GetWorldAreaSearchTextForPath(item.Id, worldAreaSearchText)
           );
         })
         .ToArray();
@@ -3703,8 +3751,10 @@ namespace PugTools {
       internal String ResourcePath { get; }
       internal String FileId { get; }
       internal String SearchAlias { get; }
+      // The world's name(s) shown next to the area folder this file lives in, so that searching a world finds its files.
+      internal String WorldName { get; }
 
-      internal AssetSearchEntry(String id, String displayName, Boolean isNamed, String firstSeenVersion, String resourcePath, String fileId, String searchAlias = null) {
+      internal AssetSearchEntry(String id, String displayName, Boolean isNamed, String firstSeenVersion, String resourcePath, String fileId, String searchAlias = null, String worldName = null) {
         Id = id ?? String.Empty;
         DisplayName = displayName ?? String.Empty;
         IsNamed = isNamed;
@@ -3712,6 +3762,7 @@ namespace PugTools {
         ResourcePath = resourcePath ?? String.Empty;
         FileId = fileId ?? String.Empty;
         SearchAlias = searchAlias ?? String.Empty;
+        WorldName = worldName ?? String.Empty;
       }
     }
 
@@ -3805,8 +3856,11 @@ namespace PugTools {
         if (filter.ShowUnnamedOnly) {
           match = !entry.IsNamed;
         } else {
+          // A file inside a world's area folder is also found by the name written beside that folder.
           Boolean textMatch = entry.IsNamed
-            ? filter.Matches(entry.Id, entry.DisplayName)
+            ? (entry.WorldName.Length == 0
+                ? filter.Matches(entry.Id, entry.DisplayName)
+                : filter.Matches(entry.Id, entry.DisplayName, entry.WorldName, String.Empty, String.Empty))
             : filter.RequiredTerms.Count == 0;
           if (!textMatch) continue;
 
@@ -5263,7 +5317,8 @@ namespace PugTools {
                 && entry.DisplayName.IndexOf(term, StringComparison.OrdinalIgnoreCase) < 0
                 && entry.ResourcePath.IndexOf(term, StringComparison.OrdinalIgnoreCase) < 0
                 && entry.FileId.IndexOf(term, StringComparison.OrdinalIgnoreCase) < 0
-                && entry.SearchAlias.IndexOf(term, StringComparison.OrdinalIgnoreCase) < 0) {
+                && entry.SearchAlias.IndexOf(term, StringComparison.OrdinalIgnoreCase) < 0
+                && entry.WorldName.IndexOf(term, StringComparison.OrdinalIgnoreCase) < 0) {
               matches = false;
               break;
             }

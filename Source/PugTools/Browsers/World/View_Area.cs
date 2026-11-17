@@ -1223,7 +1223,7 @@ namespace PugTools {
 
     private bool TryRayHitNpcPlacement(WorldNpcPlacement npc,Matrix world,Vector3 rayOrigin,Vector3 rayDirection,WorldRenderSettings s,ref float bestDistance,ref Vector3 bestPoint,ref GR2 bestModel,ref GR2_Mesh bestMesh,ref GR2_Mesh_Piece bestPiece){
       if(npc?.Models==null)return false;bool hit=false;
-      foreach(GR2 model in npc.Models)if(model!=null&&TryRayHitModel(model,world,1f,rayOrigin,rayDirection,s,ref bestDistance,ref bestPoint,ref bestModel,ref bestMesh,ref bestPiece))hit=true;
+      foreach(GR2 model in npc.Models)if(model!=null&&!WorldNpcHelmets.IsDrawSuppressed(npc,model)&&TryRayHitModel(model,world,1f,rayOrigin,rayDirection,s,ref bestDistance,ref bestPoint,ref bestModel,ref bestMesh,ref bestPiece))hit=true;
       return hit;
     }
 
@@ -1502,7 +1502,7 @@ namespace PugTools {
       foreach(GR2_Material material in worldOwnedMaterials)ReleaseOwnedMaterial(material);
       ReleaseJedipediaFeatureGpu();
       mapBackdropBuffer?.Dispose();mapBackdropBuffer=null;mapBackdropTexture?.Dispose();mapBackdropTexture=null;mapBackdropLoadAttempted=false;
-      foreach(var g in terrainGpu.Values)g.Dispose();terrainGpu.Clear();foreach(var g in terrainIndexCache.Values)g.Dispose();terrainIndexCache.Clear(); foreach(var g in waterGpu.Values)g.Dispose();waterGpu.Clear(); foreach(var g in roadGpu)g.Dispose();roadGpu.Clear();foreach(var g in mapNoteFallbackGpu)g.Dispose();mapNoteFallbackGpu.Clear();foreach(var g in mapArtGpu)g.Dispose();mapArtGpu.Clear();mapArtPrepared=false;foreach(var g in mapNoteIconGpu.Values)g.Dispose();mapNoteIconGpu.Clear();materialLastUseFrame.Clear();modelGeometryPrepared.Clear();modelGeometryLastUseFrame.Clear();worldRenderFrame=0;Release(ref selectedWorldBoxBuffer);manuallyHiddenWorldEntries.Clear();ClearWorldModelSelection();
+      foreach(var g in terrainGpu.Values)g.Dispose();terrainGpu.Clear();foreach(var g in terrainIndexCache.Values)g.Dispose();terrainIndexCache.Clear(); foreach(var g in waterGpu.Values)g.Dispose();waterGpu.Clear(); foreach(var g in roadGpu)g.Dispose();roadGpu.Clear();foreach(var g in mapNoteFallbackGpu)g.Dispose();mapNoteFallbackGpu.Clear();foreach(var g in mapArtGpu)g.Dispose();mapArtGpu.Clear();mapArtPrepared=false;DisposeMapTiles();foreach(var g in mapNoteIconGpu.Values)g.Dispose();mapNoteIconGpu.Clear();materialLastUseFrame.Clear();modelGeometryPrepared.Clear();modelGeometryLastUseFrame.Clear();worldRenderFrame=0;Release(ref selectedWorldBoxBuffer);manuallyHiddenWorldEntries.Clear();ClearWorldModelSelection();
       foreach(var list in dynamicDetailGpu.Values)foreach(var g in list)g.Dispose();dynamicDetailGpu.Clear();
       foreach(var list in dynamicDetailMeshBatches.Values)foreach(var g in list)g.Dispose();dynamicDetailMeshBatches.Clear();
       instanceWorldTransforms.Clear();heightMapFloorGrid.Clear();heightMapFloors.Clear();roomPlacementGrid.Clear();roomPlacementGlobal.Clear();volumeMembershipGrid.Clear();volumeMembershipGlobal.Clear();modelFloorData.Clear();modelFloorPlacementGrid.Clear();modelFloorPlacementGlobal.Clear();renderGrid.Clear();renderGlobal.Clear();renderEntriesByRoom.Clear();occluderRenderEntries.Clear();walkingPathFollowerRenderEntries.Clear();decorationHookRenderEntries.Clear();teleportWarmupModels.Clear();teleportWarmupQueued.Clear();cameraWarmupModels.Clear();cameraWarmupQueued.Clear();cameraWarmupAnchor=new Vector3(float.NaN,float.NaN,float.NaN);cameraWarmupRoomName=String.Empty;lock(teleportWarmupLock){teleportWarmupRequestPending=false;teleportWarmupCancelPending=false;}Release(ref regularModelInstanceBuffer);regularModelInstanceCapacity=0;regularModelInstanceScratch=Array.Empty<float>();regularModelInstancingSafe.Clear();visualLodLevels.Clear();lodSchemas.Clear();localLightGrid.Clear();localLightGlobal.Clear();localLightSelectionCache.Clear();localLightVisibilityScope=null;currentLocalLightSelection=LocalLightSelection.Empty;boundLocalLightTexturePaths.Clear();roomPortals.Clear();roomStreamingNeighbors.Clear();roomStreamingAuthoredVisible.Clear();roomStreamingBounds.Clear();streamTransitionRoomGrace.Clear();lastStreamAnchorRoom=String.Empty;Array.Clear(lastLocalLightSelection,0,lastLocalLightSelection.Length);lastLocalLightCount=-1;currentCameraRoom=null;displayCameraRoom=null;skyRoomNames.Clear();
@@ -5351,6 +5351,8 @@ namespace PugTools {
     }
 
     private void DrawMapArt(Matrix vp){
+      // The minimap tiles of the selected page replace the page image on the full map.
+      if(mapOpen&&InteractiveMapTilesActive){DrawMapTiles(vp);return;}
       if(!mapArtPrepared)BuildMapArt();
       if(mapArtGpu.Count==0)return;
       ImmediateContext.InputAssembler.PrimitiveTopology=PrimitiveTopology.TriangleList;fx.SetWorld(Matrix.Identity);fx.SetViewProj(vp);
@@ -5946,7 +5948,7 @@ namespace PugTools {
     private ShaderResourceView LoadTexture(string raw,bool pin=false){
       string path=NormalizeTexturePath(raw);if(path==null)return null;
       if(textureCache.TryGetValue(path,out ShaderResourceView v)){textureLastUseFrame[path]=worldRenderFrame;if(pin)pinnedTexturePaths.Add(path);return v;}
-      try{using var file=area?.FindFile(path);if(file==null)return null;using Stream stream=file.OpenCopyInMemory();int mip=ClampDdsFirstMipLevel(stream,Math.Max(0,appliedTextureMipSkip));
+      try{using var file=area?.FindFile(path);if(file==null)return null;using Stream stream=EnsureOpaqueRgbDds(file.OpenCopyInMemory());int mip=ClampDdsFirstMipLevel(stream,Math.Max(0,appliedTextureMipSkip));
         if(mip>0){ImageLoadInformation info=ImageLoadInformation.FromDefaults();info.FirstMipLevel=mip;v=ShaderResourceView.FromStream(Device,stream,(int)stream.Length,info);}
         else v=ShaderResourceView.FromStream(Device,stream,(int)stream.Length);
         textureCache[path]=v;textureLastUseFrame[path]=worldRenderFrame;if(pin)pinnedTexturePaths.Add(path);return v;
@@ -5988,7 +5990,7 @@ namespace PugTools {
         ReleaseOwnedMaterial(material);streamedMaterialResourcesPrepared.Remove(material);materialLastUseFrame.Remove(material);
       }
       foreach(var gpu in waterGpu.Values)gpu.Dispose();waterGpu.Clear();Release(ref defaultWaterNormal);Release(ref defaultWaterDepth);BuildWaterResources();
-      foreach(var art in mapArtGpu)art.Dispose();mapArtGpu.Clear();mapArtPrepared=false;if(rebuildMapArt)BuildMapArt();
+      foreach(var art in mapArtGpu)art.Dispose();mapArtGpu.Clear();mapArtPrepared=false;DisposeMapTiles();if(rebuildMapArt)BuildMapArt();
       BuildLocalLightIndex();localLightSelectionCache.Clear();dynamicSpnLocalLights.Clear();
       InvalidateTemporalHistory();InvalidateObjectOcclusionVisibility();
     }

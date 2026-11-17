@@ -577,6 +577,7 @@ namespace PugTools {
       ClearWorldConversationFaceFx();
       ClearWorldConversationAnimations();
       ClearWorldConversationStaging();
+      RestoreWorldConversationActorProps();
       panelRender?.ClearWorldConversationCamera(true);
       panelRender?.ClearWorldConversationSubtitle();
       panelRender?.ClearWorldConversationFx();
@@ -602,6 +603,7 @@ namespace PugTools {
       ClearWorldConversationFaceFx();
       ClearWorldConversationAnimations();
       ClearWorldConversationStaging();
+      RestoreWorldConversationActorProps();
       panelRender?.ClearWorldConversationCamera(true);
       panelRender?.ClearWorldConversationSubtitle();
       panelRender?.ClearWorldConversationFx();

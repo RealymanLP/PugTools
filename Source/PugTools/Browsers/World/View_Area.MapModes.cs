@@ -39,7 +39,9 @@ namespace PugTools {
     public bool InteractiveMapHasAreaScope => interactiveMapAreaPage != null;
     public bool InteractiveMapPrefersOriginalArt => interactiveMapPreferOriginalArt;
     public bool InteractiveMapOriginalArtAvailable => InteractiveMapSelectedPage?.HasImage == true;
-    public bool InteractiveMapOriginalArtActive => mapOpen && interactiveMapPreferOriginalArt && InteractiveMapOriginalArtAvailable;
+    // The minimap tiles count as original art for everything that composes it over the generated map (the extent,
+    // the tight fit of an area page, the map-art layer being switched on).
+    public bool InteractiveMapOriginalArtActive => mapOpen && ((interactiveMapPreferOriginalArt && InteractiveMapOriginalArtAvailable) || InteractiveMapTilesActive);
     public string InteractiveMapAreaName => interactiveMapAreaPage?.MapName ?? String.Empty;
     public string InteractiveMapWorldName => interactiveMapWorldPage?.MapName ?? String.Empty;
     public bool InteractiveMapTravelMode => IsTaxiRouteMapActive || IsQuickTravelMapActive;
@@ -327,6 +329,7 @@ namespace PugTools {
         ApplyMapExtentSelection();
         if (interactiveMapPreferOriginalArt && selected?.HasImage == true) ExpandMapExtentToIncludePage(selected);
       }
+      if (InteractiveMapTilesActive) ExpandMapExtentToIncludeMiniTiles(selected);
       if (resetView) {
         mapCenter = new Vector2((mapExtentMinX + mapExtentMaxX) * .5f, (mapExtentMinZ + mapExtentMaxZ) * .5f);
         mapZoom = 1f;
@@ -419,7 +422,7 @@ namespace PugTools {
     private string InteractiveMapScopeStatus() {
       string scope = InteractiveMapIsWorldScope ? "World map" : "Area map" +
         (String.IsNullOrWhiteSpace(InteractiveMapAreaName) ? String.Empty : " — " + InteractiveMapAreaName);
-      string source = InteractiveMapOriginalArtActive ? "original SWTOR art" : "PugTools render";
+      string source = InteractiveMapTilesActive ? "minimap tiles" : InteractiveMapOriginalArtActive ? "original SWTOR art" : "PugTools render";
       return scope + " • " + source + " • click = teleport, drag = pan, wheel = zoom, M/Esc = close";
     }
 

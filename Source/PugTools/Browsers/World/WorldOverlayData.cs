@@ -178,12 +178,18 @@ namespace PugTools {
     public WorldNpcAnimationClip Animation { get; set; }
     // DYN rows own this decision per visual/state; do not fall back to the parent PLC glow when false.
     public bool BlueGlow { get; set; }
+    // 0-based index of the dyn row this part draws, so a conversation can switch single pieces (`Set Dyn Piece
+    // Visible/Invisible`, whose value is the 1-based row). -1 for a part not built from a row.
+    public int Row { get; set; } = -1;
   }
 
   internal sealed class WorldSpnDynState {
     public string Name { get; set; }
     public bool Hidden { get; set; }
     public readonly List<WorldSpnDynPart> Parts = new List<WorldSpnDynPart>();
+    // Rows the assembly does not draw in THIS state, row -> how to build the part. Kept as a recipe rather than a
+    // loaded model: nearly none is ever asked for, and only a scene that switches the piece on pays for its model.
+    public readonly Dictionary<int, System.Func<WorldSpnDynPart>> RowParts = new Dictionary<int, System.Func<WorldSpnDynPart>>();
   }
 
   internal sealed class WorldSpnFxPart {
@@ -244,5 +250,8 @@ namespace PugTools {
     public readonly List<WorldSpnDynState> DynStates = new List<WorldSpnDynState>();
     public readonly List<WorldSpnDynLight> DynLights = new List<WorldSpnDynLight>();
     public readonly List<WorldSpnFxPart> DynEffects = new List<WorldSpnFxPart>();
+    // The state a conversation holds this placement in (`Set Dynamic Placeable State` and the dyn-piece beats): a copy
+    // of one of DynStates with the scene's pieces switched. Null outside a scene, which leaves the preview clock's choice.
+    public volatile WorldSpnDynState ConversationDyn;
   }
 }

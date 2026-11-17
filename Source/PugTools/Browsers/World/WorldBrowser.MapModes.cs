@@ -12,6 +12,7 @@ namespace PugTools {
     private Label worldMapModeLabel;
     private Button worldMapScopeButton;
     private Button worldMapSourceButton;
+    private Button worldMapTilesButton;
     private Button worldMapCloseButton;
     private ComboBox worldMapPageCombo;
     private bool updatingWorldMapPageCombo;
@@ -62,9 +63,22 @@ namespace PugTools {
       worldMapSourceButton.FlatAppearance.BorderColor = Color.FromArgb(76, 145, 168);
       worldMapSourceButton.FlatAppearance.MouseOverBackColor = Color.FromArgb(36, 69, 82);
       worldMapSourceButton.FlatAppearance.MouseDownBackColor = Color.FromArgb(45, 83, 98);
+      worldMapTilesButton = new Button {
+        Text = "Minimaps",
+        Location = new Point(477, 4),
+        Size = new Size(110, 28),
+        FlatStyle = FlatStyle.Flat,
+        UseVisualStyleBackColor = false,
+        BackColor = Color.FromArgb(24, 47, 57),
+        ForeColor = Color.FromArgb(221, 241, 247),
+        TabStop = false
+      };
+      worldMapTilesButton.FlatAppearance.BorderColor = Color.FromArgb(76, 145, 168);
+      worldMapTilesButton.FlatAppearance.MouseOverBackColor = Color.FromArgb(36, 69, 82);
+      worldMapTilesButton.FlatAppearance.MouseDownBackColor = Color.FromArgb(45, 83, 98);
       worldMapCloseButton = new Button {
         Text = "×",
-        Location = new Point(477, 4),
+        Location = new Point(591, 4),
         Size = new Size(54, 28),
         FlatStyle = FlatStyle.Flat,
         UseVisualStyleBackColor = false,
@@ -112,7 +126,13 @@ namespace PugTools {
       };
       worldMapModePanel.Controls.Add(worldMapModeLabel);
       worldMapModePanel.Controls.Add(worldMapScopeButton);
+      worldMapTilesButton.Click += (_, __) => {
+        if (panelRender == null || !panelRender.IsFullMapOpen) return;
+        panelRender.SetInteractiveMapTiles(!panelRender.InteractiveMapPrefersTiles);
+        ActivateWorldRenderInput();
+      };
       worldMapModePanel.Controls.Add(worldMapSourceButton);
+      worldMapModePanel.Controls.Add(worldMapTilesButton);
       worldMapModePanel.Controls.Add(worldMapCloseButton);
       worldMapModePanel.Controls.Add(worldMapPageCombo);
       splitContainer3.Panel1.Controls.Add(worldMapModePanel);
@@ -220,7 +240,10 @@ namespace PugTools {
       bool originalActive = panelRender.InteractiveMapOriginalArtActive;
       string page = world ? panelRender.InteractiveMapWorldName : panelRender.InteractiveMapAreaName;
       string scope = world ? "World map" : "Area" + (String.IsNullOrWhiteSpace(page) ? String.Empty : ": " + page);
-      worldMapModeLabel.Text = scope + " · " + (originalActive ? "in-game" : "PugTools");
+      bool tilesPreference = panelRender.InteractiveMapPrefersTiles;
+      bool tilesAvailable = panelRender.InteractiveMapTilesAvailable;
+      bool tilesActive = panelRender.InteractiveMapTilesActive;
+      worldMapModeLabel.Text = scope + " · " + (tilesActive ? "minimaps" : originalActive ? "in-game" : "PugTools");
       worldMapModeLabel.ForeColor = originalPreference && !originalAvailable ? Color.Khaki : Color.FromArgb(232, 245, 248);
 
       // Keep the controls visually enabled even on travel/world-only maps. A disabled WinForms button ignores custom
@@ -234,7 +257,11 @@ namespace PugTools {
 
       worldMapSourceButton.Enabled = true;
       worldMapSourceButton.Text = originalPreference ? "PugTools map" : "Original in-game map";
-      worldMapSourceButton.BackColor = originalActive ? Color.FromArgb(62, 54, 24) : Color.FromArgb(24, 47, 57);
+      worldMapSourceButton.BackColor = originalActive && !tilesActive ? Color.FromArgb(62, 54, 24) : Color.FromArgb(24, 47, 57);
+      worldMapTilesButton.Enabled = true;
+      worldMapTilesButton.Text = tilesPreference ? "Hide minimaps" : "Minimaps";
+      worldMapTilesButton.BackColor = tilesActive ? Color.FromArgb(62, 54, 24) : Color.FromArgb(24, 47, 57);
+      worldMapTilesButton.ForeColor = tilesPreference && !tilesAvailable ? Color.Khaki : Color.FromArgb(232, 245, 248);
       worldMapSourceButton.ForeColor = originalPreference && !originalAvailable ? Color.Khaki : Color.FromArgb(232, 245, 248);
       worldMapSourceButton.Tag = originalAvailable ? null : "No original SWTOR art is available for this map page.";
       var tip = worldMapNoteToolTip;
@@ -242,6 +269,7 @@ namespace PugTools {
         tip.SetToolTip(worldMapScopeButton, travel ? "Travel maps always use the world scope." : hasArea ? "Switch between the current SWTOR submap and the world map." : "No separate area map exists here.");
         tip.SetToolTip(worldMapSourceButton, originalAvailable ? "Switch between the generated PugTools map and the original SWTOR map art." : "No original SWTOR art exists for this page; the generated map remains visible.");
       }
+      if (tip != null) tip.SetToolTip(worldMapTilesButton, tilesAvailable ? "Show the minimap tiles of this map page on top of the generated map." : "No minimap tiles exist for this map page.");
       worldMapModePanel.BringToFront();
     }
 
